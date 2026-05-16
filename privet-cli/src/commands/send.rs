@@ -12,12 +12,12 @@ pub struct SendArgs {
     pub files: Vec<PathBuf>,
 
     /// Target peer address (IP:port)
-    #[arg(short, long)]
-    pub to: Option<String>,
+    #[arg(long = "to-ip", short = 't')]
+    pub to_ip: Option<String>,
 
-    /// Peer name (alternative to --to, resolves via discovery)
-    #[arg(long)]
-    pub name: Option<String>,
+    /// Target peer name (resolved via discovery)
+    #[arg(long = "to-name")]
+    pub to_name: Option<String>,
 }
 
 pub async fn run(args: SendArgs, config: PrivetConfig) -> privet_core::Result<()> {
@@ -26,16 +26,16 @@ pub async fn run(args: SendArgs, config: PrivetConfig) -> privet_core::Result<()
         std::process::exit(1);
     }
 
-    // Validate that exactly one of --to or --name is provided
-    let has_to = args.to.is_some();
-    let has_name = args.name.is_some();
-    match (has_to, has_name) {
+    // Validate that exactly one of --to-ip or --to-name is provided
+    let has_ip = args.to_ip.is_some();
+    let has_name = args.to_name.is_some();
+    match (has_ip, has_name) {
         (true, false) => {
             // Direct address send
-            let addr: SocketAddr = args.to.as_ref().unwrap().parse().map_err(|e: std::net::AddrParseError| {
+            let addr: SocketAddr = args.to_ip.as_ref().unwrap().parse().map_err(|e: std::net::AddrParseError| {
                 privet_core::PrivetError::PeerNotFound(format!(
                     "invalid address '{}': {e}",
-                    args.to.as_ref().unwrap()
+                    args.to_ip.as_ref().unwrap()
                 ))
             })?;
 
@@ -46,14 +46,12 @@ pub async fn run(args: SendArgs, config: PrivetConfig) -> privet_core::Result<()
         }
         (false, true) => {
             // Name-based send via discovery
-            let name = args.name.as_ref().unwrap();
+            let name = args.to_name.as_ref().unwrap();
             let engine = privet_core::PrivetEngine::new(config).await?;
             let mut events = engine.subscribe_events().await;
             engine.start().await?;
 
-            println!(
-                "Looking for peer '{name}' via discovery (timeout: 6s)...",
-            );
+            println!("Looking for peer '{name}' via discovery (timeout: 6s)...");
 
             // Wait up to 6 seconds for the peer to appear
             let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
@@ -91,7 +89,7 @@ pub async fn run(args: SendArgs, config: PrivetConfig) -> privet_core::Result<()
             engine.shutdown().await?;
         }
         _ => {
-            eprintln!("Either --to <addr> or --name <name> must be provided");
+            eprintln!("Either --to-ip <addr:port> or --to-name <name> must be provided");
             std::process::exit(1);
         }
     }
