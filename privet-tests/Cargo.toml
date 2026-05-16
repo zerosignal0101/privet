@@ -1,0 +1,17 @@
+[package]
+name = "privet-tests"
+description = "Integration tests for privet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+privet-core = { path = "../privet-core" }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+tempfile = "3"
+rand = "0.8"
+
+[lints]
+workspace = true
