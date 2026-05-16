@@ -315,6 +315,214 @@ async fn e2e_multifile_concurrency_cap() {
     run_multifile_transfer(&sizes).await;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: Resume and Resilience tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_resume_partial_transfer() {
+    // Verify that a partially received file can be resumed.
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+    let file_name = "resume_test.bin";
+    let file_size = 256 * 1024; // 256KB
+
+    let (file_path, source_hash) = generate_test_file(&send_dir, file_name, file_size);
+
+    // Create a partial file (100KB) in the receive directory to trigger resume
+    let partial_path = recv_dir.join(file_name);
+    let partial_size = 100 * 1024;
+    let src_data = std::fs::read(&file_path).unwrap();
+    std::fs::write(&partial_path, &src_data[..partial_size]).unwrap();
+
+    // Copy mtime from source so resume matching succeeds
+    let src_mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+    let pf = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial_path)
+        .unwrap();
+    let times = std::fs::FileTimes::new().set_modified(src_mtime);
+    let _ = pf.set_times(times);
+
+    // Start receiver
+    let mut recv_config = PrivetConfig::default_with_name("resume-recv".into());
+    recv_config.transport.listen_port = port;
+    recv_config.download_dir = recv_dir.clone();
+    recv_config.auto_accept_trusted = true;
+    let recv_engine = privet_core::PrivetEngine::new(recv_config)
+        .await
+        .expect("recv engine");
+    recv_engine.start().await.expect("recv start");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    {
+        let mut send_config = PrivetConfig::default_with_name("resume-send".into());
+        send_config.transport.listen_port = 0;
+        send_config.auto_accept_trusted = true;
+        let engine = privet_core::PrivetEngine::new(send_config)
+            .await
+            .expect("send engine");
+        engine
+            .send_files_to_addr(addr, vec![file_path])
+            .await
+            .expect("send with resume");
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    recv_engine.shutdown().await.expect("shutdown");
+
+    // Verify: complete file with correct hash
+    assert!(partial_path.exists(), "resume file missing");
+    let actual_size = std::fs::metadata(&partial_path).unwrap().len();
+    assert_eq!(
+        file_size as u64, actual_size,
+        "size mismatch after resume: expected {file_size}, got {actual_size}"
+    );
+    let actual_hash = sha256_file(&partial_path);
+    assert_eq!(
+        source_hash, actual_hash,
+        "hash mismatch after resume\n  src: {source_hash}\n  got: {actual_hash}"
+    );
+    eprintln!("[resume] PASS — partial file resumed correctly");
+}
+
+#[tokio::test]
+async fn e2e_tcp_fallback_transfer() {
+    // Verify files can be transferred over TCP fallback transport.
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+    let file_name = "tcp_test.bin";
+    let file_size = 64 * 1024;
+
+    let (file_path, source_hash) = generate_test_file(&send_dir, file_name, file_size);
+
+    // Start receiver with TCP fallback
+    let mut recv_config = PrivetConfig::default_with_name("tcp-recv".into());
+    recv_config.transport.listen_port = port;
+    recv_config.transport.enable_tcp_fallback = true;
+    recv_config.download_dir = recv_dir.clone();
+    recv_config.auto_accept_trusted = true;
+    let recv_engine = privet_core::PrivetEngine::new(recv_config)
+        .await
+        .expect("recv engine");
+    recv_engine.start().await.expect("recv start");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send via TCP directly (simulating UDP-blocked / QUIC failure)
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let cert_dir = temp_dir.path().join("certs").join("tcp-send");
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    let identity = privet_core::security::identity::DeviceIdentity::generate(
+        "tcp-send".into(),
+        cert_dir,
+        10,
+    )
+    .expect("identity");
+    let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
+    privet_core::transfer::tcp_transport::send_files_tcp(
+        addr,
+        vec![file_path],
+        64 * 1024,
+        &identity,
+        &[], // empty trusted, but auto_accept=true
+        true,
+        &event_tx,
+    )
+    .await
+    .expect("TCP send");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    recv_engine.shutdown().await.expect("shutdown");
+
+    // Verify
+    let received_path = recv_dir.join(file_name);
+    assert!(received_path.exists(), "TCP received file missing");
+    let actual_hash = sha256_file(&received_path);
+    assert_eq!(
+        source_hash, actual_hash,
+        "TCP transfer hash mismatch\n  src: {source_hash}\n  got: {actual_hash}"
+    );
+    eprintln!("[tcp-fallback] PASS — TCP transfer completed correctly");
+}
+
+#[tokio::test]
+async fn e2e_transfer_log_created() {
+    // Verify that a transfer log record is created on successful send.
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = temp_dir.path().join("logs");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+    let (file_path, _) = generate_test_file(&send_dir, "log_test.bin", 4096);
+
+    // Receiver
+    let mut rc = PrivetConfig::default_with_name("log-recv".into());
+    rc.transport.listen_port = port;
+    rc.download_dir = recv_dir.clone();
+    rc.auto_accept_trusted = true;
+    rc.log_dir = Some(log_dir.clone());
+    let recv_engine = privet_core::PrivetEngine::new(rc).await.expect("recv");
+    recv_engine.start().await.expect("recv start");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Sender
+    let mut sc = PrivetConfig::default_with_name("log-send".into());
+    sc.transport.listen_port = 0;
+    sc.auto_accept_trusted = true;
+    sc.log_dir = Some(log_dir.clone());
+    let send_engine = privet_core::PrivetEngine::new(sc).await.expect("send");
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    send_engine
+        .send_files_to_addr(addr, vec![file_path])
+        .await
+        .expect("send");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    recv_engine.shutdown().await.expect("shutdown");
+
+    // Check that a log file was created and contains at least one record
+    let log_file = log_dir.join("transfers.jsonl");
+    assert!(log_file.exists(), "transfer log file should exist");
+    let contents = std::fs::read_to_string(&log_file).expect("read log");
+    assert!(!contents.is_empty(), "transfer log should not be empty");
+    // Parse the first record to verify it's valid JSON
+    let record: serde_json::Value = contents
+        .lines()
+        .next()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .expect("at least one log record");
+    assert_eq!(
+        record["completed"], true,
+        "log record should mark transfer as completed"
+    );
+    eprintln!("[transfer-log] PASS — log file created with valid record");
+}
+
 /// Generate multiple files, send them in a single transfer, and verify they all arrived.
 async fn run_multifile_transfer(sizes: &[usize]) {
     privet_core::init();

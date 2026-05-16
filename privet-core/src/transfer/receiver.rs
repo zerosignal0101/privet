@@ -184,23 +184,26 @@ impl Receiver {
             });
         }
 
-        // 7. Build resume map and send Accept
-        let mut resume_map = std::collections::HashMap::new();
-        for file_info in &offer.files.files {
-            let dest = self.download_dir.join(&file_info.relative_path);
-            if dest.exists() {
-                if let Ok(meta) = std::fs::metadata(&dest) {
-                    if meta.len() < file_info.size {
-                        resume_map.insert(
-                            file_info.relative_path.clone(),
-                            ResumePoint {
-                                bytes_received: meta.len(),
-                            },
-                        );
-                    }
-                }
-            }
-        }
+        // 7. Build resume map using resume::check_resume (name+size+mtime)
+        let file_entries: Vec<crate::session::FileEntry> = offer
+            .files
+            .files
+            .iter()
+            .map(|f| crate::session::FileEntry {
+                relative_path: f.relative_path.clone(),
+                size: f.size,
+                modified: f.modified_secs.map(|s| {
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s)
+                }),
+                sha256: f.sha256.clone(),
+                is_dir: f.is_dir,
+            })
+            .collect();
+        let raw_map = crate::transfer::resume::check_resume(&self.download_dir, &file_entries);
+        let resume_map: std::collections::HashMap<String, ResumePoint> = raw_map
+            .into_iter()
+            .map(|(path, bytes)| (path, ResumePoint { bytes_received: bytes }))
+            .collect();
 
         let accept = ControlMessage::Accept(Accept {
             session_id,
@@ -281,7 +284,13 @@ async fn receive_stream_files(
     // The sender sends all chunks for file 0, then file 1, etc., sequentially.
     // We read exactly `total_size` bytes per file to delimit boundaries.
     for file_entry in &stream_header.files {
-        let dest = resolve_conflict(download_dir, &file_entry.relative_path);
+        // When resuming (start_offset > 0), use the original path directly.
+        // Only resolve naming conflicts for fresh transfers.
+        let dest = if file_entry.start_offset > 0 {
+            download_dir.join(&file_entry.relative_path)
+        } else {
+            resolve_conflict(download_dir, &file_entry.relative_path)
+        };
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -344,13 +353,13 @@ async fn receive_stream_files(
 }
 
 /// Check available disk space (best-effort). Returns u64::MAX if unknown.
-fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> {
+pub(crate) fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> {
     // TODO: implement platform-specific disk space check (fs2 crate or similar)
     Ok(u64::MAX)
 }
 
 /// Resolve filename conflicts by appending (1), (2), etc.
-fn resolve_conflict(dir: &PathBuf, name: &str) -> PathBuf {
+pub(crate) fn resolve_conflict(dir: &PathBuf, name: &str) -> PathBuf {
     let dest = dir.join(name);
     if !dest.exists() {
         return dest;

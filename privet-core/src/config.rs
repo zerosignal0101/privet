@@ -19,6 +19,7 @@ pub struct PrivetConfig {
     pub security: SecurityConfig,
     pub discovery: DiscoveryConfig,
     pub auto_accept_trusted: bool,
+    pub log_dir: Option<PathBuf>,
 }
 
 impl PrivetConfig {
@@ -26,6 +27,9 @@ impl PrivetConfig {
         let download_dir = dirs::download_dir()
             .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
             .unwrap_or_else(|| PathBuf::from("."));
+        let data_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("privet");
 
         Self {
             device_name,
@@ -34,6 +38,7 @@ impl PrivetConfig {
             security: SecurityConfig::default(),
             discovery: DiscoveryConfig::default(),
             auto_accept_trusted: false,
+            log_dir: Some(data_dir.join("logs")),
         }
     }
 }
@@ -52,6 +57,7 @@ pub struct TransportConfig {
     pub enable_gso: bool,
     pub enable_mtu_discovery: bool,
     pub handshake_timeout: Duration,
+    pub enable_tcp_fallback: bool,
 }
 
 impl Default for TransportConfig {
@@ -69,6 +75,7 @@ impl Default for TransportConfig {
             enable_gso: true,
             enable_mtu_discovery: true,
             handshake_timeout: Duration::from_secs(5),
+            enable_tcp_fallback: true,
         }
     }
 }

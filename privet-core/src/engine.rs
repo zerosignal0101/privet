@@ -15,6 +15,7 @@ use crate::security::identity::DeviceIdentity;
 use crate::security::tls;
 use crate::security::trust::TrustStore;
 use crate::session::{SessionId, SessionState, TransferProgress, TransferSession};
+use crate::storage::records::{TransferLog, TransferRecord};
 use crate::transport::endpoint;
 
 /// Events emitted by the engine for the UI / CLI / FFI layer.
@@ -42,6 +43,8 @@ pub struct PrivetEngine {
     endpoint: RwLock<Option<Arc<Endpoint>>>,
     listener_handle: RwLock<Option<JoinHandle<()>>>,
     discovery_handles: RwLock<Vec<JoinHandle<()>>>,
+    transfer_log: Option<TransferLog>,
+    tcp_listener_handle: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl PrivetEngine {
@@ -73,6 +76,19 @@ impl PrivetEngine {
 
         let trust_store = TrustStore::load_or_create(trust_path)?;
 
+        // Initialize transfer log
+        let log_dir = config
+            .log_dir
+            .clone()
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("privet")
+                    .join("logs")
+            });
+        std::fs::create_dir_all(&log_dir).ok();
+        let transfer_log = TransferLog::open(&log_dir.join("transfers.jsonl")).ok();
+
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
@@ -86,6 +102,8 @@ impl PrivetEngine {
             endpoint: RwLock::new(None),
             listener_handle: RwLock::new(None),
             discovery_handles: RwLock::new(Vec::new()),
+            transfer_log,
+            tcp_listener_handle: RwLock::new(None),
         })
     }
 
@@ -113,6 +131,7 @@ impl PrivetEngine {
         let chunk_size = self.config.transport.chunk_size;
         let identity = self.identity.clone();
         let trusted_fingerprints = self.trust_store.lock().await.trusted_fingerprints();
+        let trusted_fps_for_tcp = trusted_fingerprints.clone();
         let auto_accept = self.config.auto_accept_trusted;
 
         let listener = async move {
@@ -152,6 +171,52 @@ impl PrivetEngine {
 
         *self.listener_handle.write().await = Some(tokio::spawn(listener));
         *self.endpoint.write().await = Some(ep);
+
+        // --- Start TCP fallback listener ---
+        if self.config.transport.enable_tcp_fallback {
+            let tcp_addr = listen_addr;
+            let tcp_ev = self.event_tx.clone();
+            let tcp_dl = self.config.download_dir.clone();
+            let tcp_ck = self.config.transport.chunk_size;
+            let tcp_id = self.identity.clone();
+            let tcp_tf = trusted_fps_for_tcp.clone();
+            let tcp_aa = auto_accept;
+            let tcp_handle = tokio::spawn(async move {
+                match tokio::net::TcpListener::bind(tcp_addr).await {
+                    Ok(listener) => {
+                        tracing::info!("TCP fallback listening on {tcp_addr}");
+                        loop {
+                            match listener.accept().await {
+                                Ok((stream, addr)) => {
+                                    let ev = tcp_ev.clone();
+                                    let dl = tcp_dl.clone();
+                                    let id = tcp_id.clone();
+                                    let tf = tcp_tf.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            crate::transfer::tcp_transport::receive_tcp(
+                                                stream, dl, tcp_ck, &id, &tf, tcp_aa, &ev,
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!("TCP recv error from {addr}: {e}");
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::error!("TCP accept error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("TCP fallback listener bind: {e}");
+                    }
+                }
+            });
+            *self.tcp_listener_handle.write().await = Some(tcp_handle);
+        }
 
         // --- Start discovery subsystems ---
         let enable_disc = self.config.discovery.enable_beacon || self.config.discovery.enable_mdns;
@@ -205,6 +270,9 @@ impl PrivetEngine {
         if let Some(handle) = self.listener_handle.write().await.take() {
             handle.abort();
         }
+        if let Some(handle) = self.tcp_listener_handle.write().await.take() {
+            handle.abort();
+        }
         for handle in self.discovery_handles.write().await.drain(..) {
             handle.abort();
         }
@@ -243,13 +311,86 @@ impl PrivetEngine {
     }
 
     /// Send files to a peer by address (IP:port), bypassing discovery.
+    /// Tries QUIC first, then TCP fallback if configured.
     pub async fn send_files_to_addr(
         &self,
         addr: SocketAddr,
         paths: Vec<PathBuf>,
     ) -> Result<SessionId> {
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
-        let client_config = tls::build_client_config(&self.identity, &trusted)?;
+        let auto_accept = self.config.auto_accept_trusted;
+
+        // Try QUIC first
+        let quic_result = self.try_send_quic(addr, &paths, &trusted, auto_accept).await;
+
+        let (session_id, peer_fingerprint) = match quic_result {
+            Ok(r) => r,
+            Err(quic_err) => {
+                let is_tcp_candidate = matches!(
+                    &quic_err,
+                    PrivetError::Transport(crate::error::TransportError::Quic(_))
+                ) || matches!(&quic_err, PrivetError::ConnectionTimeout);
+
+                if is_tcp_candidate && self.config.transport.enable_tcp_fallback {
+                    tracing::info!("QUIC failed ({quic_err}), trying TCP fallback to {addr}");
+                    match crate::transfer::tcp_transport::send_files_tcp(
+                        addr,
+                        paths.clone(),
+                        self.config.transport.chunk_size,
+                        &self.identity,
+                        &trusted,
+                        auto_accept,
+                        &self.event_tx,
+                    )
+                    .await
+                    {
+                        Ok(tcp_result) => {
+                            self.log_transfer(tcp_result.0, &tcp_result.1, &paths, true)
+                                .await;
+                            self.emit_pairing_if_needed(&tcp_result.1, &addr).await;
+                            self.track_session(tcp_result.0).await;
+                            return Ok(tcp_result.0);
+                        }
+                        Err(tcp_err) => {
+                            let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                                session_id: SessionId::new(),
+                                error: tcp_err.to_string(),
+                            });
+                            return Err(tcp_err);
+                        }
+                    }
+                }
+
+                let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                    session_id: SessionId::new(),
+                    error: quic_err.to_string(),
+                });
+                return Err(quic_err);
+            }
+        };
+
+        // Log
+        self.log_transfer(session_id, &peer_fingerprint, &paths, true)
+            .await;
+
+        // Pairing flow
+        self.emit_pairing_if_needed(&peer_fingerprint, &addr).await;
+
+        // Track session
+        self.track_session(session_id).await;
+
+        Ok(session_id)
+    }
+
+    /// Try QUIC transport: connect and send. Returns (session_id, peer_fingerprint).
+    async fn try_send_quic(
+        &self,
+        addr: SocketAddr,
+        paths: &[PathBuf],
+        trusted: &[String],
+        auto_accept: bool,
+    ) -> Result<(SessionId, String)> {
+        let client_config = tls::build_client_config(&self.identity, trusted)?;
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
         let ep = endpoint::build_client_endpoint(
@@ -271,28 +412,41 @@ impl PrivetEngine {
             self.identity.device_name.clone(),
         );
 
-        let auto_accept = self.config.auto_accept_trusted;
+        sender.send(paths, &self.event_tx, trusted, auto_accept).await
+    }
 
-        let (session_id, peer_fingerprint) = match sender.send(&paths, &self.event_tx, &trusted, auto_accept).await {
-            Ok(result) => result,
-            Err(e) => {
-                let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                    session_id: SessionId::new(),
-                    error: e.to_string(),
-                });
-                return Err(e);
-            }
-        };
+    /// Log a completed transfer to the JSONL transfer log.
+    async fn log_transfer(
+        &self,
+        session_id: SessionId,
+        peer_fingerprint: &str,
+        paths: &[PathBuf],
+        completed: bool,
+    ) {
+        if let Some(log) = &self.transfer_log {
+            let _ = log.append(&TransferRecord {
+                session_id,
+                direction: crate::session::TransferDirection::Sending,
+                peer_fingerprint: peer_fingerprint.to_owned(),
+                files: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+                total_bytes: 0,
+                bytes_transferred: 0,
+                completed,
+            });
+        }
+    }
 
-        // Check trust for pairing flow
+    /// Emit PairRequest event if the peer is not yet trusted.
+    async fn emit_pairing_if_needed(&self, peer_fingerprint: &str, addr: &SocketAddr) {
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
-        if !trusted.iter().any(|fp| fp == &peer_fingerprint) {
-            let code = TrustStore::pairing_code(&self.identity.fingerprint, &peer_fingerprint);
+        if !trusted.iter().any(|fp| fp == peer_fingerprint) {
+            let code =
+                TrustStore::pairing_code(&self.identity.fingerprint, peer_fingerprint);
             let peer_info = PeerInfo {
                 id: PeerId(uuid::Uuid::nil()),
                 name: self.identity.device_name.clone(),
-                addresses: vec![addr],
-                fingerprint: peer_fingerprint.clone(),
+                addresses: vec![*addr],
+                fingerprint: peer_fingerprint.to_owned(),
                 is_trusted: false,
                 last_seen: std::time::SystemTime::now(),
                 platform: None,
@@ -303,22 +457,20 @@ impl PrivetEngine {
                 code,
             });
         }
+    }
 
-        // Track the session
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(entry) = sessions.get_mut(&session_id) {
-                entry.state = SessionState::Completed;
-                entry.progress = TransferProgress {
-                    total_bytes: 0,
-                    bytes_transferred: 0,
-                    current_speed_bps: 0.0,
-                    per_file: vec![],
-                };
-            }
+    /// Mark session as completed in the sessions map.
+    async fn track_session(&self, session_id: SessionId) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions.get_mut(&session_id) {
+            entry.state = SessionState::Completed;
+            entry.progress = TransferProgress {
+                total_bytes: 0,
+                bytes_transferred: 0,
+                current_speed_bps: 0.0,
+                per_file: vec![],
+            };
         }
-
-        Ok(session_id)
     }
 
     /// Send files to a peer resolved by display name.
