@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use quinn::Endpoint;
 
 use crate::config::PrivetConfig;
+use crate::discovery::{DiscoveryEvent, DiscoveryManager};
 use crate::error::{PrivetError, Result};
 use crate::peer::{PeerId, PeerInfo};
 use crate::security::identity::DeviceIdentity;
@@ -34,12 +35,13 @@ pub struct PrivetEngine {
     config: PrivetConfig,
     identity: DeviceIdentity,
     trust_store: Mutex<TrustStore>,
-    peers: RwLock<HashMap<PeerId, PeerInfo>>,
+    peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
     sessions: RwLock<HashMap<SessionId, TransferSession>>,
     event_tx: mpsc::UnboundedSender<PrivetEvent>,
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<PrivetEvent>>>,
     endpoint: RwLock<Option<Arc<Endpoint>>>,
     listener_handle: RwLock<Option<JoinHandle<()>>>,
+    discovery_handles: RwLock<Vec<JoinHandle<()>>>,
 }
 
 impl PrivetEngine {
@@ -77,12 +79,13 @@ impl PrivetEngine {
             config,
             identity,
             trust_store: Mutex::new(trust_store),
-            peers: RwLock::new(HashMap::new()),
+            peers: Arc::new(RwLock::new(HashMap::new())),
             sessions: RwLock::new(HashMap::new()),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             endpoint: RwLock::new(None),
             listener_handle: RwLock::new(None),
+            discovery_handles: RwLock::new(Vec::new()),
         })
     }
 
@@ -141,6 +144,45 @@ impl PrivetEngine {
         *self.listener_handle.write().await = Some(tokio::spawn(listener));
         *self.endpoint.write().await = Some(ep);
 
+        // --- Start discovery subsystems ---
+        let enable_disc = self.config.discovery.enable_beacon || self.config.discovery.enable_mdns;
+        if enable_disc {
+            let (discovery, mut discovery_rx) = DiscoveryManager::new();
+            let handles = discovery
+                .start(
+                    &self.config.discovery,
+                    &self.identity,
+                    self.config.transport.listen_port,
+                )
+                .await;
+            *self.discovery_handles.write().await = handles;
+
+            let peers = Arc::clone(&self.peers);
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                while let Some(event) = discovery_rx.recv().await {
+                    match event {
+                        DiscoveryEvent::PeerDiscovered(info) => {
+                            let mut map = peers.write().await;
+                            map.insert(info.id, info.clone());
+                            drop(map);
+                            let _ = event_tx.send(PrivetEvent::PeerDiscovered(info));
+                        }
+                        DiscoveryEvent::PeerLost(id) => {
+                            peers.write().await.remove(&id);
+                            let _ = event_tx.send(PrivetEvent::PeerLost(id));
+                        }
+                    }
+                }
+            });
+
+            tracing::info!(
+                "discovery started (beacon={}, mdns={})",
+                self.config.discovery.enable_beacon,
+                self.config.discovery.enable_mdns
+            );
+        }
+
         tracing::info!(
             "privet engine started on port {}",
             self.config.transport.listen_port
@@ -152,6 +194,9 @@ impl PrivetEngine {
     /// Shut down the engine.
     pub async fn shutdown(&self) -> Result<()> {
         if let Some(handle) = self.listener_handle.write().await.take() {
+            handle.abort();
+        }
+        for handle in self.discovery_handles.write().await.drain(..) {
             handle.abort();
         }
         if let Some(ep) = self.endpoint.write().await.take() {
@@ -216,6 +261,21 @@ impl PrivetEngine {
         );
 
         sender.send(&paths, &self.event_tx).await
+    }
+
+    /// Send files to a peer resolved by display name.
+    pub async fn send_files_to_name(&self, name: &str, paths: Vec<PathBuf>) -> Result<SessionId> {
+        let peer = self
+            .resolve_peer_by_name(name)
+            .await
+            .ok_or_else(|| PrivetError::PeerNotFound(name.to_owned()))?;
+        self.send_files(&peer.id, paths).await
+    }
+
+    /// Resolve a peer by display name from the discovered peers list.
+    pub async fn resolve_peer_by_name(&self, name: &str) -> Option<PeerInfo> {
+        let peers = self.peers.read().await;
+        peers.values().find(|p| p.name == name).cloned()
     }
 
     /// Accept an incoming transfer.

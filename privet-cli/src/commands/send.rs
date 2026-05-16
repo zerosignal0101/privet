@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Args;
 
@@ -12,7 +13,7 @@ pub struct SendArgs {
 
     /// Target peer address (IP:port)
     #[arg(short, long)]
-    pub to: String,
+    pub to: Option<String>,
 
     /// Peer name (alternative to --to, resolves via discovery)
     #[arg(long)]
@@ -25,16 +26,75 @@ pub async fn run(args: SendArgs, config: PrivetConfig) -> privet_core::Result<()
         std::process::exit(1);
     }
 
-    let engine = privet_core::PrivetEngine::new(config).await?;
+    // Validate that exactly one of --to or --name is provided
+    let has_to = args.to.is_some();
+    let has_name = args.name.is_some();
+    match (has_to, has_name) {
+        (true, false) => {
+            // Direct address send
+            let addr: SocketAddr = args.to.as_ref().unwrap().parse().map_err(|e: std::net::AddrParseError| {
+                privet_core::PrivetError::PeerNotFound(format!(
+                    "invalid address '{}': {e}",
+                    args.to.as_ref().unwrap()
+                ))
+            })?;
 
-    let addr: SocketAddr = args.to.parse().map_err(|e: std::net::AddrParseError| {
-        privet_core::PrivetError::PeerNotFound(format!("invalid address '{}': {e}", args.to))
-    })?;
+            let engine = privet_core::PrivetEngine::new(config).await?;
+            println!("Sending {} file(s) to {addr}...", args.files.len());
+            let session_id = engine.send_files_to_addr(addr, args.files).await?;
+            println!("Transfer complete! Session: {session_id}");
+        }
+        (false, true) => {
+            // Name-based send via discovery
+            let name = args.name.as_ref().unwrap();
+            let engine = privet_core::PrivetEngine::new(config).await?;
+            let mut events = engine.subscribe_events().await;
+            engine.start().await?;
 
-    println!("Sending {} file(s) to {addr}...", args.files.len());
+            println!(
+                "Looking for peer '{name}' via discovery (timeout: 6s)...",
+            );
 
-    let session_id = engine.send_files_to_addr(addr, args.files).await?;
+            // Wait up to 6 seconds for the peer to appear
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+            let mut found = false;
 
-    println!("Transfer complete! Session: {session_id}");
+            while tokio::time::Instant::now() < deadline {
+                if let Some(privet_core::PrivetEvent::PeerDiscovered(peer)) = events.recv().await {
+                    if peer.name == *name {
+                        println!("Found peer '{}' at {}", peer.name, peer.primary_address().map_or("?".into(), |a| a.to_string()));
+                        found = true;
+                        println!("Sending {} file(s)...", args.files.len());
+                        let session_id = engine.send_files(&peer.id, args.files.clone()).await?;
+                        println!("Transfer complete! Session: {session_id}");
+                        break;
+                    }
+                }
+            }
+
+            if !found {
+                // One last check in case we missed the event
+                let peers = engine.discovered_peers().await;
+                if let Some(peer) = peers.iter().find(|p| p.name == *name) {
+                    found = true;
+                    println!("Sending {} file(s) to '{}'...", args.files.len(), name);
+                    let session_id = engine.send_files(&peer.id, args.files.clone()).await?;
+                    println!("Transfer complete! Session: {session_id}");
+                }
+            }
+
+            if !found {
+                eprintln!("Peer '{name}' not found via discovery");
+                std::process::exit(1);
+            }
+
+            engine.shutdown().await?;
+        }
+        _ => {
+            eprintln!("Either --to <addr> or --name <name> must be provided");
+            std::process::exit(1);
+        }
+    }
+
     Ok(())
 }
