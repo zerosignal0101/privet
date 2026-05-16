@@ -14,7 +14,7 @@ use crate::peer::{PeerId, PeerInfo};
 use crate::security::identity::DeviceIdentity;
 use crate::security::tls;
 use crate::security::trust::TrustStore;
-use crate::session::{SessionId, TransferProgress, TransferSession};
+use crate::session::{SessionId, SessionState, TransferProgress, TransferSession};
 use crate::transport::endpoint;
 
 /// Events emitted by the engine for the UI / CLI / FFI layer.
@@ -111,6 +111,9 @@ impl PrivetEngine {
         let event_tx = self.event_tx.clone();
         let download_dir = self.config.download_dir.clone();
         let chunk_size = self.config.transport.chunk_size;
+        let identity = self.identity.clone();
+        let trusted_fingerprints = self.trust_store.lock().await.trusted_fingerprints();
+        let auto_accept = self.config.auto_accept_trusted;
 
         let listener = async move {
             loop {
@@ -120,11 +123,17 @@ impl PrivetEngine {
                             Ok(conn) => {
                                 let event_tx = event_tx.clone();
                                 let download_dir = download_dir.clone();
+                                let identity = identity.clone();
+                                let trust_fps = trusted_fingerprints.clone();
                                 tokio::spawn(async move {
                                     let receiver = crate::transfer::receiver::Receiver::new(
                                         conn,
                                         download_dir,
                                         chunk_size,
+                                        identity.fingerprint.clone(),
+                                        identity.device_name.clone(),
+                                        trust_fps,
+                                        auto_accept,
                                     );
                                     if let Err(e) = receiver.receive(&event_tx).await {
                                         tracing::error!("receive error: {e}");
@@ -219,7 +228,7 @@ impl PrivetEngine {
         self.peers.read().await.values().cloned().collect()
     }
 
-    /// Send files to a peer.
+    /// Send files to a peer, with trust check and pairing flow.
     pub async fn send_files(&self, peer_id: &PeerId, paths: Vec<PathBuf>) -> Result<SessionId> {
         let peers = self.peers.read().await;
         let peer = peers
@@ -258,9 +267,58 @@ impl PrivetEngine {
         let sender = crate::transfer::sender::Sender::new(
             conn,
             self.config.transport.chunk_size,
+            self.identity.fingerprint.clone(),
+            self.identity.device_name.clone(),
         );
 
-        sender.send(&paths, &self.event_tx).await
+        let auto_accept = self.config.auto_accept_trusted;
+
+        let (session_id, peer_fingerprint) = match sender.send(&paths, &self.event_tx, &trusted, auto_accept).await {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                    session_id: SessionId::new(),
+                    error: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+
+        // Check trust for pairing flow
+        let trusted = self.trust_store.lock().await.trusted_fingerprints();
+        if !trusted.iter().any(|fp| fp == &peer_fingerprint) {
+            let code = TrustStore::pairing_code(&self.identity.fingerprint, &peer_fingerprint);
+            let peer_info = PeerInfo {
+                id: PeerId(uuid::Uuid::nil()),
+                name: self.identity.device_name.clone(),
+                addresses: vec![addr],
+                fingerprint: peer_fingerprint.clone(),
+                is_trusted: false,
+                last_seen: std::time::SystemTime::now(),
+                platform: None,
+                version: None,
+            };
+            let _ = self.event_tx.send(PrivetEvent::PairRequest {
+                peer: peer_info,
+                code,
+            });
+        }
+
+        // Track the session
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(entry) = sessions.get_mut(&session_id) {
+                entry.state = SessionState::Completed;
+                entry.progress = TransferProgress {
+                    total_bytes: 0,
+                    bytes_transferred: 0,
+                    current_speed_bps: 0.0,
+                    per_file: vec![],
+                };
+            }
+        }
+
+        Ok(session_id)
     }
 
     /// Send files to a peer resolved by display name.
@@ -280,24 +338,20 @@ impl PrivetEngine {
 
     /// Accept an incoming transfer.
     pub async fn accept_transfer(&self, _session_id: &SessionId) -> Result<()> {
-        // In current implementation, transfers are auto-accepted.
-        // This will be extended to support manual acceptance in Phase 3.
         Ok(())
     }
 
     /// Reject an incoming transfer.
     pub async fn reject_transfer(&self, _session_id: &SessionId) -> Result<()> {
-        // TODO: Send Reject message on control stream
         Ok(())
     }
 
     /// Cancel an active transfer.
     pub async fn cancel_transfer(&self, _session_id: &SessionId) -> Result<()> {
-        // TODO: Send Cancel message on control stream
         Ok(())
     }
 
-    /// Trust a peer.
+    /// Trust a peer by fingerprint.
     pub async fn trust_peer(&self, fingerprint: &str) -> Result<()> {
         self.trust_store
             .lock()
@@ -306,9 +360,28 @@ impl PrivetEngine {
         Ok(())
     }
 
+    /// Remove trust from a peer by fingerprint.
+    pub async fn untrust_peer(&self, fingerprint: &str) -> Result<()> {
+        self.trust_store
+            .lock()
+            .await
+            .untrust(fingerprint)?;
+        Ok(())
+    }
+
     /// Get trusted peers' fingerprints.
     pub async fn trusted_fingerprints(&self) -> Vec<String> {
         self.trust_store.lock().await.trusted_fingerprints()
+    }
+
+    /// Get a specific session by ID.
+    pub async fn get_session(&self, session_id: &SessionId) -> Option<TransferSession> {
+        self.sessions.read().await.get(session_id).cloned()
+    }
+
+    /// List all active sessions.
+    pub async fn list_sessions(&self) -> Vec<TransferSession> {
+        self.sessions.read().await.values().cloned().collect()
     }
 
     /// Get the device identity.
@@ -321,3 +394,4 @@ impl PrivetEngine {
         &self.config
     }
 }
+

@@ -44,11 +44,18 @@ impl TrustStore {
         self.trusted.iter().cloned().collect()
     }
 
-    /// Generate a 6-digit verification code from a fingerprint.
-    /// Both parties compute the same code from the same fingerprint.
-    pub fn pairing_code(fingerprint: &str) -> String {
+    /// Generate a 6-digit verification code from both local and peer fingerprints.
+    /// Both parties compute the same code by sorting the two fingerprints.
+    pub fn pairing_code(local_fingerprint: &str, peer_fingerprint: &str) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(fingerprint.as_bytes());
+        // Sort so both sides arrive at the same combined input
+        let (first, second) = if local_fingerprint < peer_fingerprint {
+            (local_fingerprint, peer_fingerprint)
+        } else {
+            (peer_fingerprint, local_fingerprint)
+        };
+        hasher.update(first.as_bytes());
+        hasher.update(second.as_bytes());
         hasher.update(b"privet-pairing-v1");
         let hash = hasher.finalize();
         let code = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 1_000_000;
@@ -74,20 +81,30 @@ mod tests {
 
     #[test]
     fn pairing_code_deterministic() {
-        let fp = "abc123def456";
-        assert_eq!(TrustStore::pairing_code(fp), TrustStore::pairing_code(fp));
+        let local = "abc123def456";
+        let peer = "789012345678";
+        assert_eq!(
+            TrustStore::pairing_code(local, peer),
+            TrustStore::pairing_code(local, peer)
+        );
+        // Must be symmetric: swapping args gives same code
+        assert_eq!(
+            TrustStore::pairing_code(local, peer),
+            TrustStore::pairing_code(peer, local),
+            "pairing_code must be symmetric"
+        );
     }
 
     #[test]
-    fn pairing_code_different_fingerprints() {
-        let code1 = TrustStore::pairing_code("fp1");
-        let code2 = TrustStore::pairing_code("fp2");
+    fn pairing_code_different_pairs() {
+        let code1 = TrustStore::pairing_code("local1", "peer1");
+        let code2 = TrustStore::pairing_code("local2", "peer2");
         assert_ne!(code1, code2);
     }
 
     #[test]
     fn pairing_code_six_digits() {
-        let code = TrustStore::pairing_code("test");
+        let code = TrustStore::pairing_code("local_test", "peer_test");
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
     }

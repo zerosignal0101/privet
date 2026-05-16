@@ -1,0 +1,94 @@
+use clap::Args;
+
+use privet_core::PrivetConfig;
+
+#[derive(Args)]
+pub struct PairArgs {
+    /// Show pairing code for a peer fingerprint
+    #[arg(long)]
+    pub code: Option<String>,
+
+    /// Trust a peer by fingerprint
+    #[arg(long)]
+    pub trust: Option<String>,
+
+    /// Verification code (when set, --trust requires the code to match before trusting)
+    #[arg(long)]
+    pub verify_code: Option<String>,
+
+    /// Remove trust from a peer by fingerprint
+    #[arg(long)]
+    pub untrust: Option<String>,
+
+    /// List all trusted peers
+    #[arg(long)]
+    pub list: bool,
+}
+
+pub async fn run(args: PairArgs, config: PrivetConfig) -> privet_core::Result<()> {
+    let engine = privet_core::PrivetEngine::new(config).await?;
+    let local_fp = engine.identity().fingerprint.clone();
+
+    if args.list {
+        let trusted = engine.trusted_fingerprints().await;
+        if trusted.is_empty() {
+            println!("No trusted peers");
+            return Ok(());
+        }
+        println!("Trusted peers ({}):", trusted.len());
+        for (i, fp) in trusted.iter().enumerate() {
+            let code = privet_core::security::trust::TrustStore::pairing_code(&local_fp, fp);
+            let short = if fp.len() > 16 { &fp[..16] } else { fp.as_str() };
+            println!("  {}. {}...  (code: {})", i + 1, short, code);
+        }
+        return Ok(());
+    }
+
+    if let Some(fp) = &args.trust {
+        // If --verify-code is provided, check the pairing code before trusting
+        if let Some(expected) = &args.verify_code {
+            let computed = privet_core::security::trust::TrustStore::pairing_code(&local_fp, fp);
+            if &computed != expected {
+                eprintln!("ERROR: Pairing code mismatch");
+                eprintln!("  Expected: {expected}");
+                eprintln!("  Computed: {computed}");
+                eprintln!("The pairing code must match on both devices.");
+                eprintln!("Use `privet pair --code <fp>` to see the current code.");
+                std::process::exit(1);
+            }
+            println!("✓ Pairing code verified: {computed}");
+        }
+        engine.trust_peer(fp).await?;
+        println!("Trusted fingerprint: {fp}");
+        return Ok(());
+    }
+
+    if let Some(fp) = &args.untrust {
+        engine.untrust_peer(fp).await?;
+        println!("Removed trust for fingerprint: {fp}");
+        return Ok(());
+    }
+
+    if let Some(fp) = &args.code {
+        let code = privet_core::security::trust::TrustStore::pairing_code(&local_fp, fp);
+        let short = if fp.len() > 16 { &fp[..16] } else { fp.as_str() };
+        println!("Local fingerprint: {}...", &local_fp[..16]);
+        println!("Peer fingerprint: {short}...");
+        println!("Pairing code: {code}");
+        println!("Verify this code matches on the other device.");
+        return Ok(());
+    }
+
+    // Default: show help
+    println!("Usage:");
+    println!("  privet pair --trust <fingerprint> [--verify-code <code>]");
+    println!("  privet pair --untrust <fingerprint>");
+    println!("  privet pair --code <fingerprint>");
+    println!("  privet pair --list");
+    println!();
+    println!("Pairing flow:");
+    println!("  1. Both devices run `privet pair --code <peer-fingerprint>`");
+    println!("  2. Verify the 6-digit code matches on both devices");
+    println!("  3. Run `privet pair --trust <fingerprint> --verify-code <code>`");
+    Ok(())
+}

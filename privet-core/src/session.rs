@@ -128,6 +128,7 @@ impl FileManifest {
 pub struct FileEntry {
     pub relative_path: String,
     pub size: u64,
+    #[serde(with = "system_time_serde")]
     pub modified: Option<SystemTime>,
     pub sha256: Option<Vec<u8>>,
     pub is_dir: bool,

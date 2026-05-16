@@ -10,13 +10,11 @@ use crate::security::identity::DeviceIdentity;
 /// Build a rustls ServerConfig that requires mTLS (client cert required).
 pub fn build_server_config(
     identity: &DeviceIdentity,
-    trusted_fingerprints: &[String],
+    _trusted_fingerprints: &[String],
 ) -> Result<Arc<rustls::ServerConfig>, SecurityError> {
     let (cert_chain, key) = load_cert_and_key(identity)?;
 
-    let client_verifier = Arc::new(PrivetClientVerifier {
-        trusted: trusted_fingerprints.to_vec(),
-    });
+    let client_verifier = Arc::new(PrivetClientVerifier {});
 
     let config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
@@ -61,9 +59,7 @@ fn load_cert_and_key(
 // --- Custom mTLS client cert verifier for server side ---
 
 #[derive(Debug)]
-struct PrivetClientVerifier {
-    trusted: Vec<String>,
-}
+struct PrivetClientVerifier;
 
 impl rustls::server::danger::ClientCertVerifier for PrivetClientVerifier {
     fn offer_client_auth(&self) -> bool {

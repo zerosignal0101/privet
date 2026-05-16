@@ -27,6 +27,8 @@ enum Commands {
     Discover(commands::discover::DiscoverArgs),
     /// Show active transfers
     Status,
+    /// Manage trusted peers and pairing
+    Pair(commands::pair::PairArgs),
 }
 
 #[tokio::main]
@@ -69,6 +71,7 @@ async fn run_command(
         Commands::Send(args) => commands::send::run(args, config).await,
         Commands::Receive(args) => commands::receive::run(args, config).await,
         Commands::Discover(args) => commands::discover::run(args, config).await,
+        Commands::Pair(args) => commands::pair::run(args, config).await,
         Commands::Status => {
             println!("No active transfers (daemon not yet implemented)");
             Ok(())
