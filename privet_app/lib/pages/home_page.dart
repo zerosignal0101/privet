@@ -83,6 +83,9 @@ class _HomePageState extends ConsumerState<HomePage> {
                           onTrust: () => ref
                               .read(pairingProvider.notifier)
                               .trust(req.peer.fingerprint),
+                          onTrustAndAccept: () => ref
+                              .read(pairingProvider.notifier)
+                              .trustAndAccept(req.peer.fingerprint),
                           onDismiss: () => ref
                               .read(pairingProvider.notifier)
                               .reject(req.peer.fingerprint),
@@ -243,11 +246,13 @@ class _PeerTile extends StatelessWidget {
 class _PairingBanner extends StatelessWidget {
   final PairRequest request;
   final VoidCallback onTrust;
+  final VoidCallback onTrustAndAccept;
   final VoidCallback onDismiss;
 
   const _PairingBanner({
     required this.request,
     required this.onTrust,
+    required this.onTrustAndAccept,
     required this.onDismiss,
   });
 
@@ -271,9 +276,11 @@ class _PairingBanner extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                TextButton(onPressed: onDismiss, child: const Text('Dismiss')),
+                TextButton(onPressed: onDismiss, child: const Text('Reject')),
                 const SizedBox(width: 8),
-                FilledButton(onPressed: onTrust, child: const Text('Trust')),
+                OutlinedButton(onPressed: onTrust, child: const Text('Trust')),
+                const SizedBox(width: 8),
+                FilledButton(onPressed: onTrustAndAccept, child: const Text('Trust & Accept')),
               ],
             ),
           ],

@@ -394,6 +394,87 @@ pub extern "C" fn privet_untrust_peer(fingerprint: *const c_char) -> c_int {
     }
 }
 
+/// Trust a peer and auto-accept all future transfers from them.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_trust_and_accept_peer(fingerprint: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let fp = unsafe {
+        if fingerprint.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(fingerprint).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    match rt.block_on(engine.trust_and_accept_peer(fp)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Reject a pending pairing request from a peer.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_reject_pairing(fingerprint: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let fp = unsafe {
+        if fingerprint.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(fingerprint).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    match rt.block_on(engine.reject_pairing(fp)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Remove a peer from the auto-accept list (keeps trust).
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_unaccept_peer(fingerprint: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let fp = unsafe {
+        if fingerprint.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(fingerprint).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    match rt.block_on(engine.unaccept_peer(fp)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
@@ -430,6 +511,26 @@ pub extern "C" fn privet_get_trusted_fingerprints() -> *mut c_char {
     };
 
     let fps = rt.block_on(engine.trusted_fingerprints());
+    let json = match serde_json::to_string(&fps) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Get the list of accepted (auto-accept) fingerprints as a JSON string.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_accepted_fingerprints() -> *mut c_char {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let fps = rt.block_on(engine.accepted_fingerprints());
     let json = match serde_json::to_string(&fps) {
         Ok(j) => j,
         Err(_) => return std::ptr::null_mut(),

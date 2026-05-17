@@ -13,6 +13,8 @@ class SettingsPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider);
     final identity = ref.watch(identityProvider);
+    final trusted = ref.watch(trustedListProvider);
+    final accepted = ref.watch(acceptedListProvider);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -73,6 +75,64 @@ class SettingsPage extends ConsumerWidget {
 
           const Divider(),
 
+          // Trusted Devices management
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Text(
+              'Trusted Devices',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+          ),
+          if (trusted.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text('No trusted devices', style: TextStyle(color: Colors.grey)),
+            )
+          else
+            ...trusted.map((fp) => ListTile(
+                  dense: true,
+                  leading: const Icon(Icons.verified_user, size: 20),
+                  title: Text(
+                    fp.length > 16 ? '${fp.substring(0, 16)}...' : fp,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline, size: 20),
+                    onPressed: () => _confirmUntrust(context, ref, fp),
+                  ),
+                )),
+
+          const SizedBox(height: 8),
+
+          // Accepted (auto-accept) Devices management
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Text(
+              'Auto-Accept Devices',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+          ),
+          if (accepted.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text('No auto-accept devices', style: TextStyle(color: Colors.grey)),
+            )
+          else
+            ...accepted.map((fp) => ListTile(
+                  dense: true,
+                  leading: const Icon(Icons.auto_mode, size: 20),
+                  title: Text(
+                    fp.length > 16 ? '${fp.substring(0, 16)}...' : fp,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline, size: 20),
+                    onPressed: () => _confirmUnaccept(context, ref, fp),
+                  ),
+                )),
+
+          const Divider(),
+
           // Restart engine
           ListTile(
             leading: const Icon(Icons.restart_alt),
@@ -120,11 +180,47 @@ class SettingsPage extends ConsumerWidget {
     }
   }
 
+  Future<void> _confirmUntrust(BuildContext context, WidgetRef ref, String fp) async {
+    final short = fp.length > 16 ? '${fp.substring(0, 16)}...' : fp;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove Trust?'),
+        content: Text('Remove trust for $short?\nThis will also remove auto-accept if set.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await ref.read(trustedListProvider.notifier).untrust(fp);
+      await ref.read(acceptedListProvider.notifier).refresh();
+    }
+  }
+
+  Future<void> _confirmUnaccept(BuildContext context, WidgetRef ref, String fp) async {
+    final short = fp.length > 16 ? '${fp.substring(0, 16)}...' : fp;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove Auto-Accept?'),
+        content: Text('Remove auto-accept for $short?\nThe device will remain trusted.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await ref.read(acceptedListProvider.notifier).unaccept(fp);
+    }
+  }
+
   Future<void> _restartEngine(BuildContext context, WidgetRef ref) async {
     final service = PrivetService.instance;
     await service.stop();
 
-    // Get data directory for mobile platforms.
     String? dataDir;
     try {
       final dir = await getApplicationDocumentsDirectory();

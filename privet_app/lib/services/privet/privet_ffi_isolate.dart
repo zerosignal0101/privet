@@ -153,6 +153,21 @@ class PrivetFfiIsolate {
     return r['ok'] == true;
   }
 
+  Future<bool> trustAndAcceptPeer(String fingerprint) async {
+    final r = await _call('trust_and_accept_peer', {'fingerprint': fingerprint});
+    return r['ok'] == true;
+  }
+
+  Future<bool> rejectPairing(String fingerprint) async {
+    final r = await _call('reject_pairing', {'fingerprint': fingerprint});
+    return r['ok'] == true;
+  }
+
+  Future<bool> unacceptPeer(String fingerprint) async {
+    final r = await _call('unaccept_peer', {'fingerprint': fingerprint});
+    return r['ok'] == true;
+  }
+
   Future<List<Map<String, dynamic>>> getPeers() async {
     final r = await _call('get_peers', {});
     if (r['ok'] == true && r['data'] != null) {
@@ -163,6 +178,14 @@ class PrivetFfiIsolate {
 
   Future<List<String>> getTrustedFingerprints() async {
     final r = await _call('get_trusted_fingerprints', {});
+    if (r['ok'] == true && r['data'] != null) {
+      return (r['data'] as List).cast<String>();
+    }
+    return [];
+  }
+
+  Future<List<String>> getAcceptedFingerprints() async {
+    final r = await _call('get_accepted_fingerprints', {});
     if (r['ok'] == true && r['data'] != null) {
       return (r['data'] as List).cast<String>();
     }
@@ -287,11 +310,23 @@ void _handleCommand(PrivetFfi ffi, _FfiCommand cmd) {
       case 'untrust_peer':
         _cmdTrustAction(ffi, cmd, ffi.untrustPeer);
         break;
+      case 'trust_and_accept_peer':
+        _cmdTrustAction(ffi, cmd, ffi.trustAndAcceptPeer);
+        break;
+      case 'reject_pairing':
+        _cmdTrustAction(ffi, cmd, ffi.rejectPairing);
+        break;
+      case 'unaccept_peer':
+        _cmdTrustAction(ffi, cmd, ffi.unacceptPeer);
+        break;
       case 'get_peers':
         _cmdGetPeers(ffi, cmd);
         break;
       case 'get_trusted_fingerprints':
         _cmdGetTrustedFingerprints(ffi, cmd);
+        break;
+      case 'get_accepted_fingerprints':
+        _cmdGetAcceptedFingerprints(ffi, cmd);
         break;
       case 'get_identity':
         _cmdGetIdentity(ffi, cmd);
@@ -423,6 +458,17 @@ void _cmdGetPeers(PrivetFfi ffi, _FfiCommand cmd) {
 
 void _cmdGetTrustedFingerprints(PrivetFfi ffi, _FfiCommand cmd) {
   final ptr = ffi.getTrustedFingerprints();
+  final json = ffi.readAndFreeJson(ptr);
+  if (json != null) {
+    final data = jsonDecode(json);
+    cmd.replyTo.send({'ok': true, 'data': data});
+  } else {
+    cmd.replyTo.send({'ok': false});
+  }
+}
+
+void _cmdGetAcceptedFingerprints(PrivetFfi ffi, _FfiCommand cmd) {
+  final ptr = ffi.getAcceptedFingerprints();
   final json = ffi.readAndFreeJson(ptr);
   if (json != null) {
     final data = jsonDecode(json);

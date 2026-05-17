@@ -144,7 +144,8 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
   }
 
   void _onEvent(PrivetEvent event) {
-    if (event.type == PrivetEventType.pairRequest &&
+    if ((event.type == PrivetEventType.pairRequest ||
+            event.type == PrivetEventType.awaitingPairing) &&
         event.peer != null &&
         event.pairingCode != null) {
       if (!state.any((p) => p.peer.fingerprint == event.peer!.fingerprint)) {
@@ -164,9 +165,26 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
     return ok;
   }
 
+  Future<bool> trustAndAccept(String fingerprint) async {
+    debugPrint('[pairing] trust_and_accept_peer called: fingerprint=$fingerprint');
+    final service = ref.read(privetServiceProvider);
+    final ok = await service.trustAndAcceptPeer(fingerprint);
+    debugPrint('[pairing] trust_and_accept_peer result: ok=$ok');
+    if (ok) {
+      state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+    }
+    return ok;
+  }
+
   Future<bool> reject(String fingerprint) async {
-    state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
-    return true;
+    debugPrint('[pairing] reject_pairing called: fingerprint=$fingerprint');
+    final service = ref.read(privetServiceProvider);
+    final ok = await service.rejectPairing(fingerprint);
+    debugPrint('[pairing] reject_pairing result: ok=$ok');
+    if (ok) {
+      state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+    }
+    return ok;
   }
 }
 
@@ -196,7 +214,8 @@ class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
   }
 
   void _onEvent(PrivetEvent event) {
-    if (event.type == PrivetEventType.incomingTransfer &&
+    if ((event.type == PrivetEventType.incomingTransfer ||
+            event.type == PrivetEventType.awaitingAccept) &&
         event.sessionId != null) {
       state = [
         ...state.where((t) => t.sessionId != event.sessionId),
@@ -230,6 +249,70 @@ class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
 
 final incomingTransferProvider = NotifierProvider<IncomingTransferNotifier,
     List<IncomingTransfer>>(IncomingTransferNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Trusted peers list (for settings management)
+// ---------------------------------------------------------------------------
+
+class TrustedListNotifier extends Notifier<List<String>> {
+  @override
+  List<String> build() {
+    _load();
+    return [];
+  }
+
+  Future<void> _load() async {
+    final service = ref.read(privetServiceProvider);
+    state = await service.getTrustedFingerprints();
+  }
+
+  Future<void> refresh() async {
+    await _load();
+  }
+
+  Future<void> untrust(String fingerprint) async {
+    final service = ref.read(privetServiceProvider);
+    final ok = await service.untrustPeer(fingerprint);
+    if (ok) {
+      state = state.where((fp) => fp != fingerprint).toList();
+    }
+  }
+}
+
+final trustedListProvider =
+    NotifierProvider<TrustedListNotifier, List<String>>(TrustedListNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Accepted (auto-accept) peers list (for settings management)
+// ---------------------------------------------------------------------------
+
+class AcceptedListNotifier extends Notifier<List<String>> {
+  @override
+  List<String> build() {
+    _load();
+    return [];
+  }
+
+  Future<void> _load() async {
+    final service = ref.read(privetServiceProvider);
+    state = await service.getAcceptedFingerprints();
+  }
+
+  Future<void> refresh() async {
+    await _load();
+  }
+
+  Future<void> unaccept(String fingerprint) async {
+    final service = ref.read(privetServiceProvider);
+    final ok = await service.unacceptPeer(fingerprint);
+    if (ok) {
+      state = state.where((fp) => fp != fingerprint).toList();
+    }
+  }
+}
+
+final acceptedListProvider =
+    NotifierProvider<AcceptedListNotifier, List<String>>(AcceptedListNotifier.new);
 
 // ---------------------------------------------------------------------------
 // Device identity

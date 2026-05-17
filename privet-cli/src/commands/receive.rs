@@ -17,6 +17,10 @@ pub struct ReceiveArgs {
     /// Auto-accept transfers from trusted peers
     #[arg(long)]
     pub auto_accept_trusted: bool,
+
+    /// Non-interactive mode: reject all pairing requests and non-auto-accepted transfers
+    #[arg(long)]
+    pub non_interactive: bool,
 }
 
 pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Result<()> {
@@ -31,17 +35,70 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
     println!("Listening for incoming transfers on port {}...", config.transport.listen_port);
     println!("Download directory: {}", config.download_dir.display());
 
-    // Subscribe to events and print them
     let mut events = engine.subscribe_events().await;
 
-    println!("Waiting for incoming transfers... (Ctrl+C to stop)");
+    let mode = if args.non_interactive {
+        "non-interactive"
+    } else {
+        "interactive"
+    };
+    println!("Waiting for incoming transfers... (mode: {mode}, Ctrl+C to stop)");
 
     loop {
         match events.recv().await {
+            Some(privet_core::PrivetEvent::AwaitingPairing { session_id: _, peer, code }) => {
+                if args.non_interactive {
+                    println!("\nPairing request from {} (non-interactive, rejecting)", peer.name);
+                    engine.reject_pairing(&peer.fingerprint).await?;
+                } else {
+                    println!("\nPairing request from {}", peer.name);
+                    println!("  Fingerprint: {}", peer.fingerprint);
+                    println!("  Verification code: {code}");
+                    let choice = super::prompt_choice(
+                        "  Options",
+                        "T=Trust, A=Trust+Accept, R=Reject",
+                    );
+                    match choice {
+                        'T' | 't' => {
+                            engine.trust_peer(&peer.fingerprint).await?;
+                            println!("  Trusted.");
+                        }
+                        'A' | 'a' => {
+                            engine.trust_and_accept_peer(&peer.fingerprint).await?;
+                            println!("  Trusted and auto-accepted.");
+                        }
+                        _ => {
+                            engine.reject_pairing(&peer.fingerprint).await?;
+                            println!("  Rejected.");
+                        }
+                    }
+                }
+            }
+            Some(privet_core::PrivetEvent::AwaitingAccept { session_id, peer, files }) => {
+                if args.non_interactive {
+                    println!("\nIncoming transfer from {} (non-interactive, rejecting)", peer.name);
+                    engine.reject_transfer(&session_id).await?;
+                } else {
+                    println!("\nIncoming transfer from {}", peer.name);
+                    println!("  Session: {session_id}");
+                    println!("  Files: {} ({})", files.files.len(), super::format_size(files.total_size));
+                    let choice = super::prompt_choice("  Accept?", "A=Accept, R=Reject");
+                    match choice {
+                        'A' | 'a' => {
+                            engine.accept_transfer(&session_id).await?;
+                            println!("  Accepted.");
+                        }
+                        _ => {
+                            engine.reject_transfer(&session_id).await?;
+                            println!("  Rejected.");
+                        }
+                    }
+                }
+            }
             Some(privet_core::PrivetEvent::IncomingTransfer { session_id, peer, files }) => {
                 println!("\nIncoming transfer from {}", peer.name);
                 println!("  Session: {session_id}");
-                println!("  Files: {} ({})", files.files.len(), format_size(files.total_size));
+                println!("  Files: {} ({})", files.files.len(), super::format_size(files.total_size));
             }
             Some(privet_core::PrivetEvent::TransferProgress { session_id: _, progress }) => {
                 print!(
@@ -69,21 +126,4 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
 
     engine.shutdown().await?;
     Ok(())
-}
-
-fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{b:.1} GB")
-    } else if b >= MB {
-        format!("{b:.1} MB")
-    } else if b >= KB {
-        format!("{b:.1} KB")
-    } else {
-        format!("{b} B")
-    }
 }

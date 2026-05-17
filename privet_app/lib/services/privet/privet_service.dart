@@ -19,6 +19,8 @@ enum PrivetEventType {
   transferFailed,
   incomingTransfer,
   networkChanged,
+  awaitingAccept,
+  awaitingPairing,
 }
 
 class PrivetEvent {
@@ -193,6 +195,15 @@ class PrivetService {
   Future<bool> untrustPeer(String fingerprint) =>
       _ffiIsolate.untrustPeer(fingerprint);
 
+  Future<bool> trustAndAcceptPeer(String fingerprint) =>
+      _ffiIsolate.trustAndAcceptPeer(fingerprint);
+
+  Future<bool> rejectPairing(String fingerprint) =>
+      _ffiIsolate.rejectPairing(fingerprint);
+
+  Future<bool> unacceptPeer(String fingerprint) =>
+      _ffiIsolate.unacceptPeer(fingerprint);
+
   // -----------------------------------------------------------------------
   // Queries
   // -----------------------------------------------------------------------
@@ -204,6 +215,9 @@ class PrivetService {
 
   Future<List<String>> getTrustedFingerprints() =>
       _ffiIsolate.getTrustedFingerprints();
+
+  Future<List<String>> getAcceptedFingerprints() =>
+      _ffiIsolate.getAcceptedFingerprints();
 
   Future<DeviceIdentity?> getIdentity() async {
     final json = await _ffiIsolate.getIdentity();
@@ -295,6 +309,31 @@ class PrivetService {
         break;
       case 7: // NetworkChanged
         event = const PrivetEvent(type: PrivetEventType.networkChanged);
+        break;
+      case 8: // AwaitingAccept
+        final aFilesRaw = extra?['files']?['files'] as List<dynamic>?;
+        event = PrivetEvent(
+          type: PrivetEventType.awaitingAccept,
+          sessionId: sessionId,
+          peerId: peerId,
+          peer: extra?['peer'] != null
+              ? PeerInfo.fromJson(extra!['peer'] as Map<String, dynamic>)
+              : null,
+          files: aFilesRaw
+              ?.map((f) => FileEntry.fromJson(f as Map<String, dynamic>))
+              .toList(),
+        );
+        break;
+      case 9: // AwaitingPairing
+        event = PrivetEvent(
+          type: PrivetEventType.awaitingPairing,
+          sessionId: sessionId,
+          peerId: peerId,
+          peer: extra?['peer'] != null
+              ? PeerInfo.fromJson(extra!['peer'] as Map<String, dynamic>)
+              : null,
+          pairingCode: extra?['code'] as String?,
+        );
         break;
       default:
         return; // Unknown event, skip

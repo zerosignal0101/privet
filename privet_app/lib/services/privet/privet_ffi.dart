@@ -39,6 +39,8 @@ const int eventTransferComplete = 4;
 const int eventTransferFailed = 5;
 const int eventIncomingTransfer = 6;
 const int eventNetworkChanged = 7;
+const int eventAwaitingAccept = 8;
+const int eventAwaitingPairing = 9;
 
 // ---------------------------------------------------------------------------
 // FFI function typedefs
@@ -86,6 +88,18 @@ typedef PrivetTrustPeerDart = int Function(Pointer<Utf8> fingerprint);
 typedef PrivetUntrustPeerNative = Int32 Function(Pointer<Utf8> fingerprint);
 typedef PrivetUntrustPeerDart = int Function(Pointer<Utf8> fingerprint);
 
+typedef PrivetTrustAndAcceptPeerNative = Int32 Function(Pointer<Utf8> fingerprint);
+typedef PrivetTrustAndAcceptPeerDart = int Function(Pointer<Utf8> fingerprint);
+
+typedef PrivetRejectPairingNative = Int32 Function(Pointer<Utf8> fingerprint);
+typedef PrivetRejectPairingDart = int Function(Pointer<Utf8> fingerprint);
+
+typedef PrivetGetAcceptedFingerprintsNative = Pointer<Utf8> Function();
+typedef PrivetGetAcceptedFingerprintsDart = Pointer<Utf8> Function();
+
+typedef PrivetUnacceptPeerNative = Int32 Function(Pointer<Utf8> fingerprint);
+typedef PrivetUnacceptPeerDart = int Function(Pointer<Utf8> fingerprint);
+
 typedef PrivetGetPeersNative = Pointer<Utf8> Function();
 typedef PrivetGetPeersDart = Pointer<Utf8> Function();
 
@@ -128,6 +142,10 @@ class PrivetFfi {
   late PrivetCancelTransferDart _cancelTransfer;
   late PrivetTrustPeerDart _trustPeer;
   late PrivetUntrustPeerDart _untrustPeer;
+  late PrivetTrustAndAcceptPeerDart _trustAndAcceptPeer;
+  late PrivetRejectPairingDart _rejectPairing;
+  late PrivetGetAcceptedFingerprintsDart _getAcceptedFingerprints;
+  late PrivetUnacceptPeerDart _unacceptPeer;
   late PrivetGetPeersDart _getPeers;
   late PrivetGetTrustedFingerprintsDart _getTrustedFingerprints;
   late PrivetGetSessionsDart _getSessions;
@@ -166,6 +184,15 @@ class PrivetFfi {
         PrivetTrustPeerDart>('privet_trust_peer');
     _untrustPeer = _lib!.lookupFunction<PrivetUntrustPeerNative,
         PrivetUntrustPeerDart>('privet_untrust_peer');
+    _trustAndAcceptPeer = _lib!.lookupFunction<PrivetTrustAndAcceptPeerNative,
+        PrivetTrustAndAcceptPeerDart>('privet_trust_and_accept_peer');
+    _rejectPairing = _lib!.lookupFunction<PrivetRejectPairingNative,
+        PrivetRejectPairingDart>('privet_reject_pairing');
+    _getAcceptedFingerprints = _lib!.lookupFunction<
+        PrivetGetAcceptedFingerprintsNative,
+        PrivetGetAcceptedFingerprintsDart>('privet_get_accepted_fingerprints');
+    _unacceptPeer = _lib!.lookupFunction<PrivetUnacceptPeerNative,
+        PrivetUnacceptPeerDart>('privet_unaccept_peer');
     _getPeers = _lib!.lookupFunction<PrivetGetPeersNative, PrivetGetPeersDart>(
         'privet_get_peers');
     _getTrustedFingerprints = _lib!.lookupFunction<
@@ -242,9 +269,13 @@ class PrivetFfi {
 
   int trustPeer(Pointer<Utf8> fingerprint) => _trustPeer(fingerprint);
   int untrustPeer(Pointer<Utf8> fingerprint) => _untrustPeer(fingerprint);
+  int trustAndAcceptPeer(Pointer<Utf8> fingerprint) => _trustAndAcceptPeer(fingerprint);
+  int rejectPairing(Pointer<Utf8> fingerprint) => _rejectPairing(fingerprint);
+  int unacceptPeer(Pointer<Utf8> fingerprint) => _unacceptPeer(fingerprint);
 
   Pointer<Utf8> getPeers() => _getPeers();
   Pointer<Utf8> getTrustedFingerprints() => _getTrustedFingerprints();
+  Pointer<Utf8> getAcceptedFingerprints() => _getAcceptedFingerprints();
   Pointer<Utf8> getSessions() => _getSessions();
   Pointer<Utf8> getIdentity() => _getIdentity();
 
