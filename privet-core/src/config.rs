@@ -12,6 +12,7 @@ const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024; // 64 KB
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrivetConfig {
     pub device_name: String,
     pub download_dir: PathBuf,
@@ -20,6 +21,12 @@ pub struct PrivetConfig {
     pub discovery: DiscoveryConfig,
     pub auto_accept_trusted: bool,
     pub log_dir: Option<PathBuf>,
+}
+
+impl Default for PrivetConfig {
+    fn default() -> Self {
+        Self::default_with_name("Privet".to_owned())
+    }
 }
 
 impl PrivetConfig {
@@ -44,6 +51,7 @@ impl PrivetConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TransportConfig {
     pub listen_port: u16,
     pub congestion: CongestionControl,
@@ -88,6 +96,7 @@ pub enum CongestionControl {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityConfig {
     pub cert_dir: Option<PathBuf>,
     pub cert_validity_years: u32,
@@ -103,6 +112,7 @@ impl Default for SecurityConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DiscoveryConfig {
     pub enable_mdns: bool,
     pub enable_beacon: bool,

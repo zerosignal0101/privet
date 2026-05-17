@@ -1,0 +1,27 @@
+name: privet_app
+description: "Privet — high-performance LAN file transfer"
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: ^3.1.0
+  ffi: ^2.1.0
+  path_provider: ^2.1.5
+  shared_preferences: ^2.5.4
+  file_picker: ^9.2.1
+  open_file: ^3.5.10
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

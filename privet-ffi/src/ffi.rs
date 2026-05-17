@@ -11,10 +11,12 @@ use crate::runtime;
 /// Returns 0 on success, -1 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
+    tracing::debug!("privet_init called");
     privet_core::init();
 
     let config_str = unsafe {
         if config_json.is_null() {
+            tracing::error!("privet_init: config_json is null");
             return -1;
         }
         CStr::from_ptr(config_json)
@@ -24,13 +26,19 @@ pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
         config_str.to_str().unwrap_or(""),
     ) {
         Ok(c) => c,
-        Err(_) => return -1,
+        Err(e) => {
+            tracing::error!("privet_init: config parse error: {e}");
+            return -1;
+        }
     };
 
     let rt = runtime::get_runtime();
     let engine = match rt.block_on(privet_core::PrivetEngine::new(config)) {
         Ok(e) => e,
-        Err(_) => return -1,
+        Err(e) => {
+            tracing::error!("privet_init: engine creation failed: {e}");
+            return -1;
+        }
     };
 
     {
@@ -38,7 +46,7 @@ pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
         *guard = Some(engine);
     }
 
-    // Start dispatching events once both engine and callback are ready.
+    tracing::info!("privet_init: engine created successfully");
     runtime::start_event_loop();
     0
 }
@@ -47,15 +55,20 @@ pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
 /// Returns 0 on success, -1 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int {
+    tracing::debug!("privet_init_with_defaults called");
     privet_core::init();
 
     let name = unsafe {
         if device_name.is_null() {
+            tracing::error!("privet_init_with_defaults: device_name is null");
             return -1;
         }
         match CStr::from_ptr(device_name).to_str() {
             Ok(s) => s.to_owned(),
-            Err(_) => return -1,
+            Err(e) => {
+                tracing::error!("privet_init_with_defaults: device_name invalid: {e}");
+                return -1;
+            }
         }
     };
 
@@ -64,7 +77,10 @@ pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int
     let rt = runtime::get_runtime();
     let engine = match rt.block_on(privet_core::PrivetEngine::new(config)) {
         Ok(e) => e,
-        Err(_) => return -1,
+        Err(e) => {
+            tracing::error!("privet_init_with_defaults: engine creation failed: {e}");
+            return -1;
+        }
     };
 
     {
@@ -72,6 +88,7 @@ pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int
         *guard = Some(engine);
     }
 
+    tracing::info!("privet_init_with_defaults: engine created successfully");
     runtime::start_event_loop();
     0
 }
@@ -80,16 +97,26 @@ pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int
 /// Returns 0 on success, -1 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_start() -> c_int {
+    tracing::debug!("privet_start called");
     let rt = runtime::get_runtime();
     let guard = runtime::get_engine().lock().unwrap();
     let engine = match guard.as_ref() {
         Some(e) => e,
-        None => return -1,
+        None => {
+            tracing::error!("privet_start: engine not initialized");
+            return -1;
+        }
     };
 
     match rt.block_on(engine.start()) {
-        Ok(()) => 0,
-        Err(_) => -1,
+        Ok(()) => {
+            tracing::info!("privet_start: engine started successfully");
+            0
+        }
+        Err(e) => {
+            tracing::error!("privet_start: engine start failed: {e}");
+            -1
+        }
     }
 }
 
@@ -104,17 +131,16 @@ pub extern "C" fn privet_stop() {
 }
 
 // ---------------------------------------------------------------------------
-// Event callback
+// Event polling (instead of callback — NativeCallable.listener can't be
+// safely called from Rust/Tokio threads on all platforms).
 // ---------------------------------------------------------------------------
 
-/// Register a callback for events from the engine.
-/// The callback receives a CEvent struct; the caller is responsible for
-/// freeing `extra_json` inside CEvent with `privet_free_string`.
+/// Poll the next pending event. Returns a JSON CString (caller must free
+/// with `privet_free_string`) or null if no event is pending.
+/// Call this periodically from a Dart timer (e.g. every 50 ms).
 #[unsafe(no_mangle)]
-pub extern "C" fn privet_register_event_callback(
-    cb: unsafe extern "C" fn(crate::types::CEvent),
-) {
-    crate::callback::register_callback(cb);
+pub extern "C" fn privet_poll_event() -> *mut c_char {
+    crate::callback::poll_event()
 }
 
 // ---------------------------------------------------------------------------

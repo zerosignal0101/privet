@@ -49,6 +49,9 @@ ipnet = { workspace = true }
 # Discovery
 mdns-sd = { workspace = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-subscriber = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

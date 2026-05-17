@@ -18,12 +18,21 @@ pub struct SendArgs {
     /// Target peer name (resolved via discovery)
     #[arg(long = "to-name")]
     pub to_name: Option<String>,
+
+    /// Auto-accept transfer from untrusted peers (skip pairing)
+    #[arg(long)]
+    pub auto_accept: bool,
 }
 
-pub async fn run(args: SendArgs, config: PrivetConfig) -> privet_core::Result<()> {
+pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Result<()> {
     if args.files.is_empty() {
         eprintln!("No files specified");
         std::process::exit(1);
+    }
+
+    // Apply --auto-accept flag to skip pairing checks on the sender side
+    if args.auto_accept {
+        config.auto_accept_trusted = true;
     }
 
     // Validate that exactly one of --to-ip or --to-name is provided

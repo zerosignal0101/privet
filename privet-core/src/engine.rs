@@ -35,7 +35,9 @@ pub enum PrivetEvent {
 pub struct PrivetEngine {
     config: PrivetConfig,
     identity: DeviceIdentity,
-    trust_store: Mutex<TrustStore>,
+    /// Trust store behind Arc — shared with Receiver so trust is checked
+    /// dynamically (reads the latest store, not a start-time snapshot).
+    trust_store: Arc<tokio::sync::Mutex<TrustStore>>,
     peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
     sessions: RwLock<HashMap<SessionId, TransferSession>>,
     event_tx: mpsc::UnboundedSender<PrivetEvent>,
@@ -50,6 +52,8 @@ pub struct PrivetEngine {
 impl PrivetEngine {
     /// Create a new engine with the given configuration.
     pub async fn new(config: PrivetConfig) -> Result<Self> {
+        tracing::debug!("PrivetEngine::new: device_name={}", config.device_name);
+
         let cert_dir = config
             .security
             .cert_dir
@@ -60,12 +64,14 @@ impl PrivetEngine {
                     .join("privet")
                     .join("certs")
             });
+        tracing::debug!("PrivetEngine::new: cert_dir={:?}", cert_dir);
 
         let identity = DeviceIdentity::load_or_generate(
             config.device_name.clone(),
             cert_dir,
             config.security.cert_validity_years,
         )?;
+        tracing::debug!("PrivetEngine::new: identity loaded, fingerprint={}", identity.fingerprint);
 
         let trust_path = config
             .security
@@ -75,6 +81,7 @@ impl PrivetEngine {
             .unwrap_or_else(|| PathBuf::from("trusted.json"));
 
         let trust_store = TrustStore::load_or_create(trust_path)?;
+        tracing::debug!("PrivetEngine::new: trust_store loaded");
 
         // Initialize transfer log
         let log_dir = config
@@ -91,10 +98,11 @@ impl PrivetEngine {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+        tracing::info!("PrivetEngine::new: engine created");
         Ok(Self {
             config,
             identity,
-            trust_store: Mutex::new(trust_store),
+            trust_store: Arc::new(tokio::sync::Mutex::new(trust_store)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             sessions: RwLock::new(HashMap::new()),
             event_tx,
@@ -109,6 +117,7 @@ impl PrivetEngine {
 
     /// Start the engine: bind QUIC endpoint and begin listening.
     pub async fn start(&self) -> Result<()> {
+        tracing::debug!("PrivetEngine::start: binding endpoint");
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
         let server_config = tls::build_server_config(&self.identity, &trusted)?;
         let rustls_server: Arc<rustls::ServerConfig> = server_config;
@@ -130,8 +139,8 @@ impl PrivetEngine {
         let download_dir = self.config.download_dir.clone();
         let chunk_size = self.config.transport.chunk_size;
         let identity = self.identity.clone();
-        let trusted_fingerprints = self.trust_store.lock().await.trusted_fingerprints();
-        let trusted_fps_for_tcp = trusted_fingerprints.clone();
+        let trust_store = self.trust_store.clone();
+        let trust_store_tcp = trust_store.clone();
         let auto_accept = self.config.auto_accept_trusted;
 
         let listener = async move {
@@ -143,7 +152,7 @@ impl PrivetEngine {
                                 let event_tx = event_tx.clone();
                                 let download_dir = download_dir.clone();
                                 let identity = identity.clone();
-                                let trust_fps = trusted_fingerprints.clone();
+                                let trust_store = trust_store.clone();
                                 tokio::spawn(async move {
                                     let receiver = crate::transfer::receiver::Receiver::new(
                                         conn,
@@ -151,7 +160,7 @@ impl PrivetEngine {
                                         chunk_size,
                                         identity.fingerprint.clone(),
                                         identity.device_name.clone(),
-                                        trust_fps,
+                                        trust_store,
                                         auto_accept,
                                     );
                                     if let Err(e) = receiver.receive(&event_tx).await {
@@ -179,7 +188,7 @@ impl PrivetEngine {
             let tcp_dl = self.config.download_dir.clone();
             let tcp_ck = self.config.transport.chunk_size;
             let tcp_id = self.identity.clone();
-            let tcp_tf = trusted_fps_for_tcp.clone();
+            let tcp_ts = trust_store_tcp.clone();
             let tcp_aa = auto_accept;
             let tcp_handle = tokio::spawn(async move {
                 match tokio::net::TcpListener::bind(tcp_addr).await {
@@ -191,7 +200,7 @@ impl PrivetEngine {
                                     let ev = tcp_ev.clone();
                                     let dl = tcp_dl.clone();
                                     let id = tcp_id.clone();
-                                    let tf = tcp_tf.clone();
+                                    let tf = tcp_ts.lock().await.trusted_fingerprints();
                                     tokio::spawn(async move {
                                         if let Err(e) =
                                             crate::transfer::tcp_transport::receive_tcp(

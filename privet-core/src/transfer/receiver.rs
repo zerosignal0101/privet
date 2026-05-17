@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -22,7 +23,8 @@ pub struct Receiver {
     fingerprint: String,
     #[allow(dead_code)]
     device_name: String,
-    trusted_fingerprints: Vec<String>,
+    /// Shared trust store — checked dynamically (not a snapshot).
+    trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
     auto_accept: bool,
 }
 
@@ -33,7 +35,7 @@ impl Receiver {
         chunk_size: u32,
         fingerprint: String,
         device_name: String,
-        trusted_fingerprints: Vec<String>,
+        trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
         auto_accept: bool,
     ) -> Self {
         let remote_addr = conn.remote_address();
@@ -44,7 +46,7 @@ impl Receiver {
             chunk_size,
             fingerprint,
             device_name,
-            trusted_fingerprints,
+            trust_store,
             auto_accept,
         }
     }
@@ -79,7 +81,7 @@ impl Receiver {
 
         // 2b. Trust check: emit PairRequest immediately if peer not trusted
         //     (continue with handshake so pairing info can be exchanged)
-        let is_trusted = self.trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint);
+        let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == &peer_fingerprint);
         if !is_trusted && !self.auto_accept {
             let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
             let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {

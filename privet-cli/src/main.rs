@@ -3,7 +3,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "privet", version, about = "Fast LAN file transfer with QUIC/BBR3")]
+#[command(name = "privet", version, about = "Fast LAN file transfer with QUIC")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -18,9 +18,21 @@ pub use session::{SessionId, TransferSession, TransferProgress, FileManifest};
 
 static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-/// Initialize the crypto provider. Idempotent — safe to call multiple times.
+/// Initialize logging and crypto. Idempotent — safe to call multiple times.
 pub fn init() {
     INIT.get_or_init(|| {
+        // On Android, set up tracing to stderr (captured by logcat).
+        // On desktop, the application (CLI) sets up its own subscriber.
+        #[cfg(target_os = "android")]
+        {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::new("debug"),
+                )
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+
         #[cfg(feature = "aws-lc-rs")]
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
