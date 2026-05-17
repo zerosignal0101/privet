@@ -32,6 +32,8 @@ pub const EVENT_TRANSFER_COMPLETE: c_int = 4;
 pub const EVENT_TRANSFER_FAILED: c_int = 5;
 pub const EVENT_INCOMING_TRANSFER: c_int = 6;
 pub const EVENT_NETWORK_CHANGED: c_int = 7;
+pub const EVENT_AWAITING_ACCEPT: c_int = 8;
+pub const EVENT_AWAITING_PAIRING: c_int = 9;
 
 /// Encode a UUID as a 36-byte fixed buffer (NUL-terminated).
 pub fn uuid_to_bytes(id: &uuid::Uuid) -> [u8; 36] {
@@ -114,6 +116,24 @@ impl CEvent {
             }
             privet_core::PrivetEvent::NetworkChanged => {
                 ce.event_type = EVENT_NETWORK_CHANGED;
+            }
+            privet_core::PrivetEvent::AwaitingAccept { session_id, peer, files } => {
+                ce.event_type = EVENT_AWAITING_ACCEPT;
+                ce.session_id = uuid_to_bytes(&session_id.0);
+                ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
+                ce.extra_json = json_to_cstring(&serde_json::json!({
+                    "peer": peer,
+                    "files": files,
+                }));
+            }
+            privet_core::PrivetEvent::AwaitingPairing { session_id, peer, code } => {
+                ce.event_type = EVENT_AWAITING_PAIRING;
+                ce.session_id = uuid_to_bytes(&session_id.0);
+                ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
+                ce.extra_json = json_to_cstring(&serde_json::json!({
+                    "peer": peer,
+                    "code": code,
+                }));
             }
         }
 

@@ -28,7 +28,33 @@ pub enum PrivetEvent {
     TransferComplete { session_id: SessionId },
     TransferFailed { session_id: SessionId, error: String },
     IncomingTransfer { session_id: SessionId, peer: PeerInfo, files: crate::session::FileManifest },
+    /// Emitted when an incoming transfer arrives from a trusted peer that is NOT
+    /// in the auto-accept list. The UI/CLI should call `accept_transfer` or
+    /// `reject_transfer` with the session_id.
+    AwaitingAccept {
+        session_id: SessionId,
+        peer: PeerInfo,
+        files: crate::session::FileManifest,
+    },
+    /// Emitted when an incoming pairing request arrives. The UI/CLI should call
+    /// `trust_peer`, `trust_and_accept_peer`, or `reject_pairing`.
+    AwaitingPairing {
+        session_id: SessionId,
+        peer: PeerInfo,
+        code: String,
+    },
     NetworkChanged,
+}
+
+/// Decision for a pairing request from an unknown peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairDecision {
+    /// Trust the device identity only.
+    Trust,
+    /// Trust the device and auto-accept all future transfers.
+    TrustAndAccept,
+    /// Reject the pairing request.
+    Reject,
 }
 
 /// Extract the peer's TLS certificate fingerprint from a TlsStream.
@@ -47,9 +73,14 @@ macro_rules! tls_peer_fingerprint {
 pub struct PrivetEngine {
     config: PrivetConfig,
     identity: DeviceIdentity,
-    /// Trust store behind Arc — shared with Receiver so trust is checked
-    /// dynamically (reads the latest store, not a start-time snapshot).
+    /// Trust store behind Arc — shared with Receiver so trust is checked dynamically.
     trust_store: Arc<tokio::sync::Mutex<TrustStore>>,
+    /// Accept store — which trusted devices auto-accept transfers.
+    accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
+    /// Oneshot channels for pending incoming transfer decisions (session_id → sender).
+    pending_incoming: Arc<RwLock<HashMap<SessionId, tokio::sync::oneshot::Sender<bool>>>>,
+    /// Oneshot channels for pending pairing decisions (peer_fingerprint → sender).
+    pending_pairing: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<PairDecision>>>>,
     peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
     sessions: RwLock<HashMap<SessionId, TransferSession>>,
     event_tx: mpsc::UnboundedSender<PrivetEvent>,
@@ -95,6 +126,16 @@ impl PrivetEngine {
         let trust_store = TrustStore::load_or_create(trust_path)?;
         tracing::debug!("PrivetEngine::new: trust_store loaded");
 
+        // Load accept store
+        let accept_path = config
+            .security
+            .cert_dir
+            .as_ref()
+            .map(|d| d.join("accepted.json"))
+            .unwrap_or_else(|| PathBuf::from("accepted.json"));
+        let accept_store = crate::security::accept::AcceptStore::load_or_create(accept_path)?;
+        tracing::debug!("PrivetEngine::new: accept_store loaded");
+
         // Initialize transfer log
         let log_dir = config
             .log_dir
@@ -115,6 +156,9 @@ impl PrivetEngine {
             config,
             identity,
             trust_store: Arc::new(tokio::sync::Mutex::new(trust_store)),
+            accept_store: Arc::new(tokio::sync::Mutex::new(accept_store)),
+            pending_incoming: Arc::new(RwLock::new(HashMap::new())),
+            pending_pairing: Arc::new(RwLock::new(HashMap::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             sessions: RwLock::new(HashMap::new()),
             event_tx,
@@ -154,6 +198,12 @@ impl PrivetEngine {
         let trust_store = self.trust_store.clone();
         let trust_store_tcp = trust_store.clone();
         let auto_accept = self.config.auto_accept_trusted;
+        let accept_store = self.accept_store.clone();
+        let pending_incoming = self.pending_incoming.clone();
+        let pending_pairing = self.pending_pairing.clone();
+        let accept_store_tcp = accept_store.clone();
+        let pending_incoming_tcp = pending_incoming.clone();
+        let pending_pairing_tcp = pending_pairing.clone();
 
         let listener = async move {
             loop {
@@ -165,6 +215,9 @@ impl PrivetEngine {
                                 let download_dir = download_dir.clone();
                                 let identity = identity.clone();
                                 let trust_store = trust_store.clone();
+                                let accept_store = accept_store.clone();
+                                let pending_incoming = pending_incoming.clone();
+                                let pending_pairing = pending_pairing.clone();
                                 tokio::spawn(async move {
                                     let receiver = crate::transfer::receiver::Receiver::new(
                                         conn,
@@ -174,6 +227,9 @@ impl PrivetEngine {
                                         identity.device_name.clone(),
                                         trust_store,
                                         auto_accept,
+                                        accept_store,
+                                        pending_incoming,
+                                        pending_pairing,
                                     );
                                     if let Err(e) = receiver.receive(&event_tx).await {
                                         tracing::error!("receive error: {e}");
@@ -202,6 +258,9 @@ impl PrivetEngine {
             let tcp_id = self.identity.clone();
             let tcp_ts = trust_store_tcp.clone();
             let tcp_aa = auto_accept;
+            let tcp_accept_store = accept_store_tcp.clone();
+            let tcp_pending_incoming = pending_incoming_tcp.clone();
+            let tcp_pending_pairing = pending_pairing_tcp.clone();
             let tcp_handle = tokio::spawn(async move {
                 // Build TLS server config once (mandatory client auth)
                 let tls_server_cfg = match crate::security::tls::build_tcp_server_config(&tcp_id) {
@@ -224,6 +283,9 @@ impl PrivetEngine {
                                     let ts = tcp_ts.clone();
                                     let aa = tcp_aa;
                                     let ck = tcp_ck;
+                                    let as_ = tcp_accept_store.clone();
+                                    let pi = tcp_pending_incoming.clone();
+                                    let pp = tcp_pending_pairing.clone();
                                     let acceptor = tokio_rustls::TlsAcceptor::from(tls_server_cfg.clone());
                                     tokio::spawn(async move {
                                         // Wrap with TLS
@@ -242,7 +304,7 @@ impl PrivetEngine {
                                         if let Err(e) =
                                             crate::transfer::tcp_transport::receive_tcp(
                                                 tls_stream, dl, ck, &id, &tf, aa,
-                                                tls_fp.as_deref(), &ev,
+                                                tls_fp.as_deref(), as_, &*pi, &*pp, &ev,
                                             )
                                             .await
                                         {
@@ -592,12 +654,18 @@ impl PrivetEngine {
     }
 
     /// Accept an incoming transfer.
-    pub async fn accept_transfer(&self, _session_id: &SessionId) -> Result<()> {
+    pub async fn accept_transfer(&self, session_id: &SessionId) -> Result<()> {
+        if let Some(tx) = self.pending_incoming.write().await.remove(session_id) {
+            let _ = tx.send(true);
+        }
         Ok(())
     }
 
     /// Reject an incoming transfer.
-    pub async fn reject_transfer(&self, _session_id: &SessionId) -> Result<()> {
+    pub async fn reject_transfer(&self, session_id: &SessionId) -> Result<()> {
+        if let Some(tx) = self.pending_incoming.write().await.remove(session_id) {
+            let _ = tx.send(false);
+        }
         Ok(())
     }
 
@@ -607,26 +675,54 @@ impl PrivetEngine {
     }
 
     /// Trust a peer by fingerprint.
+    /// If there is a pending pairing request for this fingerprint,
+    /// it will be resolved with PairDecision::Trust.
     pub async fn trust_peer(&self, fingerprint: &str) -> Result<()> {
-        self.trust_store
-            .lock()
-            .await
-            .trust(fingerprint.to_owned())?;
+        self.trust_store.lock().await.trust(fingerprint.to_owned())?;
+        if let Some(tx) = self.pending_pairing.write().await.remove(fingerprint) {
+            let _ = tx.send(PairDecision::Trust);
+        }
+        Ok(())
+    }
+
+    /// Trust a peer and auto-accept all future transfers from them.
+    pub async fn trust_and_accept_peer(&self, fingerprint: &str) -> Result<()> {
+        self.trust_store.lock().await.trust(fingerprint.to_owned())?;
+        self.accept_store.lock().await.accept(fingerprint.to_owned())?;
+        if let Some(tx) = self.pending_pairing.write().await.remove(fingerprint) {
+            let _ = tx.send(PairDecision::TrustAndAccept);
+        }
+        Ok(())
+    }
+
+    /// Reject a pairing request from a peer.
+    pub async fn reject_pairing(&self, fingerprint: &str) -> Result<()> {
+        if let Some(tx) = self.pending_pairing.write().await.remove(fingerprint) {
+            let _ = tx.send(PairDecision::Reject);
+        }
         Ok(())
     }
 
     /// Remove trust from a peer by fingerprint.
     pub async fn untrust_peer(&self, fingerprint: &str) -> Result<()> {
-        self.trust_store
-            .lock()
-            .await
-            .untrust(fingerprint)?;
+        self.trust_store.lock().await.untrust(fingerprint)?;
         Ok(())
     }
 
     /// Get trusted peers' fingerprints.
     pub async fn trusted_fingerprints(&self) -> Vec<String> {
         self.trust_store.lock().await.trusted_fingerprints()
+    }
+
+    /// Get accepted peers' fingerprints.
+    pub async fn accepted_fingerprints(&self) -> Vec<String> {
+        self.accept_store.lock().await.accepted_fingerprints()
+    }
+
+    /// Remove a peer from the accept store.
+    pub async fn unaccept_peer(&self, fingerprint: &str) -> Result<()> {
+        self.accept_store.lock().await.unaccept(fingerprint)?;
+        Ok(())
     }
 
     /// Get a specific session by ID.

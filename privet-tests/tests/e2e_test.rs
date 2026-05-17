@@ -256,16 +256,16 @@ async fn e2e_pairing_code_deterministic() {
 
     // Collect PairRequest code from sender side
     let send_code = collect_pair_code(&mut send_events, Duration::from_secs(3)).await;
-    // Collect PairRequest code from receiver side
-    let recv_code = collect_pair_code(&mut recv_events, Duration::from_secs(3)).await;
+    // Collect AwaitingPairing code from receiver side
+    let recv_code = collect_awaiting_pairing_code(&mut recv_events, Duration::from_secs(3)).await;
 
     eprintln!(
         "[pairing] sender code={send_code:?} receiver code={recv_code:?}"
     );
 
-    // Both sides must have received a PairRequest with codes
+    // Both sides must have received pairing codes
     assert!(send_code.is_some(), "sender did not receive PairRequest");
-    assert!(recv_code.is_some(), "receiver did not receive PairRequest");
+    assert!(recv_code.is_some(), "receiver did not receive AwaitingPairing");
 
     // The codes must match (both derived from the same fingerprint pair)
     assert_eq!(
@@ -639,6 +639,26 @@ async fn collect_pair_code(
             event = rx.recv() => {
                 match event {
                     Some(privet_core::PrivetEvent::PairRequest { code, .. }) => return Some(code),
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    None
+}
+
+/// Drain events until we find an AwaitingPairing and return its code.
+async fn collect_awaiting_pairing_code(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<privet_core::PrivetEvent>,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(privet_core::PrivetEvent::AwaitingPairing { code, .. }) => return Some(code),
                     _ => {}
                 }
             }

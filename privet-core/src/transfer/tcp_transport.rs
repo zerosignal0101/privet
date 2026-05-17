@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
+use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{PrivetError, TransportError};
 use crate::protocol::data::{self, Chunk};
@@ -30,6 +33,9 @@ pub async fn receive_tcp<S>(
     trusted_fingerprints: &[String],
     auto_accept: bool,
     tls_peer_fingerprint: Option<&str>,
+    accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
+    pending_incoming: &RwLock<HashMap<SessionId, oneshot::Sender<bool>>>,
+    pending_pairing: &RwLock<HashMap<String, oneshot::Sender<crate::engine::PairDecision>>>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
 ) -> Result<(SessionId, String), PrivetError>
 where
@@ -61,12 +67,23 @@ where
         }
     }
 
-    // 2. Trust check: emit PairRequest if not trusted
-    let is_trusted = trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint);
+    // 2. Send HelloAck immediately (sender needs our fingerprint for trust check)
+    let hello_ack = ControlMessage::HelloAck(HelloAck {
+        version: handshake::PROTOCOL_VERSION, accepted: true,
+        fingerprint: identity.fingerprint.clone(),
+    });
+    crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &handshake::serialize(&hello_ack)?).await?;
+
+    // 3. Pairing flow: if peer not trusted, wait for user decision
+    let mut is_trusted = trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint);
     if !is_trusted && !auto_accept {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending_pairing.write().await.insert(peer_fingerprint.clone(), tx);
+
         let code =
             crate::security::trust::TrustStore::pairing_code(&identity.fingerprint, &peer_fingerprint);
-        let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
+        let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
+            session_id: SessionId(uuid::Uuid::nil()),
             peer: crate::peer::PeerInfo {
                 id: crate::peer::PeerId(uuid::Uuid::nil()),
                 name: hello.device_name.clone(),
@@ -79,16 +96,30 @@ where
             },
             code,
         });
-    }
 
-    // 3. Send HelloAck
-    let hello_ack = ControlMessage::HelloAck(HelloAck {
-        version: handshake::PROTOCOL_VERSION,
-        accepted: true,
-        fingerprint: identity.fingerprint.clone(),
-    });
-    let ack_data = handshake::serialize(&hello_ack)?;
-    crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &ack_data).await?;
+        match rx.await.unwrap_or(crate::engine::PairDecision::Reject) {
+            crate::engine::PairDecision::Trust => {
+                is_trusted = true;
+            }
+            crate::engine::PairDecision::TrustAndAccept => {
+                let _ = accept_store.lock().await.accept(peer_fingerprint.clone());
+                is_trusted = true;
+            }
+            crate::engine::PairDecision::Reject => {
+                let reject = ControlMessage::Reject(handshake::Reject {
+                    session_id: SessionId(uuid::Uuid::nil()),
+                    reason: "pairing rejected".into(),
+                });
+                let reject_data = handshake::serialize(&reject)?;
+                let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject_data).await;
+                return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
+            }
+        }
+        pending_pairing.write().await.remove(&peer_fingerprint);
+
+        // If pairing was resolved (Trust), sender may have closed this connection.
+        // read_frame will return error if so — that's fine, sender will retry.
+    }
 
     // 4. Read Offer
     let (_, offer_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
@@ -116,7 +147,48 @@ where
         return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
     }
 
-    // 6. Notify app layer
+    // 5b. AwaitAccept: if trusted but NOT in accept_store, wait for user decision
+    if !auto_accept && !accept_store.lock().await.is_accepted(&peer_fingerprint) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending_incoming.write().await.insert(session_id, tx);
+
+        let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingAccept {
+            session_id,
+            peer: crate::peer::PeerInfo {
+                id: crate::peer::PeerId(uuid::Uuid::nil()),
+                name: hello.device_name.clone(),
+                addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
+                fingerprint: peer_fingerprint.clone(),
+                is_trusted: true,
+                last_seen: std::time::SystemTime::now(),
+                platform: Some(hello.platform.clone()),
+                version: None,
+            },
+            files: crate::session::FileManifest {
+                files: offer.files.files.iter().map(|f| crate::session::FileEntry {
+                    relative_path: f.relative_path.clone(),
+                    size: f.size,
+                    modified: f.modified_secs.map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+                    sha256: f.sha256.clone(),
+                    is_dir: f.is_dir,
+                }).collect(),
+                total_size: offer.total_size,
+            },
+        });
+
+        if !rx.await.unwrap_or(false) {
+            let reject = ControlMessage::Reject(handshake::Reject {
+                session_id,
+                reason: "transfer rejected by user".into(),
+            });
+            let reject_data = handshake::serialize(&reject)?;
+            let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject_data).await;
+            return Err(PrivetError::TransferRejected("transfer rejected by user".into()));
+        }
+        pending_incoming.write().await.remove(&session_id);
+    }
+
+    // 6. Notify app layer of incoming transfer
     let _ = event_tx.send(crate::engine::PrivetEvent::IncomingTransfer {
         session_id,
         peer: crate::peer::PeerInfo {
@@ -124,26 +196,19 @@ where
             name: hello.device_name.clone(),
             addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
             fingerprint: peer_fingerprint.clone(),
-            is_trusted: false,
+            is_trusted: true,
             last_seen: std::time::SystemTime::now(),
             platform: Some(hello.platform.clone()),
             version: None,
         },
         files: crate::session::FileManifest {
-            files: offer
-                .files
-                .files
-                .iter()
-                .map(|f| crate::session::FileEntry {
-                    relative_path: f.relative_path.clone(),
-                    size: f.size,
-                    modified: f.modified_secs.map(|s| {
-                        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s)
-                    }),
-                    sha256: f.sha256.clone(),
-                    is_dir: f.is_dir,
-                })
-                .collect(),
+            files: offer.files.files.iter().map(|f| crate::session::FileEntry {
+                relative_path: f.relative_path.clone(),
+                size: f.size,
+                modified: f.modified_secs.map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+                sha256: f.sha256.clone(),
+                is_dir: f.is_dir,
+            }).collect(),
             total_size: offer.total_size,
         },
     });
