@@ -31,6 +31,18 @@ pub enum PrivetEvent {
     NetworkChanged,
 }
 
+/// Extract the peer's TLS certificate fingerprint from a TlsStream.
+macro_rules! tls_peer_fingerprint {
+    ($stream:expr) => {{
+        let (_, session) = $stream.get_ref();
+        session
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| crate::security::cert::fingerprint_from_der(cert.as_ref()))
+    }};
+}
+
+
 /// The top-level engine that orchestrates all subsystems.
 pub struct PrivetEngine {
     config: PrivetConfig,
@@ -181,7 +193,7 @@ impl PrivetEngine {
         *self.listener_handle.write().await = Some(tokio::spawn(listener));
         *self.endpoint.write().await = Some(ep);
 
-        // --- Start TCP fallback listener ---
+        // --- Start TCP fallback listener (with TLS) ---
         if self.config.transport.enable_tcp_fallback {
             let tcp_addr = listen_addr;
             let tcp_ev = self.event_tx.clone();
@@ -191,20 +203,46 @@ impl PrivetEngine {
             let tcp_ts = trust_store_tcp.clone();
             let tcp_aa = auto_accept;
             let tcp_handle = tokio::spawn(async move {
+                // Build TLS server config once (mandatory client auth)
+                let tls_server_cfg = match crate::security::tls::build_tcp_server_config(&tcp_id) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("TCP TLS config build error: {e}");
+                        return;
+                    }
+                };
+
                 match tokio::net::TcpListener::bind(tcp_addr).await {
                     Ok(listener) => {
-                        tracing::info!("TCP fallback listening on {tcp_addr}");
+                        tracing::info!("TCP fallback listening on {tcp_addr} (TLS)");
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
                                     let ev = tcp_ev.clone();
                                     let dl = tcp_dl.clone();
                                     let id = tcp_id.clone();
-                                    let tf = tcp_ts.lock().await.trusted_fingerprints();
+                                    let ts = tcp_ts.clone();
+                                    let aa = tcp_aa;
+                                    let ck = tcp_ck;
+                                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_server_cfg.clone());
                                     tokio::spawn(async move {
+                                        // Wrap with TLS
+                                        let tls_stream = match acceptor.accept(stream).await {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                tracing::error!("TCP TLS handshake error from {addr}: {e}");
+                                                return;
+                                            }
+                                        };
+
+                                        // Extract peer's TLS certificate fingerprint for MITM check
+                                        let tls_fp = tls_peer_fingerprint!(&tls_stream);
+
+                                        let tf = ts.lock().await.trusted_fingerprints();
                                         if let Err(e) =
                                             crate::transfer::tcp_transport::receive_tcp(
-                                                stream, dl, tcp_ck, &id, &tf, tcp_aa, &ev,
+                                                tls_stream, dl, ck, &id, &tf, aa,
+                                                tls_fp.as_deref(), &ev,
                                             )
                                             .await
                                         {
@@ -341,14 +379,70 @@ impl PrivetEngine {
                 ) || matches!(&quic_err, PrivetError::ConnectionTimeout);
 
                 if is_tcp_candidate && self.config.transport.enable_tcp_fallback {
-                    tracing::info!("QUIC failed ({quic_err}), trying TCP fallback to {addr}");
+                    tracing::info!("QUIC failed ({quic_err}), trying TCP+TLS fallback to {addr}");
+                    // Connect TCP, then wrap with TLS for MITM protection
+                    let tcp_stream = match crate::transport::tcp_fallback::connect_tcp(addr).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let msg = format!("TCP connect failed: {e}");
+                            let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                                session_id: SessionId::new(),
+                                error: msg.clone(),
+                            });
+                            return Err(PrivetError::Transport(e));
+                        }
+                    };
+                    let tls_client_cfg = match crate::security::tls::build_client_config(
+                        &self.identity,
+                        &trusted,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let msg = format!("TLS client config error: {e}");
+                            let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                                session_id: SessionId::new(),
+                                error: msg.clone(),
+                            });
+                            return Err(PrivetError::Security(e));
+                        }
+                    };
+                    let connector = tokio_rustls::TlsConnector::from(tls_client_cfg);
+                    let tls_name = match rustls::pki_types::ServerName::try_from("privet") {
+                        Ok(n) => n,
+                        Err(_) => {
+                            let msg: String = "invalid TLS server name".into();
+                            let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                                session_id: SessionId::new(),
+                                error: msg.clone(),
+                            });
+                            return Err(PrivetError::Security(
+                                crate::error::SecurityError::Tls(msg),
+                            ));
+                        }
+                    };
+                    let tls_stream = match connector.connect(tls_name, tcp_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let msg = format!("TLS handshake failed: {e}");
+                            let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+                                session_id: SessionId::new(),
+                                error: msg.clone(),
+                            });
+                            return Err(PrivetError::Security(
+                                crate::error::SecurityError::Tls(msg),
+                            ));
+                        }
+                    };
+                    let tls_fp = tls_peer_fingerprint!(&tls_stream);
                     match crate::transfer::tcp_transport::send_files_tcp(
+                        tls_stream,
                         addr,
                         paths.clone(),
                         self.config.transport.chunk_size,
                         &self.identity,
                         &trusted,
                         auto_accept,
+                        tls_fp.as_deref(),
                         &self.event_tx,
                     )
                     .await
@@ -555,4 +649,5 @@ impl PrivetEngine {
         &self.config
     }
 }
+
 

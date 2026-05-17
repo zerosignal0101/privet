@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::TransportError;
 
@@ -16,12 +16,15 @@ pub async fn connect_tcp(addr: SocketAddr) -> Result<TcpStream, TransportError> 
         .map_err(|e| TransportError::TcpFallback(format!("connect: {e}")))
 }
 
-/// Write a framed message to a TCP stream.
-pub async fn write_frame(
-    stream: &mut TcpStream,
+/// Write a framed message to any async read+write stream (TcpStream or TLS stream).
+pub async fn write_frame<S>(
+    stream: &mut S,
     stream_id: u16,
     data: &[u8],
-) -> Result<(), TransportError> {
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     let len = data.len() as u32;
     let mut header = [0u8; FRAME_HEADER_SIZE];
     header[0..4].copy_from_slice(&len.to_be_bytes());
@@ -39,10 +42,13 @@ pub async fn write_frame(
     Ok(())
 }
 
-/// Read a framed message from a TCP stream.
-pub async fn read_frame(
-    stream: &mut TcpStream,
-) -> Result<(u16, Vec<u8>), TransportError> {
+/// Read a framed message from any async read+write stream.
+pub async fn read_frame<S>(
+    stream: &mut S,
+) -> Result<(u16, Vec<u8>), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     let mut header = [0u8; FRAME_HEADER_SIZE];
     stream
         .read_exact(&mut header)

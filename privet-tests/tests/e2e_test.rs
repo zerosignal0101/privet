@@ -438,13 +438,33 @@ async fn e2e_tcp_fallback_transfer() {
     .expect("identity");
     let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
+    // Connect with TLS to the receiver (its TCP listener now wraps with TLS)
+    let tcp_stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("TCP connect");
+    let tls_client_cfg = privet_core::security::tls::build_client_config(
+        &identity,
+        &[], // empty trusted, but auto_accept=true
+    )
+    .expect("TLS client config");
+    let connector = tokio_rustls::TlsConnector::from(tls_client_cfg);
+    let tls_name = rustls::pki_types::ServerName::try_from("privet")
+        .expect("server name");
+    let tls_stream = connector
+        .connect(tls_name, tcp_stream)
+        .await
+        .expect("TLS handshake");
+    let tls_fp: Option<String> = None; // auto_accept=true, no MITM check needed
+
     privet_core::transfer::tcp_transport::send_files_tcp(
+        tls_stream,
         addr,
         vec![file_path],
         64 * 1024,
         &identity,
         &[], // empty trusted, but auto_accept=true
         true,
+        tls_fp.as_deref(),
         &event_tx,
     )
     .await

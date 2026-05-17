@@ -79,6 +79,20 @@ impl Receiver {
         };
         let peer_fingerprint = hello.fingerprint.clone();
 
+        // 2c. Verify Hello fingerprint matches TLS certificate (MITM protection)
+        if let Some(tls_identity) = self.conn.peer_identity() {
+            if let Some(certs) = tls_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
+                if let Some(cert) = certs.first() {
+                    let tls_fp = crate::security::cert::fingerprint_from_der(cert.as_ref());
+                    if tls_fp != peer_fingerprint {
+                        return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                            format!("TLS certificate fingerprint '{tls_fp}' does not match Hello claim '{peer_fingerprint}'")
+                        )));
+                    }
+                }
+            }
+        }
+
         // 2b. Trust check: emit PairRequest immediately if peer not trusted
         //     (continue with handshake so pairing info can be exchanged)
         let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == &peer_fingerprint);

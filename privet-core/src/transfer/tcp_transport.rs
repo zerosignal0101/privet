@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::error::{PrivetError, TransportError};
@@ -19,17 +19,23 @@ const DATA_STREAM: u16 = 1;
 // ---------------------------------------------------------------------------
 
 /// Handle an incoming TCP connection: full receive flow.
-/// Returns (session_id, peer_fingerprint) on success.
-pub async fn receive_tcp(
-    mut stream: TcpStream,
+/// Accepts any stream implementing AsyncRead+AsyncWrite (raw TcpStream or TLS-wrapped).
+/// `tls_peer_fingerprint` is `Some(fp)` when TLS is used — the fingerprint is
+/// verified against the peer's Hello claim at the application layer.
+pub async fn receive_tcp<S>(
+    mut stream: S,
     download_dir: PathBuf,
     _chunk_size: u32,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
     auto_accept: bool,
+    tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-) -> Result<(SessionId, String), PrivetError> {
-    let remote_addr = stream.peer_addr().ok();
+) -> Result<(SessionId, String), PrivetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let remote_addr: Option<std::net::SocketAddr> = None;
 
     // 1. Read Hello
     let (_, hello_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
@@ -45,6 +51,15 @@ pub async fn receive_tcp(
         }
     };
     let peer_fingerprint = hello.fingerprint.clone();
+
+    // 1b. If TLS is active, verify Hello fingerprint matches TLS certificate
+    if let Some(tls_fp) = tls_peer_fingerprint {
+        if tls_fp != peer_fingerprint {
+            return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                format!("TLS certificate fingerprint '{tls_fp}' does not match Hello claim '{peer_fingerprint}'")
+            )));
+        }
+    }
 
     // 2. Trust check: emit PairRequest if not trusted
     let is_trusted = trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint);
@@ -216,15 +231,18 @@ pub async fn receive_tcp(
 /// Read data chunks for all files from the TCP stream.
 /// Files are sent sequentially (file 0, then file 1, ...).
 /// Each data frame = postcard-encoded Chunk + raw chunk payload bytes.
-async fn receive_tcp_files(
-    stream: &mut TcpStream,
+async fn receive_tcp_files<S>(
+    stream: &mut S,
     files: &[handshake::FileInfo],
     download_dir: &PathBuf,
     tracker: &std::sync::Arc<std::sync::Mutex<ProgressTracker>>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     session_id: SessionId,
     total_size: u64,
-) -> Result<(), PrivetError> {
+) -> Result<(), PrivetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     for (file_idx, file_info) in files.iter().enumerate() {
         let dest = crate::transfer::receiver::resolve_conflict(download_dir, &file_info.relative_path);
         if let Some(parent) = dest.parent() {
@@ -303,22 +321,23 @@ async fn receive_tcp_files(
 // Sender side
 // ---------------------------------------------------------------------------
 
-/// Connect to a peer via TCP and send files.
-/// Returns (session_id, peer_fingerprint) on success.
-pub async fn send_files_tcp(
+/// Send files over a pre-connected TCP stream (raw or TLS-wrapped).
+/// `tls_peer_fingerprint` is `Some(fp)` when TLS is active — verified against
+/// the peer's HelloAck claim at the app layer.
+pub async fn send_files_tcp<S>(
+    mut stream: S,
     addr: std::net::SocketAddr,
     files: Vec<PathBuf>,
     chunk_size: u32,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
     auto_accept: bool,
+    tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-) -> Result<(SessionId, String), PrivetError> {
-    let stream = crate::transport::tcp_fallback::connect_tcp(addr)
-        .await
-        .map_err(|e| PrivetError::Transport(e))?;
-
-    let mut tcp = stream;
+) -> Result<(SessionId, String), PrivetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let session_id = SessionId::new();
 
     // 1. Send Hello
@@ -329,10 +348,10 @@ pub async fn send_files_tcp(
         fingerprint: identity.fingerprint.clone(),
     });
     let hello_data = handshake::serialize(&hello)?;
-    crate::transport::tcp_fallback::write_frame(&mut tcp, CONTROL_STREAM, &hello_data).await?;
+    crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &hello_data).await?;
 
     // 2. Read HelloAck
-    let (_, ack_data) = crate::transport::tcp_fallback::read_frame(&mut tcp).await?;
+    let (_, ack_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
     let ack_msg = handshake::deserialize(&ack_data)?;
     let hello_ack = match ack_msg {
         ControlMessage::HelloAck(ack) => ack,
@@ -345,6 +364,15 @@ pub async fn send_files_tcp(
         }
     };
     let peer_fingerprint = hello_ack.fingerprint;
+
+    // 2b. If TLS is active, verify HelloAck fingerprint matches TLS certificate
+    if let Some(tls_fp) = tls_peer_fingerprint {
+        if tls_fp != peer_fingerprint {
+            return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                format!("TLS certificate fingerprint '{tls_fp}' does not match HelloAck claim '{peer_fingerprint}'")
+            )));
+        }
+    }
 
     // 3. Trust check
     if !auto_accept && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
@@ -392,10 +420,10 @@ pub async fn send_files_tcp(
         total_size: manifest.total_size,
     });
     let offer_data = handshake::serialize(&offer)?;
-    crate::transport::tcp_fallback::write_frame(&mut tcp, CONTROL_STREAM, &offer_data).await?;
+    crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &offer_data).await?;
 
     // 5. Read Accept
-    let (_, resp_data) = crate::transport::tcp_fallback::read_frame(&mut tcp).await?;
+    let (_, resp_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
     let resp_msg = handshake::deserialize(&resp_data)?;
     let accept = match resp_msg {
         ControlMessage::Accept(a) => a,
@@ -450,7 +478,7 @@ pub async fn send_files_tcp(
             frame_data.extend_from_slice(&chunk_header);
             frame_data.extend_from_slice(&buf[..n]);
 
-            crate::transport::tcp_fallback::write_frame(&mut tcp, DATA_STREAM, &frame_data).await?;
+            crate::transport::tcp_fallback::write_frame(&mut stream, DATA_STREAM, &frame_data).await?;
 
             offset += n as u64;
             let bytes_so_far = {
@@ -474,10 +502,10 @@ pub async fn send_files_tcp(
     // 7. Send Complete
     let complete = ControlMessage::Complete(handshake::Complete { session_id });
     let complete_data = handshake::serialize(&complete)?;
-    crate::transport::tcp_fallback::write_frame(&mut tcp, CONTROL_STREAM, &complete_data).await?;
+    crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &complete_data).await?;
 
     // 8. Read Verified
-    let (_, verified_data) = crate::transport::tcp_fallback::read_frame(&mut tcp).await?;
+    let (_, verified_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
     let _verified = handshake::deserialize(&verified_data)?;
 
     let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });

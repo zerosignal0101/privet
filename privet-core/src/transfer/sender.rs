@@ -86,6 +86,20 @@ impl Sender {
         };
         let peer_fingerprint = hello_ack.fingerprint;
 
+        // 3c. Verify HelloAck fingerprint matches TLS certificate (MITM protection)
+        if let Some(tls_identity) = self.conn.peer_identity() {
+            if let Some(certs) = tls_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
+                if let Some(cert) = certs.first() {
+                    let tls_fp = crate::security::cert::fingerprint_from_der(cert.as_ref());
+                    if tls_fp != peer_fingerprint {
+                        return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                            format!("TLS certificate fingerprint '{tls_fp}' does not match HelloAck claim '{peer_fingerprint}'")
+                        )));
+                    }
+                }
+            }
+        }
+
         // 3b. Trust check: fail fast if peer not trusted
         if !auto_accept && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
             let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
