@@ -1,15 +1,25 @@
+use std::ffi::CString;
 use std::os::raw::c_int;
 
-/// C-compatible event structure for passing events to Dart.
+/// C-compatible event structure for passing events to Dart/Flutter.
+///
+/// Flat fields cover the common case (progress, complete, failed).
+/// Complex payloads (peer info, file manifest) are serialized as JSON
+/// in `extra_json` — the caller must free it with `privet_free_string`.
 #[repr(C)]
 pub struct CEvent {
     pub event_type: c_int,
+    /// UUID string (36 bytes including NUL terminator), or all zeros if N/A.
     pub session_id: [u8; 36],
+    /// UUID string (36 bytes including NUL terminator), or all zeros if N/A.
     pub peer_id: [u8; 36],
+    /// 0.0–100.0 for progress events, 0.0 otherwise.
     pub progress_percent: f64,
     pub speed_bps: f64,
     pub bytes_transferred: u64,
     pub total_bytes: u64,
+    /// JSON-encoded extra payload (must be freed with `privet_free_string`).
+    /// Null if no extra data.
     pub extra_json: *mut std::os::raw::c_char,
 }
 
@@ -21,3 +31,92 @@ pub const EVENT_TRANSFER_PROGRESS: c_int = 3;
 pub const EVENT_TRANSFER_COMPLETE: c_int = 4;
 pub const EVENT_TRANSFER_FAILED: c_int = 5;
 pub const EVENT_INCOMING_TRANSFER: c_int = 6;
+pub const EVENT_NETWORK_CHANGED: c_int = 7;
+
+/// Encode a UUID as a 36-byte fixed buffer (NUL-terminated).
+pub fn uuid_to_bytes(id: &uuid::Uuid) -> [u8; 36] {
+    let mut buf = [0u8; 36];
+    let s = id.hyphenated().to_string();
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(35);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf
+}
+
+/// Encode a Rust string as a heap-allocated C string (caller frees with `privet_free_string`).
+/// Returns null if serialization fails.
+pub fn json_to_cstring<T: serde::Serialize>(val: &T) -> *mut std::os::raw::c_char {
+    match serde_json::to_string(val) {
+        Ok(json) => CString::new(json)
+            .map(|cs| cs.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+impl CEvent {
+    /// Convert a PrivetEvent into a CEvent suitable for FFI.
+    pub fn from_privet_event(event: &privet_core::PrivetEvent) -> Self {
+        let mut ce = CEvent {
+            event_type: 0,
+            session_id: [0u8; 36],
+            peer_id: [0u8; 36],
+            progress_percent: 0.0,
+            speed_bps: 0.0,
+            bytes_transferred: 0,
+            total_bytes: 0,
+            extra_json: std::ptr::null_mut(),
+        };
+
+        match event {
+            privet_core::PrivetEvent::PeerDiscovered(peer) => {
+                ce.event_type = EVENT_PEER_DISCOVERED;
+                ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
+                ce.extra_json = json_to_cstring(peer);
+            }
+            privet_core::PrivetEvent::PeerLost(id) => {
+                ce.event_type = EVENT_PEER_LOST;
+                ce.peer_id = uuid_to_bytes(id.as_uuid());
+            }
+            privet_core::PrivetEvent::PairRequest { peer, code } => {
+                ce.event_type = EVENT_PAIR_REQUEST;
+                ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
+                ce.extra_json = json_to_cstring(&serde_json::json!({
+                    "peer": peer,
+                    "code": code,
+                }));
+            }
+            privet_core::PrivetEvent::TransferProgress { session_id, progress } => {
+                ce.event_type = EVENT_TRANSFER_PROGRESS;
+                ce.session_id = uuid_to_bytes(&session_id.0);
+                ce.progress_percent = progress.percent();
+                ce.speed_bps = progress.current_speed_bps;
+                ce.bytes_transferred = progress.bytes_transferred;
+                ce.total_bytes = progress.total_bytes;
+            }
+            privet_core::PrivetEvent::TransferComplete { session_id } => {
+                ce.event_type = EVENT_TRANSFER_COMPLETE;
+                ce.session_id = uuid_to_bytes(&session_id.0);
+            }
+            privet_core::PrivetEvent::TransferFailed { session_id, error } => {
+                ce.event_type = EVENT_TRANSFER_FAILED;
+                ce.session_id = uuid_to_bytes(&session_id.0);
+                ce.extra_json = json_to_cstring(&serde_json::json!({ "error": error }));
+            }
+            privet_core::PrivetEvent::IncomingTransfer { session_id, peer, files } => {
+                ce.event_type = EVENT_INCOMING_TRANSFER;
+                ce.session_id = uuid_to_bytes(&session_id.0);
+                ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
+                ce.extra_json = json_to_cstring(&serde_json::json!({
+                    "peer": peer,
+                    "files": files,
+                }));
+            }
+            privet_core::PrivetEvent::NetworkChanged => {
+                ce.event_type = EVENT_NETWORK_CHANGED;
+            }
+        }
+
+        ce
+    }
+}

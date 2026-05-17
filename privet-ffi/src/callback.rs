@@ -2,17 +2,24 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use super::types::CEvent;
 
-static EVENT_CALLBACK: AtomicPtr<extern "C" fn(CEvent)> = AtomicPtr::new(std::ptr::null_mut());
+/// Stored callback function pointer. The AtomicPtr holds the address of a
+/// function — we store the function pointer itself cast to a raw pointer.
+static EVENT_CALLBACK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
-pub fn register_callback(cb: extern "C" fn(CEvent)) {
-    EVENT_CALLBACK.store(cb as *mut extern "C" fn(CEvent), Ordering::SeqCst);
+/// Register a C-compatible callback that will be invoked for each engine event.
+pub fn register_callback(cb: unsafe extern "C" fn(CEvent)) {
+    EVENT_CALLBACK.store(cb as *mut (), Ordering::SeqCst);
 }
 
-pub fn emit_event(event: CEvent) {
-    let cb = EVENT_CALLBACK.load(Ordering::SeqCst);
-    if !cb.is_null() {
-        unsafe {
-            (*cb)(event);
-        }
+/// Convert a PrivetEvent to a CEvent and invoke the registered callback.
+pub fn emit_event(event: privet_core::PrivetEvent) {
+    let ptr = EVENT_CALLBACK.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        return;
+    }
+    let cb: unsafe extern "C" fn(CEvent) = unsafe { std::mem::transmute(ptr) };
+    let ce = CEvent::from_privet_event(&event);
+    unsafe {
+        cb(ce);
     }
 }

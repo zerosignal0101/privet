@@ -995,9 +995,11 @@ name = "privet-ffi"
 version = "0.1.0"
 dependencies = [
  "privet-core",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

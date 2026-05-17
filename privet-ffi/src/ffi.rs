@@ -3,6 +3,10 @@ use std::os::raw::{c_char, c_int};
 
 use crate::runtime;
 
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
 /// Initialize the privet engine with a JSON config string.
 /// Returns 0 on success, -1 on failure.
 #[unsafe(no_mangle)]
@@ -16,7 +20,9 @@ pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
         CStr::from_ptr(config_json)
     };
 
-    let config: privet_core::PrivetConfig = match serde_json::from_str(config_str.to_str().unwrap_or("")) {
+    let config: privet_core::PrivetConfig = match serde_json::from_str(
+        config_str.to_str().unwrap_or(""),
+    ) {
         Ok(c) => c,
         Err(_) => return -1,
     };
@@ -27,12 +33,51 @@ pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
         Err(_) => return -1,
     };
 
-    let mut guard = runtime::get_engine().lock().unwrap();
-    *guard = Some(engine);
+    {
+        let mut guard = runtime::get_engine().lock().unwrap();
+        *guard = Some(engine);
+    }
+
+    // Start dispatching events once both engine and callback are ready.
+    runtime::start_event_loop();
     0
 }
 
-/// Start the engine (begin listening for connections).
+/// Initialize the privet engine with defaults (only requires device_name).
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int {
+    privet_core::init();
+
+    let name = unsafe {
+        if device_name.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(device_name).to_str() {
+            Ok(s) => s.to_owned(),
+            Err(_) => return -1,
+        }
+    };
+
+    let config = privet_core::PrivetConfig::default_with_name(name);
+
+    let rt = runtime::get_runtime();
+    let engine = match rt.block_on(privet_core::PrivetEngine::new(config)) {
+        Ok(e) => e,
+        Err(_) => return -1,
+    };
+
+    {
+        let mut guard = runtime::get_engine().lock().unwrap();
+        *guard = Some(engine);
+    }
+
+    runtime::start_event_loop();
+    0
+}
+
+/// Start the engine (begin listening for connections + discovery).
+/// Returns 0 on success, -1 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_start() -> c_int {
     let rt = runtime::get_runtime();
@@ -58,8 +103,277 @@ pub extern "C" fn privet_stop() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Event callback
+// ---------------------------------------------------------------------------
+
+/// Register a callback for events from the engine.
+/// The callback receives a CEvent struct; the caller is responsible for
+/// freeing `extra_json` inside CEvent with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_register_event_callback(
+    cb: unsafe extern "C" fn(crate::types::CEvent),
+) {
+    crate::callback::register_callback(cb);
+}
+
+// ---------------------------------------------------------------------------
+// Sending files
+// ---------------------------------------------------------------------------
+
+/// Send files to a peer by address (IP:port string, e.g. "192.168.1.5:53530").
+/// `paths_json` is a JSON array of file path strings.
+/// Returns 0 on success, -1 on failure.
+/// On success, writes the session ID (hyphenated UUID) into `out_session_id`
+/// (must be at least 37 bytes including NUL terminator).
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_send_files_to_addr(
+    addr: *const c_char,
+    paths_json: *const c_char,
+    out_session_id: *mut c_char,
+) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let addr_str = unsafe {
+        if addr.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(addr).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let addr: std::net::SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => return -1,
+    };
+
+    let paths_str = unsafe {
+        if paths_json.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(paths_json).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let paths: Vec<std::path::PathBuf> = match serde_json::from_str(paths_str) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+
+    match rt.block_on(engine.send_files_to_addr(addr, paths)) {
+        Ok(session_id) => {
+            if !out_session_id.is_null() {
+                let id_str = session_id.to_string();
+                let bytes = id_str.as_bytes();
+                let len = bytes.len().min(35);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_session_id as *mut u8, len);
+                    *out_session_id.add(len) = 0; // NUL terminate
+                }
+            }
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Send files to a peer by display name.
+/// `paths_json` is a JSON array of file path strings.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_send_files_to_name(
+    name: *const c_char,
+    paths_json: *const c_char,
+    out_session_id: *mut c_char,
+) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let name_str = unsafe {
+        if name.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(name).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    let paths_str = unsafe {
+        if paths_json.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(paths_json).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let paths: Vec<std::path::PathBuf> = match serde_json::from_str(paths_str) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+
+    match rt.block_on(engine.send_files_to_name(name_str, paths)) {
+        Ok(session_id) => {
+            if !out_session_id.is_null() {
+                let id_str = session_id.to_string();
+                let bytes = id_str.as_bytes();
+                let len = bytes.len().min(35);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_session_id as *mut u8, len);
+                    *out_session_id.add(len) = 0;
+                }
+            }
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer control
+// ---------------------------------------------------------------------------
+
+/// Accept an incoming transfer.
+/// `session_id_str` is a hyphenated UUID string.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_accept_transfer(session_id_str: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let sid = match parse_session_id(session_id_str) {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    match rt.block_on(engine.accept_transfer(&sid)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Reject an incoming transfer.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_reject_transfer(session_id_str: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let sid = match parse_session_id(session_id_str) {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    match rt.block_on(engine.reject_transfer(&sid)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Cancel an active transfer.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_cancel_transfer(session_id_str: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let sid = match parse_session_id(session_id_str) {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    match rt.block_on(engine.cancel_transfer(&sid)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust / pairing
+// ---------------------------------------------------------------------------
+
+/// Trust a peer by fingerprint string.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_trust_peer(fingerprint: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let fp = unsafe {
+        if fingerprint.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(fingerprint).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    match rt.block_on(engine.trust_peer(fp)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Remove trust from a peer by fingerprint string.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_untrust_peer(fingerprint: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let fp = unsafe {
+        if fingerprint.is_null() {
+            return -1;
+        }
+        match CStr::from_ptr(fingerprint).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    match rt.block_on(engine.untrust_peer(fp)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
 /// Get the list of discovered peers as a JSON string.
-/// Caller must free the returned string with privet_free_string.
+/// Caller must free the returned string with `privet_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_peers() -> *mut c_char {
     let rt = runtime::get_runtime();
@@ -78,13 +392,74 @@ pub extern "C" fn privet_get_peers() -> *mut c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// Register a callback for events from the engine.
+/// Get the list of trusted fingerprints as a JSON string.
+/// Caller must free the returned string with `privet_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn privet_register_event_callback(cb: extern "C" fn(crate::types::CEvent)) {
-    crate::callback::register_callback(cb);
+pub extern "C" fn privet_get_trusted_fingerprints() -> *mut c_char {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let fps = rt.block_on(engine.trusted_fingerprints());
+    let json = match serde_json::to_string(&fps) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// Free a string previously returned by privet.
+/// Get the list of active sessions as a JSON string.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_sessions() -> *mut c_char {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let sessions = rt.block_on(engine.list_sessions());
+    let json = match serde_json::to_string(&sessions) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Get the device identity as a JSON string (fingerprint, device_name).
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_identity() -> *mut c_char {
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let identity = engine.identity();
+    let json = match serde_json::to_string(&serde_json::json!({
+        "fingerprint": identity.fingerprint,
+        "device_name": identity.device_name,
+    })) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+/// Free a string previously returned by privet (e.g. from `privet_get_peers`).
+/// Also safe to call on `CEvent.extra_json` pointers.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
@@ -92,4 +467,20 @@ pub extern "C" fn privet_free_string(ptr: *mut c_char) {
             let _ = CString::from_raw(ptr);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a C string as a SessionId UUID.
+fn parse_session_id(s: *const c_char) -> Option<privet_core::SessionId> {
+    let cstr = unsafe {
+        if s.is_null() {
+            return None;
+        }
+        CStr::from_ptr(s)
+    };
+    let uuid = uuid::Uuid::parse_str(cstr.to_str().ok()?).ok()?;
+    Some(privet_core::SessionId(uuid))
 }
