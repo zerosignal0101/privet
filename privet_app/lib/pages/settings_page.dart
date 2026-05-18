@@ -228,7 +228,11 @@ class SettingsPage extends ConsumerWidget {
     } catch (_) {}
 
     final settings = ref.read(settingsProvider);
-    final ok = await service.start(deviceName: settings.deviceName, dataDir: dataDir);
+    final ok = await service.start(
+      deviceName: settings.deviceName,
+      dataDir: dataDir,
+      downloadDir: settings.downloadDir.isNotEmpty ? settings.downloadDir : null,
+    );
     ref.read(engineRunningProvider.notifier).setRunning(ok);
 
     if (context.mounted) {

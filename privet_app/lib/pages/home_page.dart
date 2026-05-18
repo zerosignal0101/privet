@@ -39,9 +39,24 @@ class _HomePageState extends ConsumerState<HomePage> {
       debugPrint('[home] getApplicationDocumentsDirectory failed: $e');
     }
 
+    // Use public Downloads folder for received files (user-accessible).
+    String? downloadDir;
+    if (settings.downloadDir.isNotEmpty) {
+      downloadDir = settings.downloadDir;
+    } else {
+      try {
+        final dir = await getDownloadsDirectory();
+        downloadDir = dir?.path;
+        debugPrint('[home] downloadDir=$downloadDir');
+      } catch (e) {
+        debugPrint('[home] getDownloadsDirectory failed: $e');
+      }
+    }
+
     final ok = await service.start(
       deviceName: settings.deviceName,
       dataDir: dataDir,
+      downloadDir: downloadDir,
     );
     debugPrint('[home] _initEngine: ok=$ok, lastError=${service.lastError}');
     if (mounted) {

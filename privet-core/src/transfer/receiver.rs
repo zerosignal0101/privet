@@ -153,8 +153,31 @@ impl Receiver {
         };
         let session_id = offer.session_id;
 
-        // Trust check
+        // Notify app layer of incoming transfer (before trust check, so UI always sees it)
         let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == peer_fingerprint);
+        let _ = event_tx.send(crate::engine::PrivetEvent::IncomingTransfer {
+            session_id,
+            peer: crate::peer::PeerInfo {
+                id: crate::peer::PeerId(uuid::Uuid::nil()),
+                name: hello.device_name.clone(),
+                addresses: vec![self.remote_addr],
+                fingerprint: peer_fingerprint.to_owned(),
+                is_trusted,
+                last_seen: std::time::SystemTime::now(),
+                platform: Some(hello.platform.clone()),
+                version: None,
+            },
+            files: crate::session::FileManifest {
+                files: offer.files.files.iter().map(|f| crate::session::FileEntry {
+                    relative_path: f.relative_path.clone(), size: f.size,
+                    modified: f.modified_secs.map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+                    sha256: f.sha256.clone(), is_dir: f.is_dir,
+                }).collect(),
+                total_size: offer.total_size,
+            },
+        });
+
+        // Trust check
         if !is_trusted && !self.auto_accept {
             let reject = ControlMessage::Reject(handshake::Reject {
                 session_id, reason: "pairing required: peer not trusted".into(),
