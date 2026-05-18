@@ -192,7 +192,8 @@ impl PrivetEngine {
 
     /// Start the engine: bind QUIC endpoint and begin listening.
     pub async fn start(&self) -> Result<()> {
-        tracing::debug!("PrivetEngine::start: binding endpoint");
+        tracing::info!("PrivetEngine::start: security_mode={:?}, download_dir={:?}",
+            self.config.security_mode, self.config.download_dir);
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
         let server_config = tls::build_server_config(&self.identity, &trusted)?;
         let rustls_server: Arc<rustls::ServerConfig> = server_config;
@@ -290,7 +291,8 @@ impl PrivetEngine {
                     }
                 };
 
-                match tokio::net::TcpListener::bind(tcp_addr).await {
+                let tcp_listener = endpoint::reuseable_tcp_listener(tcp_addr);
+                match tcp_listener {
                     Ok(listener) => {
                         tracing::info!("TCP fallback listening on {tcp_addr} (TLS)");
                         loop {
@@ -434,7 +436,10 @@ impl PrivetEngine {
         }
         if let Some(ep) = self.endpoint.write().await.take() {
             ep.close(0u32.into(), b"shutdown");
+            drop(ep);
         }
+        // Short sleep to let the UDP socket be released before a rebind.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         Ok(())
     }
 

@@ -117,6 +117,9 @@ class TransferProgressNotifier
       state = Map.from(state)..remove(event.sessionId);
     }
   }
+
+  /// Clear all progress — called on engine restart.
+  void clear() => state = {};
 }
 
 final transferProgressProvider = NotifierProvider<TransferProgressNotifier,
@@ -199,7 +202,8 @@ class IncomingTransfer {
   final String sessionId;
   final PeerInfo? peer;
   final List<FileEntry> files;
-  const IncomingTransfer(this.sessionId, this.peer, this.files);
+  final bool isAwaitingAccept; // true for AwaitingAccept events, false for informational IncomingTransfer
+  const IncomingTransfer(this.sessionId, this.peer, this.files, {this.isAwaitingAccept = false});
 }
 
 class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
@@ -217,10 +221,11 @@ class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
     if ((event.type == PrivetEventType.incomingTransfer ||
             event.type == PrivetEventType.awaitingAccept) &&
         event.sessionId != null) {
-      debugPrint('[IncomingTransferNotifier] _onEvent: ${event.type} sessionId=${event.sessionId}');
+      final isAwaiting = event.type == PrivetEventType.awaitingAccept;
+      debugPrint('[IncomingTransferNotifier] _onEvent: ${event.type} sessionId=${event.sessionId} isAwaitingAccept=$isAwaiting');
       state = [
         ...state.where((t) => t.sessionId != event.sessionId),
-        IncomingTransfer(event.sessionId!, event.peer, event.files ?? []),
+        IncomingTransfer(event.sessionId!, event.peer, event.files ?? [], isAwaitingAccept: isAwaiting),
       ];
       debugPrint('[IncomingTransferNotifier] state count=${state.length}');
     } else if ((event.type == PrivetEventType.transferComplete ||
@@ -253,6 +258,9 @@ class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
     }
     return ok;
   }
+
+  /// Clear all pending incoming transfers — called on engine restart.
+  void clear() => state = [];
 }
 
 final incomingTransferProvider = NotifierProvider<IncomingTransferNotifier,

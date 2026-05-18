@@ -26,7 +26,7 @@ pub fn build_server_endpoint(
     let tp_cfg = build_transport_config(config);
     server_config.transport_config(tp_cfg);
 
-    let socket = StdUdpSocket::bind(listen_addr)
+    let socket = reuseable_udp_socket(listen_addr)
         .map_err(|e| TransportError::Quic(format!("bind {listen_addr}: {e}")))?;
 
     let endpoint = Endpoint::new(
@@ -103,4 +103,35 @@ pub fn build_transport_config(config: &PrivetTransportConfig) -> Arc<TransportCo
     }
 
     Arc::new(tp_cfg)
+}
+
+/// Create a UDP socket with SO_REUSEADDR enabled, allowing immediate rebind
+/// on engine restart (prevents EADDRINUSE after shutdown).
+fn reuseable_udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&socket2::SockAddr::from(addr))?;
+    // Convert back to std UdpSocket for Quinn.
+    Ok(std::net::UdpSocket::from(sock))
+}
+
+/// Create a TCP listener with SO_REUSEADDR for reliable engine restart.
+pub fn reuseable_tcp_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&socket2::SockAddr::from(addr))?;
+    sock.listen(128)?;
+    // Convert to tokio TcpListener.
+    let std_listener: std::net::TcpListener = sock.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }

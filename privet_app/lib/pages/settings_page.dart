@@ -69,20 +69,20 @@ class SettingsPage extends ConsumerWidget {
             child: Column(
               children: [
                 RadioListTile<String>(
-                  title: const Text('Trust Required (默认)'),
-                  subtitle: const Text('手动配对信任，信任后自动接收文件'),
+                  title: const Text('Trust Required (Default)'),
+                  subtitle: const Text('Manual pairing and trust; auto-accept from trusted devices'),
                   secondary: const Icon(Icons.shield_outlined),
                   value: 'trust_required',
                 ),
                 RadioListTile<String>(
                   title: const Text('Allow All'),
-                  subtitle: const Text('自动信任未知设备，自动接受所有传输'),
+                  subtitle: const Text('Auto-trust unknown devices and auto-accept all transfers'),
                   secondary: const Icon(Icons.public),
                   value: 'allow_all',
                 ),
                 RadioListTile<String>(
                   title: const Text('Strict'),
-                  subtitle: const Text('手动配对，特殊准许设备自动接收，其余需手动确认'),
+                  subtitle: const Text('Manual pairing; auto-accept from approved devices, manual confirm for others'),
                   secondary: const Icon(Icons.security),
                   value: 'strict',
                 ),
@@ -330,8 +330,8 @@ class SettingsPage extends ConsumerWidget {
             TextField(
               controller: labelController,
               decoration: const InputDecoration(
-                labelText: 'Network Label (e.g. 公司网络)',
-                hintText: '公司网络',
+                labelText: 'Network Label (e.g. Office Network)',
+                hintText: 'Office Network',
               ),
             ),
           ],
@@ -382,6 +382,10 @@ class SettingsPage extends ConsumerWidget {
       securityMode: settings.securityMode,
     );
     ref.read(engineRunningProvider.notifier).setRunning(ok);
+    if (ok) {
+      ref.read(incomingTransferProvider.notifier).clear();
+      ref.read(transferProgressProvider.notifier).clear();
+    }
 
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(

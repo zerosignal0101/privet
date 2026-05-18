@@ -94,6 +94,7 @@ class PrivetService {
       }
 
       // Listen for events from the isolate
+      await _eventSub?.cancel();
       final stream = await _ffiIsolate.eventStream;
       _eventSub = stream.listen(_onRawEvent);
 

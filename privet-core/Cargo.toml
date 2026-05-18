@@ -49,6 +49,9 @@ ipnet = { workspace = true }
 # Discovery
 mdns-sd = { workspace = true }
 
+# Socket configuration (SO_REUSEADDR for reliable restart)
+socket2 = { version = "0.5", features = [] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-subscriber = { workspace = true }
 log = { workspace = true }

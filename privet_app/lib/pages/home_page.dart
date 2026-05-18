@@ -66,6 +66,11 @@ class _HomePageState extends ConsumerState<HomePage> {
     if (mounted) {
       ref.read(engineRunningProvider.notifier).setRunning(ok);
     }
+    if (ok) {
+      // Clear stale transfer state from previous engine instance
+      ref.read(incomingTransferProvider.notifier).clear();
+      ref.read(transferProgressProvider.notifier).clear();
+    }
   }
 
   Future<void> _scanKnownDevices() async {
@@ -120,17 +125,26 @@ class _HomePageState extends ConsumerState<HomePage> {
                               .reject(req.peer.fingerprint),
                         )),
 
-                  // Incoming transfers
-                  if (incoming.isNotEmpty)
-                    ...incoming.map((t) => _IncomingTransferTile(
-                          transfer: t,
-                          onAccept: () => ref
-                              .read(incomingTransferProvider.notifier)
-                              .accept(t.sessionId),
-                          onReject: () => ref
-                              .read(incomingTransferProvider.notifier)
-                              .reject(t.sessionId),
-                        )),
+                  // Incoming transfers (informational — auto-processing in AllowAll)
+                  if (incoming.any((t) => !t.isAwaitingAccept))
+                    ...incoming
+                        .where((t) => !t.isAwaitingAccept)
+                        .map((t) => _IncomingTransferTile(transfer: t)),
+
+                  // Awaiting user decision (Strict mode)
+                  if (incoming.any((t) => t.isAwaitingAccept))
+                    ...incoming
+                        .where((t) => t.isAwaitingAccept)
+                        .map((t) => _IncomingTransferTile(
+                              transfer: t,
+                              isAwaiting: true,
+                              onAccept: () => ref
+                                  .read(incomingTransferProvider.notifier)
+                                  .accept(t.sessionId),
+                              onReject: () => ref
+                                  .read(incomingTransferProvider.notifier)
+                                  .reject(t.sessionId),
+                            )),
 
                   // Active transfers
                   if (progress.isNotEmpty)
@@ -400,13 +414,15 @@ class _PairingBanner extends StatelessWidget {
 
 class _IncomingTransferTile extends StatelessWidget {
   final IncomingTransfer transfer;
-  final VoidCallback onAccept;
-  final VoidCallback onReject;
+  final bool isAwaiting;
+  final VoidCallback? onAccept;
+  final VoidCallback? onReject;
 
   const _IncomingTransferTile({
     required this.transfer,
-    required this.onAccept,
-    required this.onReject,
+    this.isAwaiting = false,
+    this.onAccept,
+    this.onReject,
   });
 
   @override
@@ -417,22 +433,35 @@ class _IncomingTransferTile extends StatelessWidget {
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: ListTile(
-        leading: const Icon(Icons.download),
-        title: Text('Incoming: $fileCount file${fileCount != 1 ? 's' : ''}'),
-        subtitle: Text(_formatSize(totalSize)),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            IconButton(
-              icon: const Icon(Icons.close, color: Colors.red),
-              onPressed: onReject,
-            ),
-            IconButton(
-              icon: const Icon(Icons.check, color: Colors.green),
-              onPressed: onAccept,
-            ),
-          ],
+        leading: Icon(
+          isAwaiting ? Icons.help_outline : Icons.download,
+          color: isAwaiting ? Colors.orange : null,
         ),
+        title: Text(
+          isAwaiting
+              ? 'Accept transfer ($fileCount file${fileCount != 1 ? 's' : ''})?'
+              : 'Receiving: $fileCount file${fileCount != 1 ? 's' : ''}',
+        ),
+        subtitle: Text(
+          isAwaiting
+              ? '${_formatSize(totalSize)} — tap check to accept'
+              : _formatSize(totalSize),
+        ),
+        trailing: isAwaiting
+            ? Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.red),
+                    onPressed: onReject,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.check, color: Colors.green),
+                    onPressed: onAccept,
+                  ),
+                ],
+              )
+            : null,
       ),
     );
   }

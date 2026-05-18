@@ -134,6 +134,7 @@ impl Receiver {
 
         // AllowAll: silently trust unknown peers
         if !is_trusted && self.security_mode == SecurityMode::AllowAll {
+            tracing::info!("[receiver] AllowAll: silently trusting peer {}", &peer_fingerprint[..16]);
             let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
         }
 
@@ -195,6 +196,7 @@ impl Receiver {
         // AwaitAccept flow: determine if user prompt is needed
         match self.security_mode {
             SecurityMode::AllowAll | SecurityMode::TrustRequired => {
+                tracing::debug!("[receiver] AllowAll/TrustRequired: auto-accepting session {}", session_id.0);
                 // AllowAll: auto-accept all; TrustRequired: trusted = auto-accept
             }
             SecurityMode::Strict => {
@@ -292,13 +294,26 @@ async fn receive_stream_files(
     session_id: SessionId, total_size: u64,
 ) -> Result<(), PrivetError> {
     for file_entry in &stream_header.files {
-        let dest = if file_entry.start_offset > 0 { download_dir.join(&file_entry.relative_path) } else { resolve_conflict(download_dir, &file_entry.relative_path) };
-        if let Some(parent) = dest.parent() { tokio::fs::create_dir_all(parent).await?; }
-        let mut file = tokio::fs::OpenOptions::new().create(true).write(true).open(&dest).await?;
+        // Use atomic create_new (O_CREAT|O_EXCL) to avoid FUSE caching races
+        let dest;
+        let mut file;
+        if file_entry.start_offset > 0 {
+            // Resume: exact path required (previous partial transfer)
+            dest = download_dir.join(&file_entry.relative_path);
+            if let Some(parent) = dest.parent() { tokio::fs::create_dir_all(parent).await?; }
+            file = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
+            use tokio::io::AsyncSeekExt;
+            file.seek(std::io::SeekFrom::Start(file_entry.start_offset)).await?;
+        } else {
+            // New file: atomically create with unique name
+            let base = download_dir.join(&file_entry.relative_path);
+            let pair = open_file_atomic(&base).await
+                .map_err(PrivetError::Io)?;
+            dest = pair.0;
+            file = pair.1;
+        }
         let expected_bytes = file_entry.total_size.saturating_sub(file_entry.start_offset);
         let mut written: u64 = 0;
-        if file_entry.start_offset > 0 { use tokio::io::AsyncSeekExt; file.seek(std::io::SeekFrom::Start(file_entry.start_offset)).await?; }
-        else { file.set_len(0).await?; }
         while written < expected_bytes {
             let chunk_header_data = control::read_control_frame(data_stream).await
                 .map_err(|_| PrivetError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended early")))?;
@@ -319,15 +334,33 @@ async fn receive_stream_files(
 
 pub(crate) fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> { Ok(u64::MAX) }
 
-pub(crate) fn resolve_conflict(dir: &PathBuf, name: &str) -> PathBuf {
-    let dest = dir.join(name);
-    if !dest.exists() { return dest; }
-    let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = dest.extension().and_then(|s| s.to_str()).unwrap_or("");
-    for i in 1..1000 {
-        let new_name = if ext.is_empty() { format!("{stem} ({i})") } else { format!("{stem} ({i}).{ext}") };
-        let new_path = dir.join(&new_name);
-        if !new_path.exists() { return new_path; }
+/// Atomically create a new file with a unique name using O_CREAT|O_EXCL.
+/// If the base path already exists, appends " (1)", " (2)" etc.
+/// Returns the opened file and the path chosen.
+/// This avoids TOCTOU races and handles FUSE caching quirks on Android.
+pub(crate) async fn open_file_atomic(
+    base: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, tokio::fs::File)> {
+    if let Some(parent) = base.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
-    dest
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_owned();
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("").to_owned();
+    for i in 0..1000 {
+        let candidate = if i == 0 { base.to_path_buf() } else {
+            let name = if ext.is_empty() { format!("{stem} ({i})") } else { format!("{stem} ({i}).{ext}") };
+            base.with_file_name(name)
+        };
+        match tokio::fs::OpenOptions::new()
+            .create_new(true).write(true).open(&candidate).await
+        {
+            Ok(f) => return Ok((candidate, f)),
+            Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no unique name found after 1000 tries for {}", stem),
+    ))
 }

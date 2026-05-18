@@ -315,20 +315,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     for (file_idx, file_info) in files.iter().enumerate() {
-        let dest = crate::transfer::receiver::resolve_conflict(download_dir, &file_info.relative_path);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&dest)
-            .await?;
+        let base = download_dir.join(&file_info.relative_path);
+        let pair = crate::transfer::receiver::open_file_atomic(&base).await?;
+        let dest = pair.0;
+        let mut file = pair.1;
 
         let expected_bytes = file_info.size;
         let mut written: u64 = 0;
-        file.set_len(0).await?;
 
         while written < expected_bytes {
             let (sid, frame_data) =
