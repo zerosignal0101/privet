@@ -28,6 +28,8 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   Future<void> _initEngine() async {
     final service = PrivetService.instance;
+    // Wait for SharedPreferences to load before reading settings
+    await ref.read(settingsProvider.notifier).ready;
     final settings = ref.read(settingsProvider);
 
     // Get the app's documents directory for data storage (important on Android).
@@ -459,7 +461,10 @@ class _ActiveTransferTile extends StatelessWidget {
       subtitle: Text(
         '${progress.sizeText} · ${progress.percent.toStringAsFixed(1)}%',
       ),
-      trailing: LinearProgressIndicator(value: progress.percent / 100),
+      trailing: const SizedBox(
+        width: 100,
+        child: LinearProgressIndicator(),
+      ),
     );
   }
 }

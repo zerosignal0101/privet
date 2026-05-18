@@ -121,7 +121,7 @@ class PrivetService {
     final resolvedDownloadDir = downloadDir ?? '$dataDir/Downloads';
     final resolvedSecurityMode = securityMode ?? 'trust_required';
 
-    return jsonEncode({
+    final config = {
       'device_name': deviceName,
       'download_dir': resolvedDownloadDir,
       'log_dir': logDir,
@@ -138,7 +138,9 @@ class PrivetService {
         'enable_beacon': true,
       },
       'security_mode': resolvedSecurityMode,
-    });
+    };
+    print('[privet_service] config JSON: $config');
+    return jsonEncode(config);
   }
 
   /// Initialize with custom JSON config.
@@ -299,6 +301,7 @@ class PrivetService {
     final sessionId = raw['session_id'] as String?;
     final peerId = raw['peer_id'] as String?;
     final extra = raw['extra'] as Map<String, dynamic>?;
+    print('[privet_service] _onRawEvent: type=$eventType sessionId=$sessionId');
 
     PrivetEvent event;
     switch (eventType) {

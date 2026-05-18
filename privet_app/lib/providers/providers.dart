@@ -217,29 +217,37 @@ class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
     if ((event.type == PrivetEventType.incomingTransfer ||
             event.type == PrivetEventType.awaitingAccept) &&
         event.sessionId != null) {
+      debugPrint('[IncomingTransferNotifier] _onEvent: ${event.type} sessionId=${event.sessionId}');
       state = [
         ...state.where((t) => t.sessionId != event.sessionId),
         IncomingTransfer(event.sessionId!, event.peer, event.files ?? []),
       ];
+      debugPrint('[IncomingTransferNotifier] state count=${state.length}');
     } else if ((event.type == PrivetEventType.transferComplete ||
             event.type == PrivetEventType.transferFailed) &&
         event.sessionId != null) {
+      debugPrint('[IncomingTransferNotifier] removal event: ${event.type} sessionId=${event.sessionId}');
       state = state.where((t) => t.sessionId != event.sessionId).toList();
     }
   }
 
   Future<bool> accept(String sessionId) async {
+    debugPrint('[IncomingTransferNotifier] accept called: sessionId=$sessionId');
     final service = ref.read(privetServiceProvider);
     final ok = await service.acceptTransfer(sessionId);
+    debugPrint('[IncomingTransferNotifier] accept result: ok=$ok');
     if (ok) {
       state = state.where((t) => t.sessionId != sessionId).toList();
+      debugPrint('[IncomingTransferNotifier] accept: state count=${state.length}');
     }
     return ok;
   }
 
   Future<bool> reject(String sessionId) async {
+    debugPrint('[IncomingTransferNotifier] reject called: sessionId=$sessionId');
     final service = ref.read(privetServiceProvider);
     final ok = await service.rejectTransfer(sessionId);
+    debugPrint('[IncomingTransferNotifier] reject result: ok=$ok');
     if (ok) {
       state = state.where((t) => t.sessionId != sessionId).toList();
     }
@@ -355,6 +363,9 @@ class Settings {
 }
 
 class SettingsNotifier extends Notifier<Settings> {
+  final _readyCompleter = Completer<void>();
+  Future<void> get ready => _readyCompleter.future;
+
   @override
   Settings build() {
     _load();
@@ -369,6 +380,7 @@ class SettingsNotifier extends Notifier<Settings> {
       securityMode: prefs.getString('security_mode') ?? 'trust_required',
       enableTcpFallback: prefs.getBool('enable_tcp_fallback') ?? true,
     );
+    _readyCompleter.complete();
   }
 
   Future<void> setDeviceName(String name) async {

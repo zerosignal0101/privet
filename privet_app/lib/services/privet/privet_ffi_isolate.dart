@@ -479,9 +479,12 @@ void _cmdTransferAction(
   _FfiCommand cmd,
   int Function(Pointer<Utf8>) action,
 ) {
-  final sid = (cmd.args['session_id'] as String).toNativeUtf8();
+  final sessionId = cmd.args['session_id'] as String;
+  print('[isolate] _cmdTransferAction: cmd=${cmd.cmd} sessionId=$sessionId');
+  final sid = sessionId.toNativeUtf8();
   try {
     final result = action(sid);
+    print('[isolate] _cmdTransferAction: result=$result');
     cmd.replyTo.send({'ok': result == 0});
   } finally {
     calloc.free(sid);

@@ -765,17 +765,31 @@ impl PrivetEngine {
 
     /// Accept an incoming transfer.
     pub async fn accept_transfer(&self, session_id: &SessionId) -> Result<()> {
-        if let Some(tx) = self.pending_incoming.write().await.remove(session_id) {
-            let _ = tx.send(true);
-        }
+        tracing::debug!("[engine] accept_transfer called for session {}", session_id.0);
+        let mut map = self.pending_incoming.write().await;
+        tracing::debug!("[engine] pending_incoming keys: {:?}",
+            map.keys().map(|k| k.0).collect::<Vec<_>>());
+        let tx = map.remove(session_id)
+            .ok_or_else(|| {
+                tracing::error!("[engine] accept_transfer: session {} NOT found in pending_incoming", session_id.0);
+                PrivetError::SessionNotFound(session_id.0.to_string())
+            })?;
+        let _ = tx.send(true);
+        tracing::debug!("[engine] accept_transfer: sent true via oneshot for session {}", session_id.0);
         Ok(())
     }
 
     /// Reject an incoming transfer.
     pub async fn reject_transfer(&self, session_id: &SessionId) -> Result<()> {
-        if let Some(tx) = self.pending_incoming.write().await.remove(session_id) {
-            let _ = tx.send(false);
-        }
+        tracing::debug!("[engine] reject_transfer called for session {}", session_id.0);
+        let mut map = self.pending_incoming.write().await;
+        let tx = map.remove(session_id)
+            .ok_or_else(|| {
+                tracing::error!("[engine] reject_transfer: session {} NOT found in pending_incoming", session_id.0);
+                PrivetError::SessionNotFound(session_id.0.to_string())
+            })?;
+        let _ = tx.send(false);
+        tracing::debug!("[engine] reject_transfer: sent false via oneshot for session {}", session_id.0);
         Ok(())
     }
 

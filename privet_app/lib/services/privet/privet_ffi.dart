@@ -11,9 +11,9 @@ final class CEvent extends Struct {
   @Int32()
   external int eventType;
 
-  external Pointer<Uint8> sessionId; // 36 bytes
+  external Pointer<Uint8> sessionId; // 37 bytes (36 UUID chars + NUL)
 
-  external Pointer<Uint8> peerId; // 36 bytes
+  external Pointer<Uint8> peerId; // 37 bytes (36 UUID chars + NUL)
 
   @Double()
   external double progressPercent;

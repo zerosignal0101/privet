@@ -201,6 +201,7 @@ impl Receiver {
                 if !self.accept_store.lock().await.is_accepted(peer_fingerprint) {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.pending_incoming.write().await.insert(session_id, tx);
+            tracing::debug!("[receiver] AwaitingAccept: inserted session {} into pending_incoming", session_id.0);
             let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingAccept {
                 session_id,
                 peer: crate::peer::PeerInfo {
@@ -218,13 +219,16 @@ impl Receiver {
                     total_size: offer.total_size,
                 },
             });
+            tracing::debug!("[receiver] AwaitingAccept: waiting for user decision (session {})...", session_id.0);
             if !rx.await.unwrap_or(false) {
+                tracing::debug!("[receiver] AwaitingAccept: user REJECTED session {}", session_id.0);
                 let reject = ControlMessage::Reject(handshake::Reject {
                     session_id, reason: "transfer rejected by user".into(),
                 });
                 control::write_control_frame(&mut ctrl_send, &handshake::serialize(&reject)?).await?;
                 return Err(PrivetError::TransferRejected("transfer rejected by user".into()));
             }
+            tracing::debug!("[receiver] AwaitingAccept: user ACCEPTED session {}", session_id.0);
             self.pending_incoming.write().await.remove(&session_id);
         }
             }

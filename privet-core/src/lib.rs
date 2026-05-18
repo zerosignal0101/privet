@@ -25,15 +25,21 @@ static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// Initialize logging and crypto. Idempotent — safe to call multiple times.
 pub fn init() {
     INIT.get_or_init(|| {
-        // On Android, set up tracing to stderr (captured by logcat).
+        // On Android, use android_logger to output to logcat.
         // On desktop, the application (CLI) sets up its own subscriber.
         #[cfg(target_os = "android")]
         {
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Debug)
+                    .with_tag("Privet"),
+            );
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::new("debug"),
                 )
                 .with_writer(std::io::stderr)
+                .with_ansi(false)
                 .try_init();
         }
 

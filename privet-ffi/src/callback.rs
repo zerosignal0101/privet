@@ -10,6 +10,26 @@ fn event_queue() -> &'static Mutex<VecDeque<String>> {
 
 /// Push a PrivetEvent into the poll queue as JSON.
 pub fn emit_event(event: privet_core::PrivetEvent) {
+    let event_type_name = match &event {
+        privet_core::PrivetEvent::PeerDiscovered(_) => "PeerDiscovered",
+        privet_core::PrivetEvent::PeerLost(_) => "PeerLost",
+        privet_core::PrivetEvent::PairRequest { .. } => "PairRequest",
+        privet_core::PrivetEvent::TransferProgress { .. } => "TransferProgress",
+        privet_core::PrivetEvent::TransferComplete { .. } => "TransferComplete",
+        privet_core::PrivetEvent::TransferFailed { .. } => "TransferFailed",
+        privet_core::PrivetEvent::IncomingTransfer { session_id, .. } => {
+            tracing::debug!("[callback] emit IncomingTransfer session={}", session_id.0);
+            "IncomingTransfer"
+        }
+        privet_core::PrivetEvent::NetworkChanged => "NetworkChanged",
+        privet_core::PrivetEvent::AwaitingAccept { session_id, .. } => {
+            tracing::debug!("[callback] emit AwaitingAccept session={}", session_id.0);
+            "AwaitingAccept"
+        }
+        privet_core::PrivetEvent::AwaitingPairing { .. } => "AwaitingPairing",
+        privet_core::PrivetEvent::KnownDeviceProbed { .. } => "KnownDeviceProbed",
+    };
+    tracing::debug!("[callback] emit_event type={}", event_type_name);
     // Convert the event to a CEvent for consistent serialization, then push JSON to queue.
     let ce = super::types::CEvent::from_privet_event(&event);
     // The extra_json is already serialized. We push a JSON map containing
