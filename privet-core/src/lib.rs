@@ -11,7 +11,7 @@ pub mod transfer;
 pub mod transport;
 
 pub use engine::{PrivetEngine, PrivetEvent};
-pub use config::PrivetConfig;
+pub use config::{PrivetConfig, SecurityMode};
 pub use error::{PrivetError, Result};
 pub use peer::{PeerId, PeerInfo};
 pub use session::{SessionId, TransferSession, TransferProgress, FileManifest};

@@ -43,7 +43,7 @@ impl Sender {
         files: &[PathBuf],
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         trusted_fingerprints: &[String],
-        auto_accept: bool,
+        security_mode: &crate::config::SecurityMode,
     ) -> Result<(SessionId, String), PrivetError> {
         let session_id = SessionId::new();
 
@@ -101,7 +101,7 @@ impl Sender {
         }
 
         // 3b. Trust check: fail fast if peer not trusted
-        if !auto_accept && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
+        if *security_mode != crate::config::SecurityMode::AllowAll && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
             let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
             let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
                 peer: crate::peer::PeerInfo {

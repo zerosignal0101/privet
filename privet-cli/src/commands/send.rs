@@ -19,7 +19,11 @@ pub struct SendArgs {
     #[arg(long = "to-name")]
     pub to_name: Option<String>,
 
-    /// Auto-accept transfer from untrusted peers (skip pairing)
+    /// Security mode: allow-all, trust-required (default), strict
+    #[arg(long)]
+    pub security_mode: Option<String>,
+
+    /// Shortcut for --security-mode allow-all
     #[arg(long)]
     pub auto_accept: bool,
 
@@ -34,8 +38,18 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
         std::process::exit(1);
     }
 
-    if args.auto_accept {
-        config.auto_accept_trusted = true;
+    if let Some(ref mode) = args.security_mode {
+        config.security_mode = match mode.as_str() {
+            "allow-all" | "allow_all" => privet_core::SecurityMode::AllowAll,
+            "trust-required" | "trust_required" => privet_core::SecurityMode::TrustRequired,
+            "strict" => privet_core::SecurityMode::Strict,
+            other => {
+                eprintln!("Error: invalid security mode '{other}'. Use: allow-all, trust-required, strict");
+                std::process::exit(1);
+            }
+        };
+    } else if args.auto_accept {
+        config.security_mode = privet_core::SecurityMode::AllowAll;
     }
 
     let has_ip = args.to_ip.is_some();

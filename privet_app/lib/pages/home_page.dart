@@ -57,6 +57,7 @@ class _HomePageState extends ConsumerState<HomePage> {
       deviceName: settings.deviceName,
       dataDir: dataDir,
       downloadDir: downloadDir,
+      securityMode: settings.securityMode,
     );
     debugPrint('[home] _initEngine: ok=$ok, lastError=${service.lastError}');
     if (mounted) {

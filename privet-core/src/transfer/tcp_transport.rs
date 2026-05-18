@@ -31,7 +31,7 @@ pub async fn receive_tcp<S>(
     _chunk_size: u32,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
-    auto_accept: bool,
+    security_mode: &crate::config::SecurityMode,
     tls_peer_fingerprint: Option<&str>,
     accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
     pending_incoming: &RwLock<HashMap<SessionId, oneshot::Sender<bool>>>,
@@ -76,7 +76,7 @@ where
 
     // 3. Pairing flow: if peer not trusted, wait for user decision
     let mut is_trusted = trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint);
-    if !is_trusted && !auto_accept {
+    if !is_trusted && *security_mode != crate::config::SecurityMode::AllowAll {
         let (tx, rx) = tokio::sync::oneshot::channel();
         pending_pairing.write().await.insert(peer_fingerprint.clone(), tx);
 
@@ -121,6 +121,11 @@ where
         // read_frame will return error if so — that's fine, sender will retry.
     }
 
+    // AllowAll: silently trust unknown peers
+    if !is_trusted && *security_mode == crate::config::SecurityMode::AllowAll {
+        is_trusted = true;
+    }
+
     // 4. Read Offer
     let (_, offer_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
     let offer_msg = handshake::deserialize(&offer_data)?;
@@ -137,7 +142,7 @@ where
     let session_id = offer.session_id;
 
     // 5. Trust check: reject if not trusted
-    if !is_trusted && !auto_accept {
+    if !is_trusted && *security_mode != crate::config::SecurityMode::AllowAll {
         let reject = ControlMessage::Reject(handshake::Reject {
             session_id,
             reason: "pairing required: peer not trusted".into(),
@@ -147,8 +152,9 @@ where
         return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
     }
 
-    // 5b. AwaitAccept: if trusted but NOT in accept_store, wait for user decision
-    if !auto_accept && !accept_store.lock().await.is_accepted(&peer_fingerprint) {
+    // 5b. AwaitAccept: if Strict mode and NOT in accept_store, wait for user decision
+    if *security_mode == crate::config::SecurityMode::Strict
+        && !accept_store.lock().await.is_accepted(&peer_fingerprint) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         pending_incoming.write().await.insert(session_id, tx);
 
@@ -396,7 +402,7 @@ pub async fn send_files_tcp<S>(
     chunk_size: u32,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
-    auto_accept: bool,
+    security_mode: &crate::config::SecurityMode,
     tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
 ) -> Result<(SessionId, String), PrivetError>
@@ -440,7 +446,7 @@ where
     }
 
     // 3. Trust check
-    if !auto_accept && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
+    if *security_mode != crate::config::SecurityMode::AllowAll && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
         let code = crate::security::trust::TrustStore::pairing_code(
             &identity.fingerprint,
             &peer_fingerprint,

@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 
 use crate::engine::PairDecision;
+use crate::config::SecurityMode;
 use crate::error::{PrivetError, TransportError};
 use crate::protocol::control;
 use crate::protocol::data::{self, Chunk, StreamHeader};
@@ -23,7 +24,7 @@ pub struct Receiver {
     fingerprint: String,
     device_name: String,
     trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
-    auto_accept: bool,
+    security_mode: SecurityMode,
     accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
     pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>>,
     pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<PairDecision>>>>,
@@ -37,14 +38,14 @@ impl Receiver {
         fingerprint: String,
         device_name: String,
         trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
-        auto_accept: bool,
+        security_mode: SecurityMode,
         accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
         pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>>,
         pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<PairDecision>>>>,
     ) -> Self {
         let remote_addr = conn.remote_address();
         Self { conn, remote_addr, download_dir, chunk_size, fingerprint, device_name,
-            trust_store, auto_accept, accept_store, pending_incoming, pending_pairing }
+            trust_store, security_mode, accept_store, pending_incoming, pending_pairing }
     }
 
     pub async fn receive(
@@ -86,7 +87,7 @@ impl Receiver {
 
         // 4. Pairing flow: if peer not trusted, wait for user decision
         let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == &peer_fingerprint);
-        if !is_trusted && !self.auto_accept {
+        if !is_trusted && self.security_mode != SecurityMode::AllowAll {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.pending_pairing.write().await.insert(peer_fingerprint.clone(), tx);
 
@@ -129,6 +130,11 @@ impl Receiver {
                     return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
                 }
             }
+        }
+
+        // AllowAll: silently trust unknown peers
+        if !is_trusted && self.security_mode == SecurityMode::AllowAll {
+            let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
         }
 
         // 5. Read Offer
@@ -177,8 +183,8 @@ impl Receiver {
             },
         });
 
-        // Trust check
-        if !is_trusted && !self.auto_accept {
+        // Trust check: reject untrusted unless AllowAll
+        if !is_trusted && self.security_mode != SecurityMode::AllowAll {
             let reject = ControlMessage::Reject(handshake::Reject {
                 session_id, reason: "pairing required: peer not trusted".into(),
             });
@@ -186,8 +192,13 @@ impl Receiver {
             return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
         }
 
-        // AwaitAccept flow
-        if !self.auto_accept && !self.accept_store.lock().await.is_accepted(peer_fingerprint) {
+        // AwaitAccept flow: determine if user prompt is needed
+        match self.security_mode {
+            SecurityMode::AllowAll | SecurityMode::TrustRequired => {
+                // AllowAll: auto-accept all; TrustRequired: trusted = auto-accept
+            }
+            SecurityMode::Strict => {
+                if !self.accept_store.lock().await.is_accepted(peer_fingerprint) {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.pending_incoming.write().await.insert(session_id, tx);
             let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingAccept {
@@ -215,6 +226,8 @@ impl Receiver {
                 return Err(PrivetError::TransferRejected("transfer rejected by user".into()));
             }
             self.pending_incoming.write().await.remove(&session_id);
+        }
+            }
         }
 
         // Disk space pre-check

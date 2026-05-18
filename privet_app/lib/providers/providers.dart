@@ -330,26 +330,26 @@ final identityProvider = FutureProvider<DeviceIdentity?>((ref) async {
 class Settings {
   final String deviceName;
   final String downloadDir;
-  final bool autoAcceptTrusted;
+  final String securityMode; // 'allow_all', 'trust_required', 'strict'
   final bool enableTcpFallback;
 
   const Settings({
     this.deviceName = 'Privet',
     this.downloadDir = '',
-    this.autoAcceptTrusted = false,
+    this.securityMode = 'trust_required',
     this.enableTcpFallback = true,
   });
 
   Settings copyWith({
     String? deviceName,
     String? downloadDir,
-    bool? autoAcceptTrusted,
+    String? securityMode,
     bool? enableTcpFallback,
   }) =>
       Settings(
         deviceName: deviceName ?? this.deviceName,
         downloadDir: downloadDir ?? this.downloadDir,
-        autoAcceptTrusted: autoAcceptTrusted ?? this.autoAcceptTrusted,
+        securityMode: securityMode ?? this.securityMode,
         enableTcpFallback: enableTcpFallback ?? this.enableTcpFallback,
       );
 }
@@ -366,7 +366,7 @@ class SettingsNotifier extends Notifier<Settings> {
     state = Settings(
       deviceName: prefs.getString('device_name') ?? 'Privet',
       downloadDir: prefs.getString('download_dir') ?? '',
-      autoAcceptTrusted: prefs.getBool('auto_accept_trusted') ?? false,
+      securityMode: prefs.getString('security_mode') ?? 'trust_required',
       enableTcpFallback: prefs.getBool('enable_tcp_fallback') ?? true,
     );
   }
@@ -383,10 +383,10 @@ class SettingsNotifier extends Notifier<Settings> {
     state = state.copyWith(downloadDir: dir);
   }
 
-  Future<void> setAutoAcceptTrusted(bool value) async {
+  Future<void> setSecurityMode(String value) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('auto_accept_trusted', value);
-    state = state.copyWith(autoAcceptTrusted: value);
+    await prefs.setString('security_mode', value);
+    state = state.copyWith(securityMode: value);
   }
 
   Future<void> setEnableTcpFallback(bool value) async {

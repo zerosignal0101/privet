@@ -34,7 +34,7 @@ fn engine_config(name: &str, listen_port: u16, beacon_port: u16) -> PrivetConfig
     let tmp = std::env::temp_dir().join(format!("privet-test-{name}-{listen_port}"));
     let _ = std::fs::create_dir_all(&tmp);
     config.download_dir = tmp;
-    config.auto_accept_trusted = false;
+    // TrustRequired is the default; no need to set explicitly
     config
 }
 

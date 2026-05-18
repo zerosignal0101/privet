@@ -79,14 +79,14 @@ class PrivetService {
   ///
   /// [downloadDir] is the public directory for received files (e.g. Downloads).
   /// Falls back to `$dataDir/Downloads` if not set.
-  Future<bool> start({String? deviceName, String? dataDir, String? downloadDir}) async {
+  /// [securityMode] is one of 'allow_all', 'trust_required', 'strict'.
+  Future<bool> start({String? deviceName, String? dataDir, String? downloadDir, String? securityMode}) async {
     try {
       final name = deviceName ?? _defaultDeviceName();
 
-      // Always use JSON config so auto_accept_trusted and other settings
-      // are consistently applied. Fall back to "." when dataDir is null.
+      // Build JSON config with all settings
       final resolvedDataDir = dataDir ?? '.';
-      final ok = await _ffiIsolate.init(_buildConfigJson(name, resolvedDataDir, downloadDir));
+      final ok = await _ffiIsolate.init(_buildConfigJson(name, resolvedDataDir, downloadDir, securityMode));
       if (!ok) {
         _lastError = 'Failed to initialize engine';
         return false;
@@ -112,11 +112,13 @@ class PrivetService {
 
   /// Build a JSON config with paths rooted at [dataDir].
   /// [downloadDir] overrides the default Downloads path.
-  String _buildConfigJson(String deviceName, String dataDir, [String? downloadDir]) {
+  /// [securityMode] is one of 'allow_all', 'trust_required', 'strict'.
+  String _buildConfigJson(String deviceName, String dataDir, [String? downloadDir, String? securityMode]) {
     final certDir = '$dataDir/privet/certs';
     final logDir = '$dataDir/privet/logs';
     // Use provided downloadDir, else default to public Downloads location
     final resolvedDownloadDir = downloadDir ?? '$dataDir/Downloads';
+    final resolvedSecurityMode = securityMode ?? 'trust_required';
 
     return jsonEncode({
       'device_name': deviceName,
@@ -134,7 +136,7 @@ class PrivetService {
         'enable_mdns': true,
         'enable_beacon': true,
       },
-      'auto_accept_trusted': false,
+      'security_mode': resolvedSecurityMode,
     });
   }
 

@@ -39,6 +39,10 @@ pub struct PairArgs {
     /// List all auto-accept (accepted) peers
     #[arg(long)]
     pub list_accepted: bool,
+
+    /// Set security mode: allow-all, trust-required (default), strict
+    #[arg(long)]
+    pub set_security_mode: Option<String>,
 }
 
 pub async fn run(args: PairArgs, config: PrivetConfig) -> privet_core::Result<()> {
@@ -132,6 +136,26 @@ pub async fn run(args: PairArgs, config: PrivetConfig) -> privet_core::Result<()
     if let Some(fp) = &args.unaccept {
         engine.unaccept_peer(fp).await?;
         println!("Removed auto-accept for fingerprint: {fp}");
+        return Ok(());
+    }
+
+    if let Some(ref mode) = args.set_security_mode {
+        match mode.as_str() {
+            "allow-all" | "allow_all" => {
+                println!("Security mode set to: AllowAll (auto-trust + auto-accept)");
+            }
+            "trust-required" | "trust_required" => {
+                println!("Security mode set to: TrustRequired (manual trust, auto-accept trusted)");
+            }
+            "strict" => {
+                println!("Security mode set to: Strict (manual trust + manual accept for non-permitted)");
+            }
+            other => {
+                eprintln!("Error: invalid security mode '{other}'. Use: allow-all, trust-required, strict");
+                std::process::exit(1);
+            }
+        }
+        println!("Will take effect on next send/receive.");
         return Ok(());
     }
 

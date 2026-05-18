@@ -11,6 +11,18 @@ const DEFAULT_INITIAL_WINDOW: u64 = 1024 * 1024; // 1 MB
 const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024; // 64 KB
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMode {
+    /// 信任环境：自动信任未知设备，自动接受所有传输
+    AllowAll,
+    /// 风险环境：手动信任，信任后自动接受（忽略 accept_store）
+    #[default]
+    TrustRequired,
+    /// 不可信环境：手动信任，accept_store 内自动接受，其他需手动确认
+    Strict,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivetConfig {
@@ -19,7 +31,7 @@ pub struct PrivetConfig {
     pub transport: TransportConfig,
     pub security: SecurityConfig,
     pub discovery: DiscoveryConfig,
-    pub auto_accept_trusted: bool,
+    pub security_mode: SecurityMode,
     pub log_dir: Option<PathBuf>,
 }
 
@@ -44,7 +56,7 @@ impl PrivetConfig {
             transport: TransportConfig::default(),
             security: SecurityConfig::default(),
             discovery: DiscoveryConfig::default(),
-            auto_accept_trusted: false,
+            security_mode: SecurityMode::TrustRequired,
             log_dir: Some(data_dir.join("logs")),
         }
     }

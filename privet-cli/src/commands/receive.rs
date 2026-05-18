@@ -14,7 +14,11 @@ pub struct ReceiveArgs {
     #[arg(long)]
     pub daemon: bool,
 
-    /// Auto-accept transfers from trusted peers
+    /// Security mode: allow-all, trust-required (default), strict
+    #[arg(long)]
+    pub security_mode: Option<String>,
+
+    /// Shortcut for --security-mode allow-all (auto-accept all transfers)
     #[arg(long)]
     pub auto_accept_trusted: bool,
 
@@ -27,7 +31,19 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
     if let Some(dir) = args.output {
         config.download_dir = dir;
     }
-    config.auto_accept_trusted = args.auto_accept_trusted;
+    if let Some(ref mode) = args.security_mode {
+        config.security_mode = match mode.as_str() {
+            "allow-all" | "allow_all" => privet_core::SecurityMode::AllowAll,
+            "trust-required" | "trust_required" => privet_core::SecurityMode::TrustRequired,
+            "strict" => privet_core::SecurityMode::Strict,
+            other => {
+                eprintln!("Error: invalid security mode '{other}'. Use: allow-all, trust-required, strict");
+                std::process::exit(1);
+            }
+        };
+    } else if args.auto_accept_trusted {
+        config.security_mode = privet_core::SecurityMode::AllowAll;
+    }
 
     let engine = privet_core::PrivetEngine::new(config.clone()).await?;
     engine.start().await?;

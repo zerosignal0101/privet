@@ -53,14 +53,39 @@ class SettingsPage extends ConsumerWidget {
 
           const Divider(),
 
-          // Auto-accept trusted
-          SwitchListTile(
-            secondary: const Icon(Icons.auto_mode),
-            title: const Text('Auto-Accept Trusted'),
-            subtitle: const Text('Automatically accept files from trusted peers'),
-            value: settings.autoAcceptTrusted,
-            onChanged: (v) =>
-                ref.read(settingsProvider.notifier).setAutoAcceptTrusted(v),
+          // Security mode selection
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Text(
+              'Security Mode',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+          ),
+          RadioGroup<String>(
+            groupValue: settings.securityMode,
+            onChanged: (v) { if (v != null) ref.read(settingsProvider.notifier).setSecurityMode(v); },
+            child: Column(
+              children: [
+                RadioListTile<String>(
+                  title: const Text('Trust Required (默认)'),
+                  subtitle: const Text('手动配对信任，信任后自动接收文件'),
+                  secondary: const Icon(Icons.shield_outlined),
+                  value: 'trust_required',
+                ),
+                RadioListTile<String>(
+                  title: const Text('Allow All'),
+                  subtitle: const Text('自动信任未知设备，自动接受所有传输'),
+                  secondary: const Icon(Icons.public),
+                  value: 'allow_all',
+                ),
+                RadioListTile<String>(
+                  title: const Text('Strict'),
+                  subtitle: const Text('手动配对，特殊准许设备自动接收，其余需手动确认'),
+                  secondary: const Icon(Icons.security),
+                  value: 'strict',
+                ),
+              ],
+            ),
           ),
 
           // TCP fallback
@@ -232,6 +257,7 @@ class SettingsPage extends ConsumerWidget {
       deviceName: settings.deviceName,
       dataDir: dataDir,
       downloadDir: settings.downloadDir.isNotEmpty ? settings.downloadDir : null,
+      securityMode: settings.securityMode,
     );
     ref.read(engineRunningProvider.notifier).setRunning(ok);
 

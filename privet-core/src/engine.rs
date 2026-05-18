@@ -197,7 +197,7 @@ impl PrivetEngine {
         let identity = self.identity.clone();
         let trust_store = self.trust_store.clone();
         let trust_store_tcp = trust_store.clone();
-        let auto_accept = self.config.auto_accept_trusted;
+        let security_mode = self.config.security_mode;
         let accept_store = self.accept_store.clone();
         let pending_incoming = self.pending_incoming.clone();
         let pending_pairing = self.pending_pairing.clone();
@@ -226,7 +226,7 @@ impl PrivetEngine {
                                         identity.fingerprint.clone(),
                                         identity.device_name.clone(),
                                         trust_store,
-                                        auto_accept,
+                                        security_mode,
                                         accept_store,
                                         pending_incoming,
                                         pending_pairing,
@@ -257,7 +257,7 @@ impl PrivetEngine {
             let tcp_ck = self.config.transport.chunk_size;
             let tcp_id = self.identity.clone();
             let tcp_ts = trust_store_tcp.clone();
-            let tcp_aa = auto_accept;
+            let tcp_sm = security_mode;
             let tcp_accept_store = accept_store_tcp.clone();
             let tcp_pending_incoming = pending_incoming_tcp.clone();
             let tcp_pending_pairing = pending_pairing_tcp.clone();
@@ -281,7 +281,7 @@ impl PrivetEngine {
                                     let dl = tcp_dl.clone();
                                     let id = tcp_id.clone();
                                     let ts = tcp_ts.clone();
-                                    let aa = tcp_aa;
+                                    let aa = tcp_sm;
                                     let ck = tcp_ck;
                                     let as_ = tcp_accept_store.clone();
                                     let pi = tcp_pending_incoming.clone();
@@ -303,7 +303,7 @@ impl PrivetEngine {
                                         let tf = ts.lock().await.trusted_fingerprints();
                                         if let Err(e) =
                                             crate::transfer::tcp_transport::receive_tcp(
-                                                tls_stream, dl, ck, &id, &tf, aa,
+                                                tls_stream, dl, ck, &id, &tf, &aa,
                                                 tls_fp.as_deref(), as_, &*pi, &*pp, &ev,
                                             )
                                             .await
@@ -427,10 +427,9 @@ impl PrivetEngine {
         paths: Vec<PathBuf>,
     ) -> Result<SessionId> {
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
-        let auto_accept = self.config.auto_accept_trusted;
 
         // Try QUIC first
-        let quic_result = self.try_send_quic(addr, &paths, &trusted, auto_accept).await;
+        let quic_result = self.try_send_quic(addr, &paths, &trusted, &self.config.security_mode).await;
 
         let (session_id, peer_fingerprint) = match quic_result {
             Ok(r) => r,
@@ -503,7 +502,7 @@ impl PrivetEngine {
                         self.config.transport.chunk_size,
                         &self.identity,
                         &trusted,
-                        auto_accept,
+                        &self.config.security_mode,
                         tls_fp.as_deref(),
                         &self.event_tx,
                     )
@@ -553,7 +552,7 @@ impl PrivetEngine {
         addr: SocketAddr,
         paths: &[PathBuf],
         trusted: &[String],
-        auto_accept: bool,
+        security_mode: &crate::config::SecurityMode,
     ) -> Result<(SessionId, String)> {
         let client_config = tls::build_client_config(&self.identity, trusted)?;
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -577,7 +576,7 @@ impl PrivetEngine {
             self.identity.device_name.clone(),
         );
 
-        sender.send(paths, &self.event_tx, trusted, auto_accept).await
+        sender.send(paths, &self.event_tx, trusted, security_mode).await
     }
 
     /// Log a completed transfer to the JSONL transfer log.

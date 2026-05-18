@@ -89,7 +89,7 @@ async fn e2e_pairing_rejects_untrusted() {
     recv_config.transport.listen_port = port;
     recv_config.download_dir = recv_dir.clone();
     recv_config.security.cert_dir = Some(cert_dir.join("recv"));
-    recv_config.auto_accept_trusted = true;
+    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
     let recv_engine = privet_core::PrivetEngine::new(recv_config)
         .await
         .expect("recv engine");
@@ -100,7 +100,7 @@ async fn e2e_pairing_rejects_untrusted() {
     // --- Start sender (no trust, auto_accept = false) ---
     let mut send_config = PrivetConfig::default_with_name("pair-send".into());
     send_config.transport.listen_port = 0;
-    send_config.auto_accept_trusted = false;
+    // TrustRequired is the default; no need to set explicitly
     send_config.security.cert_dir = Some(cert_dir.join("send"));
     let send_engine = privet_core::PrivetEngine::new(send_config)
         .await
@@ -233,7 +233,7 @@ async fn e2e_pairing_code_deterministic() {
     let mut rc = PrivetConfig::default_with_name("code-recv".into());
     rc.transport.listen_port = port;
     rc.download_dir = recv_dir.clone();
-    rc.auto_accept_trusted = false;
+    // TrustRequired is the default; rely on that
     rc.security.cert_dir = Some(cert_dir.join("recv"));
     let recv_engine = privet_core::PrivetEngine::new(rc).await.expect("recv");
     recv_engine.start().await.expect("recv start");
@@ -241,7 +241,7 @@ async fn e2e_pairing_code_deterministic() {
 
     let mut sc = PrivetConfig::default_with_name("code-send".into());
     sc.transport.listen_port = 0;
-    sc.auto_accept_trusted = false;
+    // TrustRequired is the default; rely on that
     sc.security.cert_dir = Some(cert_dir.join("send"));
     let send_engine = privet_core::PrivetEngine::new(sc).await.expect("send");
     let mut send_events = send_engine.subscribe_events().await;
@@ -355,7 +355,7 @@ async fn e2e_resume_partial_transfer() {
     let mut recv_config = PrivetConfig::default_with_name("resume-recv".into());
     recv_config.transport.listen_port = port;
     recv_config.download_dir = recv_dir.clone();
-    recv_config.auto_accept_trusted = true;
+    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
     let recv_engine = privet_core::PrivetEngine::new(recv_config)
         .await
         .expect("recv engine");
@@ -368,7 +368,7 @@ async fn e2e_resume_partial_transfer() {
     {
         let mut send_config = PrivetConfig::default_with_name("resume-send".into());
         send_config.transport.listen_port = 0;
-        send_config.auto_accept_trusted = true;
+        send_config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(send_config)
             .await
             .expect("send engine");
@@ -418,7 +418,7 @@ async fn e2e_tcp_fallback_transfer() {
     recv_config.transport.listen_port = port;
     recv_config.transport.enable_tcp_fallback = true;
     recv_config.download_dir = recv_dir.clone();
-    recv_config.auto_accept_trusted = true;
+    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
     let recv_engine = privet_core::PrivetEngine::new(recv_config)
         .await
         .expect("recv engine");
@@ -462,8 +462,8 @@ async fn e2e_tcp_fallback_transfer() {
         vec![file_path],
         64 * 1024,
         &identity,
-        &[], // empty trusted, but auto_accept=true
-        true,
+        &[], // empty trusted, but AllowAll
+        &privet_core::SecurityMode::AllowAll,
         tls_fp.as_deref(),
         &event_tx,
     )
@@ -503,7 +503,7 @@ async fn e2e_transfer_log_created() {
     let mut rc = PrivetConfig::default_with_name("log-recv".into());
     rc.transport.listen_port = port;
     rc.download_dir = recv_dir.clone();
-    rc.auto_accept_trusted = true;
+    rc.security_mode = privet_core::SecurityMode::AllowAll;
     rc.log_dir = Some(log_dir.clone());
     let recv_engine = privet_core::PrivetEngine::new(rc).await.expect("recv");
     recv_engine.start().await.expect("recv start");
@@ -513,7 +513,7 @@ async fn e2e_transfer_log_created() {
     // Sender
     let mut sc = PrivetConfig::default_with_name("log-send".into());
     sc.transport.listen_port = 0;
-    sc.auto_accept_trusted = true;
+    sc.security_mode = privet_core::SecurityMode::AllowAll;
     sc.log_dir = Some(log_dir.clone());
     let send_engine = privet_core::PrivetEngine::new(sc).await.expect("send");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -572,7 +572,7 @@ async fn run_multifile_transfer(sizes: &[usize]) {
         let mut config = PrivetConfig::default_with_name("multi-recv".into());
         config.transport.listen_port = port;
         config.download_dir = recv_dir.clone();
-        config.auto_accept_trusted = true;
+        config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(config)
             .await
             .expect("recv engine");
@@ -588,7 +588,7 @@ async fn run_multifile_transfer(sizes: &[usize]) {
     {
         let mut config = PrivetConfig::default_with_name("multi-send".into());
         config.transport.listen_port = 0;
-        config.auto_accept_trusted = true;
+        config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(config)
             .await
             .expect("send engine");
@@ -691,7 +691,7 @@ async fn run_transfer(file_size: usize) {
         let mut config = PrivetConfig::default_with_name("test-recv".into());
         config.transport.listen_port = port;
         config.download_dir = recv_dir.clone();
-        config.auto_accept_trusted = true;
+        config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(config).await.expect("receiver engine");
         engine.start().await.expect("receiver start");
         engine
@@ -705,7 +705,7 @@ async fn run_transfer(file_size: usize) {
     {
         let mut config = PrivetConfig::default_with_name("test-sender".into());
         config.transport.listen_port = 0;
-        config.auto_accept_trusted = true;
+        config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(config).await.expect("sender engine");
         engine
             .send_files_to_addr(addr, vec![file_path])
