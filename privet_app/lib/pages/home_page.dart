@@ -421,14 +421,26 @@ class _PairingBanner extends StatelessWidget {
             const SizedBox(height: 4),
             Text('Verification code: ${request.code}'),
             const SizedBox(height: 8),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              alignment: WrapAlignment.end,
               children: [
-                TextButton(onPressed: onDismiss, child: const Text('Reject')),
-                const SizedBox(width: 8),
-                OutlinedButton(onPressed: onTrust, child: const Text('Trust')),
-                const SizedBox(width: 8),
-                FilledButton(onPressed: onTrustAndAccept, child: const Text('Trust & Accept')),
+                TextButton.icon(
+                  onPressed: onDismiss,
+                  icon: const Icon(Icons.close, size: 14),
+                  label: const Text('Reject', style: TextStyle(fontSize: 12)),
+                ),
+                OutlinedButton.icon(
+                  onPressed: onTrust,
+                  icon: const Icon(Icons.verified, size: 14),
+                  label: const Text('Trust', style: TextStyle(fontSize: 12)),
+                ),
+                FilledButton.icon(
+                  onPressed: onTrustAndAccept,
+                  icon: const Icon(Icons.star, size: 14),
+                  label: const Text('Trust & Accept', style: TextStyle(fontSize: 12)),
+                ),
               ],
             ),
           ],

@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use crate::engine::PairDecision;
 use crate::config::SecurityMode;
 use crate::error::{PrivetError, TransportError};
+use crate::known_device::KnownDeviceStore;
 use crate::protocol::control;
 use crate::protocol::data::{self, Chunk, StreamHeader};
 use crate::protocol::handshake::{self, Accept, ControlMessage, HelloAck, ResumePoint};
@@ -26,6 +27,7 @@ pub struct Receiver {
     trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
     security_mode: SecurityMode,
     accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
+    known_device_store: Arc<tokio::sync::Mutex<KnownDeviceStore>>,
     pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>>,
     pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<PairDecision>>>>,
 }
@@ -40,12 +42,33 @@ impl Receiver {
         trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
         security_mode: SecurityMode,
         accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
+        known_device_store: Arc<tokio::sync::Mutex<KnownDeviceStore>>,
         pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>>,
         pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<PairDecision>>>>,
     ) -> Self {
         let remote_addr = conn.remote_address();
         Self { conn, remote_addr, download_dir, chunk_size, fingerprint, device_name,
-            trust_store, security_mode, accept_store, pending_incoming, pending_pairing }
+            trust_store, security_mode, accept_store, known_device_store, pending_incoming, pending_pairing }
+    }
+
+    /// Record the peer as a known device after trust is established.
+    async fn record_known_device(&self, fingerprint: String, device_name: &str) {
+        let subnet = crate::network::subnet_from_addr(
+            &self.remote_addr.ip(),
+            crate::network::default_prefix_len(match self.remote_addr.ip() {
+                std::net::IpAddr::V4(ref v4) => v4,
+                std::net::IpAddr::V6(_) => return,
+            }),
+        );
+        let mut store = self.known_device_store.lock().await;
+        let _ = store.add_or_update_device(
+            fingerprint,
+            crate::peer::PeerId(uuid::Uuid::nil()),
+            device_name.to_owned(),
+            subnet,
+            self.remote_addr,
+            None,
+        );
     }
 
     /// Send a Reject on the control stream and wait for the sender to close.
@@ -123,25 +146,36 @@ impl Receiver {
         // 4. Pairing flow: if peer not trusted, wait for user decision
         let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == &peer_fingerprint);
         if !is_trusted && self.security_mode != SecurityMode::AllowAll {
+            // Check if there's already a pending pairing for this peer
+            // (e.g. from a previous connection that the sender retried).
+            let already_pending = self.pending_pairing.read().await.contains_key(&peer_fingerprint);
+
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.pending_pairing.write().await.insert(peer_fingerprint.clone(), tx);
 
-            let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
-            let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
-                session_id: SessionId(uuid::Uuid::nil()),
-                peer: crate::peer::PeerInfo {
-                    id: crate::peer::PeerId(uuid::Uuid::nil()),
-                    name: hello.device_name.clone(), addresses: vec![self.remote_addr],
-                    fingerprint: peer_fingerprint.clone(), is_trusted: false,
-                    last_seen: std::time::SystemTime::now(), platform: Some(hello.platform.clone()), version: None,
-                }, code,
-            });
+            // Only emit AwaitingPairing once per peer to avoid duplicate prompts.
+            if !already_pending {
+                let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
+                let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
+                    session_id: SessionId(uuid::Uuid::nil()),
+                    peer: crate::peer::PeerInfo {
+                        id: crate::peer::PeerId(uuid::Uuid::nil()),
+                        name: hello.device_name.clone(), addresses: vec![self.remote_addr],
+                        fingerprint: peer_fingerprint.clone(), is_trusted: false,
+                        last_seen: std::time::SystemTime::now(), platform: Some(hello.platform.clone()), version: None,
+                    }, code,
+                });
+            }
 
             match rx.await.unwrap_or(PairDecision::Reject) {
-                PairDecision::Trust => { let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone()); }
+                PairDecision::Trust => {
+                    let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
+                    self.record_known_device(peer_fingerprint.clone(), &hello.device_name).await;
+                }
                 PairDecision::TrustAndAccept => {
                     let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
                     let _ = self.accept_store.lock().await.accept(peer_fingerprint.clone());
+                    self.record_known_device(peer_fingerprint.clone(), &hello.device_name).await;
                 }
                 PairDecision::Reject => {
                     // Send a Reject so the sender gets a clean rejection,
@@ -173,7 +207,8 @@ impl Receiver {
             match offer_data {
                 Ok(Ok(data)) => {
                     // Sender sent a Reject (pairing needed) instead of Offer.
-                    if matches!(handshake::deserialize(&data), Ok(ControlMessage::Reject(_))) {
+                    if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&data) {
+                        tracing::info!("[receiver] sender rejected: {}", rej.reason);
                         return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
                     }
                     // Sender retried with Offer on this same connection
@@ -194,6 +229,11 @@ impl Receiver {
 
         // 5. Read Offer
         let offer_data = control::read_control_frame(&mut ctrl_recv).await?;
+        // Sender may have sent a Reject instead (pairing needed on its side)
+        if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&offer_data) {
+            tracing::info!("[receiver] sender rejected: {}", rej.reason);
+            return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+        }
         self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await
     }
 
@@ -214,8 +254,18 @@ impl Receiver {
         };
         let session_id = offer.session_id;
 
-        // Notify app layer of incoming transfer (before trust check, so UI always sees it)
+        // Trust check: reject untrusted unless AllowAll
         let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == peer_fingerprint);
+        if !is_trusted && self.security_mode != SecurityMode::AllowAll {
+            let _ = Self::send_reject_and_wait(
+                &mut ctrl_send, &mut ctrl_recv,
+                session_id,
+                "pairing required: peer not trusted",
+            ).await;
+            return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
+        }
+
+        // Notify app layer of incoming transfer (after trust check — only for accepted transfers)
         let _ = event_tx.send(crate::engine::PrivetEvent::IncomingTransfer {
             session_id,
             peer: crate::peer::PeerInfo {
@@ -223,7 +273,7 @@ impl Receiver {
                 name: hello.device_name.clone(),
                 addresses: vec![self.remote_addr],
                 fingerprint: peer_fingerprint.to_owned(),
-                is_trusted,
+                is_trusted: true,
                 last_seen: std::time::SystemTime::now(),
                 platform: Some(hello.platform.clone()),
                 version: None,
@@ -237,16 +287,6 @@ impl Receiver {
                 total_size: offer.total_size,
             },
         });
-
-        // Trust check: reject untrusted unless AllowAll
-        if !is_trusted && self.security_mode != SecurityMode::AllowAll {
-            let _ = Self::send_reject_and_wait(
-                &mut ctrl_send, &mut ctrl_recv,
-                session_id,
-                "pairing required: peer not trusted",
-            ).await;
-            return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
-        }
 
         // AwaitAccept flow: determine if user prompt is needed
         match self.security_mode {

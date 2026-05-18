@@ -78,25 +78,30 @@ where
     // 3. Pairing flow: if peer not trusted, wait for user decision
     let mut is_trusted = trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint);
     if !is_trusted && *security_mode != crate::config::SecurityMode::AllowAll {
+        // Avoid duplicate pairing prompts when sender retries
+        let already_pending = pending_pairing.read().await.contains_key(&peer_fingerprint);
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         pending_pairing.write().await.insert(peer_fingerprint.clone(), tx);
 
-        let code =
-            crate::security::trust::TrustStore::pairing_code(&identity.fingerprint, &peer_fingerprint);
-        let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
-            session_id: SessionId(uuid::Uuid::nil()),
-            peer: crate::peer::PeerInfo {
-                id: crate::peer::PeerId(uuid::Uuid::nil()),
-                name: hello.device_name.clone(),
-                addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
-                fingerprint: peer_fingerprint.clone(),
-                is_trusted: false,
-                last_seen: std::time::SystemTime::now(),
-                platform: Some(hello.platform.clone()),
-                version: None,
-            },
-            code,
-        });
+        if !already_pending {
+            let code =
+                crate::security::trust::TrustStore::pairing_code(&identity.fingerprint, &peer_fingerprint);
+            let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
+                session_id: SessionId(uuid::Uuid::nil()),
+                peer: crate::peer::PeerInfo {
+                    id: crate::peer::PeerId(uuid::Uuid::nil()),
+                    name: hello.device_name.clone(),
+                    addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
+                    fingerprint: peer_fingerprint.clone(),
+                    is_trusted: false,
+                    last_seen: std::time::SystemTime::now(),
+                    platform: Some(hello.platform.clone()),
+                    version: None,
+                },
+                code,
+            });
+        }
 
         match rx.await.unwrap_or(crate::engine::PairDecision::Reject) {
             crate::engine::PairDecision::Trust => {

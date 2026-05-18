@@ -121,6 +121,13 @@ impl Sender {
             if let Ok(data) = handshake::serialize(&reject) {
                 let _ = control::write_control_frame(&mut ctrl_send, &data).await;
                 let _ = ctrl_send.finish();
+                // Drive connection IO to flush stream data before the
+                // endpoint is dropped (which sends CONNECTION_CLOSE).
+                let mut buf = [0u8; 1];
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    ctrl_recv.read(&mut buf),
+                ).await;
             }
             let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
             let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {

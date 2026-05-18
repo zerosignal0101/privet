@@ -46,7 +46,18 @@ impl DeviceIdentity {
 
         if cert_path.exists() && key_path.exists() && id_path.exists() {
             match Self::load_from_disk(&cert_dir) {
-                Ok(id) => return Ok(id),
+                Ok(id) => {
+                    if id.device_name != device_name {
+                        // Device name changed in settings — update it.
+                        let updated = Self {
+                            device_name: device_name.clone(),
+                            ..id
+                        };
+                        updated.save_to_disk()?;
+                        return Ok(updated);
+                    }
+                    return Ok(id);
+                }
                 Err(e) => {
                     tracing::warn!("Failed to load identity, regenerating: {e}");
                 }

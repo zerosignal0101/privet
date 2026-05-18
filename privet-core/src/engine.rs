@@ -219,6 +219,7 @@ impl PrivetEngine {
         let trust_store_tcp = trust_store.clone();
         let security_mode = self.config.security_mode;
         let accept_store = self.accept_store.clone();
+        let known_device_store = self.known_device_store.clone();
         let pending_incoming = self.pending_incoming.clone();
         let pending_pairing = self.pending_pairing.clone();
         let accept_store_tcp = accept_store.clone();
@@ -236,6 +237,7 @@ impl PrivetEngine {
                                 let identity = identity.clone();
                                 let trust_store = trust_store.clone();
                                 let accept_store = accept_store.clone();
+                                let known_device_store = known_device_store.clone();
                                 let pending_incoming = pending_incoming.clone();
                                 let pending_pairing = pending_pairing.clone();
                                 tokio::spawn(async move {
@@ -248,6 +250,7 @@ impl PrivetEngine {
                                         trust_store,
                                         security_mode,
                                         accept_store,
+                                        known_device_store,
                                         pending_incoming,
                                         pending_pairing,
                                     );
