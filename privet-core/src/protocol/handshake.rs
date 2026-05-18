@@ -34,6 +34,8 @@ pub struct HelloAck {
     pub version: u8,
     pub accepted: bool,
     pub fingerprint: String,
+    #[serde(default)]
+    pub device_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

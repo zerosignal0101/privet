@@ -90,6 +90,7 @@ class _HomePageState extends ConsumerState<HomePage> {
     final progress = ref.watch(transferProgressProvider);
     final isRunning = ref.watch(engineRunningProvider);
     final probedDevices = ref.watch(probedDevicesProvider);
+    final activeTransfers = progress.entries.where((e) => e.value.percent < 100).toList();
 
     return Scaffold(
       appBar: AppBar(
@@ -141,13 +142,23 @@ class _HomePageState extends ConsumerState<HomePage> {
                               onAccept: () => ref
                                   .read(incomingTransferProvider.notifier)
                                   .accept(t.sessionId),
+                              onAcceptAlways: () {
+                                ref
+                                    .read(incomingTransferProvider.notifier)
+                                    .accept(t.sessionId);
+                                if (t.peer != null) {
+                                  PrivetService.instance
+                                      .trustAndAcceptPeer(t.peer!.fingerprint);
+                                  ref.read(acceptedListProvider.notifier).refresh();
+                                }
+                              },
                               onReject: () => ref
                                   .read(incomingTransferProvider.notifier)
                                   .reject(t.sessionId),
                             )),
 
-                  // Active transfers
-                  if (progress.isNotEmpty)
+                  // Active transfers (filter out completed at 100%)
+                  if (activeTransfers.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
                       child: Text(
@@ -155,7 +166,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                         style: Theme.of(context).textTheme.titleMedium,
                       ),
                     ),
-                  ...progress.entries.map((e) => _ActiveTransferTile(
+                  ...activeTransfers.map((e) => _ActiveTransferTile(
                         sessionId: e.key,
                         progress: e.value,
                       )),
@@ -239,13 +250,21 @@ class _HomePageState extends ConsumerState<HomePage> {
     final addr = peer.addresses.isNotEmpty ? peer.addresses.first : '';
 
     final service = PrivetService.instance;
-    final sessionId = await service.sendFilesToAddr(addr, paths);
+    var sessionId = await service.sendFilesToAddr(addr, paths);
 
-    if (sessionId != null && mounted) {
+    // If send failed (likely PairingRequired), wait for pairing
+    // to resolve then retry once.
+    if (sessionId == null) {
+      await ref.read(pairingProvider.notifier).waitForResolution;
+      sessionId = await service.sendFilesToAddr(addr, paths);
+    }
+
+    final sid = sessionId;
+    if (sid != null && mounted) {
       Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (_) => TransferPage(sessionId: sessionId),
+          builder: (_) => TransferPage(sessionId: sid),
         ),
       );
     }
@@ -284,13 +303,20 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     final paths = result.files.map((f) => f.path!).toList();
     final service = PrivetService.instance;
-    final sessionId = await service.sendFilesToAddr(addr, paths);
+    var sessionId = await service.sendFilesToAddr(addr, paths);
 
-    if (sessionId != null && mounted) {
+    // Retry after pairing resolves if needed
+    if (sessionId == null) {
+      await ref.read(pairingProvider.notifier).waitForResolution;
+      sessionId = await service.sendFilesToAddr(addr, paths);
+    }
+
+    final sid2 = sessionId;
+    if (sid2 != null && mounted) {
       Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (_) => TransferPage(sessionId: sessionId),
+          builder: (_) => TransferPage(sessionId: sid2),
         ),
       );
     }
@@ -416,12 +442,14 @@ class _IncomingTransferTile extends StatelessWidget {
   final IncomingTransfer transfer;
   final bool isAwaiting;
   final VoidCallback? onAccept;
+  final VoidCallback? onAcceptAlways;
   final VoidCallback? onReject;
 
   const _IncomingTransferTile({
     required this.transfer,
     this.isAwaiting = false,
     this.onAccept,
+    this.onAcceptAlways,
     this.onReject,
   });
 
@@ -453,11 +481,18 @@ class _IncomingTransferTile extends StatelessWidget {
                 children: [
                   IconButton(
                     icon: const Icon(Icons.close, color: Colors.red),
+                    tooltip: 'Reject',
                     onPressed: onReject,
                   ),
                   IconButton(
                     icon: const Icon(Icons.check, color: Colors.green),
+                    tooltip: 'Accept',
                     onPressed: onAccept,
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.star, color: Colors.blue.shade600),
+                    tooltip: 'Always accept from this device',
+                    onPressed: onAcceptAlways,
                   ),
                 ],
               )

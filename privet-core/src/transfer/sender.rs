@@ -37,14 +37,14 @@ impl Sender {
     }
 
     /// Execute the full send flow: handshake → trust check → offer → send data (parallel streams).
-    /// Returns (session_id, peer_fingerprint) on success.
+    /// Returns (session_id, peer_fingerprint, peer_device_name) on success.
     pub async fn send(
         &self,
         files: &[PathBuf],
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         trusted_fingerprints: &[String],
         security_mode: &crate::config::SecurityMode,
-    ) -> Result<(SessionId, String), PrivetError> {
+    ) -> Result<(SessionId, String, String), PrivetError> {
         let session_id = SessionId::new();
 
         // 1. Open control stream
@@ -85,23 +85,43 @@ impl Sender {
             }
         };
         let peer_fingerprint = hello_ack.fingerprint;
+        let peer_device_name = hello_ack.device_name;
 
         // 3c. Verify HelloAck fingerprint matches TLS certificate (MITM protection)
-        if let Some(tls_identity) = self.conn.peer_identity() {
-            if let Some(certs) = tls_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
-                if let Some(cert) = certs.first() {
-                    let tls_fp = crate::security::cert::fingerprint_from_der(cert.as_ref());
-                    if tls_fp != peer_fingerprint {
-                        return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
-                            format!("TLS certificate fingerprint '{tls_fp}' does not match HelloAck claim '{peer_fingerprint}'")
-                        )));
-                    }
-                }
-            }
+        // Extract fingerprint eagerly and drop the Box<dyn Any> before any .await.
+        let tls_fp = {
+            let tls_identity = self.conn.peer_identity()
+                .ok_or_else(|| PrivetError::Security(
+                    crate::error::SecurityError::NotTrusted("no peer certificate presented".into())
+                ))?;
+            let certs = tls_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok_or_else(|| PrivetError::Security(
+                    crate::error::SecurityError::NotTrusted("unexpected peer identity type".into())
+                ))?;
+            let cert = certs.first()
+                .ok_or_else(|| PrivetError::Security(
+                    crate::error::SecurityError::NotTrusted("peer certificate chain is empty".into())
+                ))?;
+            crate::security::cert::fingerprint_from_der(cert.as_ref())
+        };
+        if tls_fp != peer_fingerprint {
+            return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                format!("TLS certificate fingerprint '{tls_fp}' does not match HelloAck claim '{peer_fingerprint}'")
+            )));
         }
 
         // 3b. Trust check: fail fast if peer not trusted
         if *security_mode != crate::config::SecurityMode::AllowAll && !trusted_fingerprints.iter().any(|fp| fp == &peer_fingerprint) {
+            // Gracefully close the stream so the receiver sees a clean stream end
+            // (Reject message via FinishedEarly) instead of a CONNECTION_CLOSE race.
+            let reject = ControlMessage::Reject(handshake::Reject {
+                session_id: SessionId(uuid::Uuid::nil()),
+                reason: "pairing required".into(),
+            });
+            if let Ok(data) = handshake::serialize(&reject) {
+                let _ = control::write_control_frame(&mut ctrl_send, &data).await;
+                let _ = ctrl_send.finish();
+            }
             let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
             let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
                 peer: crate::peer::PeerInfo {
@@ -246,7 +266,7 @@ impl Sender {
         tracing::info!("[sender] transfer complete for session {session_id}");
         let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });
 
-        Ok((session_id, peer_fingerprint))
+        Ok((session_id, peer_fingerprint, peer_device_name))
     }
 }
 

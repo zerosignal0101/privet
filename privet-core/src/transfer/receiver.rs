@@ -48,15 +48,39 @@ impl Receiver {
             trust_store, security_mode, accept_store, pending_incoming, pending_pairing }
     }
 
+    /// Send a Reject on the control stream and wait for the sender to close.
+    /// This ensures the sender reads the Reject (not a CONNECTION_CLOSE race).
+    async fn send_reject_and_wait(
+        ctrl_send: &mut quinn::SendStream,
+        ctrl_recv: &mut quinn::RecvStream,
+        session_id: SessionId,
+        reason: &str,
+    ) -> Result<(), PrivetError> {
+        let reject = ControlMessage::Reject(handshake::Reject {
+            session_id,
+            reason: reason.to_owned(),
+        });
+        let data = handshake::serialize(&reject)?;
+        if control::write_control_frame(ctrl_send, &data).await.is_ok() {
+            let _ = ctrl_send.finish();
+        }
+        // Wait for sender to close the connection after reading the Reject.
+        let mut buf = [0u8; 1];
+        let _ = ctrl_recv.read(&mut buf).await;
+        Ok(())
+    }
+
     pub async fn receive(
         &self,
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     ) -> Result<(SessionId, String), PrivetError> {
         let (mut ctrl_send, mut ctrl_recv) = self.conn.accept_bi()
-            .await.map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+            .await.map_err(|e| TransportError::ConnectionLost(format!("accept-bi: {e}")))?;
 
         // 1. Receive Hello
-        let hello_data = control::read_control_frame(&mut ctrl_recv).await?;
+        let hello_data = control::read_control_frame(&mut ctrl_recv)
+            .await
+            .map_err(|e| PrivetError::Transport(TransportError::ConnectionLost(format!("read-hello: {e}"))))?;
         let hello = match handshake::deserialize(&hello_data)? {
             ControlMessage::Hello(h) => h,
             other => return Err(crate::error::ProtocolError::UnexpectedMessage {
@@ -65,23 +89,34 @@ impl Receiver {
         };
         let peer_fingerprint = hello.fingerprint.clone();
 
-        // 2. TLS fingerprint verification
-        if let Some(tls_identity) = self.conn.peer_identity() {
-            if let Some(certs) = tls_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
-                if let Some(cert) = certs.first() {
-                    let tls_fp = crate::security::cert::fingerprint_from_der(cert.as_ref());
-                    if tls_fp != peer_fingerprint {
-                        return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
-                            format!("TLS cert fingerprint '{tls_fp}' != Hello claim '{peer_fingerprint}'"))));
-                    }
-                }
-            }
+        // 2. TLS fingerprint verification (MITM protection)
+        // Verify the peer's TLS certificate fingerprint matches the Hello claim.
+        // Extract the fingerprint eagerly and drop the Box<dyn Any> before any .await.
+        let tls_fp = {
+            let tls_identity = self.conn.peer_identity()
+                .ok_or_else(|| PrivetError::Security(
+                    crate::error::SecurityError::NotTrusted("no peer certificate presented".into())
+                ))?;
+            let certs = tls_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok_or_else(|| PrivetError::Security(
+                    crate::error::SecurityError::NotTrusted("unexpected peer identity type".into())
+                ))?;
+            let cert = certs.first()
+                .ok_or_else(|| PrivetError::Security(
+                    crate::error::SecurityError::NotTrusted("peer certificate chain is empty".into())
+                ))?;
+            crate::security::cert::fingerprint_from_der(cert.as_ref())
+        };
+        if tls_fp != peer_fingerprint {
+            return Err(PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                format!("TLS cert fingerprint '{tls_fp}' != Hello claim '{peer_fingerprint}'"))));
         }
 
         // 3. Send HelloAck immediately (sender needs our fingerprint for trust check)
         let hello_ack = ControlMessage::HelloAck(HelloAck {
             version: handshake::PROTOCOL_VERSION, accepted: true,
             fingerprint: self.fingerprint.clone(),
+            device_name: self.device_name.clone(),
         });
         control::write_control_frame(&mut ctrl_send, &handshake::serialize(&hello_ack)?).await?;
 
@@ -109,12 +144,27 @@ impl Receiver {
                     let _ = self.accept_store.lock().await.accept(peer_fingerprint.clone());
                 }
                 PairDecision::Reject => {
+                    // Send a Reject so the sender gets a clean rejection,
+                    // then wait for sender to close the connection.
+                    let _ = Self::send_reject_and_wait(
+                        &mut ctrl_send, &mut ctrl_recv,
+                        SessionId(uuid::Uuid::nil()),
+                        "pairing rejected by user",
+                    ).await;
                     return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
                 }
             }
             self.pending_pairing.write().await.remove(&peer_fingerprint);
 
             // Sender likely rejected this connection (PairingRequired).
+            // Check if the connection is still alive before trying to read Offer.
+            // Note: close_reason() can race with CONNECTION_CLOSE delivery, so
+            // also handle the read error gracefully below.
+            if self.conn.close_reason().is_some() {
+                tracing::info!("[receiver] pairing resolved but sender closed connection, returning Ok");
+                return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+            }
+
             // Try to read Offer — will fail if sender closed the connection.
             let offer_data = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -122,12 +172,16 @@ impl Receiver {
             ).await;
             match offer_data {
                 Ok(Ok(data)) => {
+                    // Sender sent a Reject (pairing needed) instead of Offer.
+                    if matches!(handshake::deserialize(&data), Ok(ControlMessage::Reject(_))) {
+                        return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+                    }
                     // Sender retried with Offer on this same connection
                     return self.handle_offer(data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await;
                 }
                 _ => {
-                    // Connection closed or timed out — sender will retry on new connection
-                    return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
+                    tracing::info!("[receiver] pairing resolved but no Offer (connection dead or timeout), returning Ok");
+                    return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
                 }
             }
         }
@@ -186,10 +240,11 @@ impl Receiver {
 
         // Trust check: reject untrusted unless AllowAll
         if !is_trusted && self.security_mode != SecurityMode::AllowAll {
-            let reject = ControlMessage::Reject(handshake::Reject {
-                session_id, reason: "pairing required: peer not trusted".into(),
-            });
-            control::write_control_frame(&mut ctrl_send, &handshake::serialize(&reject)?).await?;
+            let _ = Self::send_reject_and_wait(
+                &mut ctrl_send, &mut ctrl_recv,
+                session_id,
+                "pairing required: peer not trusted",
+            ).await;
             return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
         }
 
@@ -224,10 +279,11 @@ impl Receiver {
             tracing::debug!("[receiver] AwaitingAccept: waiting for user decision (session {})...", session_id.0);
             if !rx.await.unwrap_or(false) {
                 tracing::debug!("[receiver] AwaitingAccept: user REJECTED session {}", session_id.0);
-                let reject = ControlMessage::Reject(handshake::Reject {
-                    session_id, reason: "transfer rejected by user".into(),
-                });
-                control::write_control_frame(&mut ctrl_send, &handshake::serialize(&reject)?).await?;
+                let _ = Self::send_reject_and_wait(
+                    &mut ctrl_send, &mut ctrl_recv,
+                    session_id,
+                    "transfer rejected by user",
+                ).await;
                 return Err(PrivetError::TransferRejected("transfer rejected by user".into()));
             }
             tracing::debug!("[receiver] AwaitingAccept: user ACCEPTED session {}", session_id.0);
@@ -238,10 +294,11 @@ impl Receiver {
 
         // Disk space pre-check
         if fs_available_space(&self.download_dir)? < offer.total_size {
-            let reject = ControlMessage::Reject(handshake::Reject {
-                session_id, reason: format!("disk full: need {}, have {}", offer.total_size, fs_available_space(&self.download_dir)?),
-            });
-            control::write_control_frame(&mut ctrl_send, &handshake::serialize(&reject)?).await?;
+            let _ = Self::send_reject_and_wait(
+                &mut ctrl_send, &mut ctrl_recv,
+                session_id,
+                &format!("disk full: need {}, have {}", offer.total_size, fs_available_space(&self.download_dir)?),
+            ).await;
             return Err(PrivetError::DiskFull { needed: offer.total_size, available: fs_available_space(&self.download_dir)? });
         }
 

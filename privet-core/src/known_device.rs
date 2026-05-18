@@ -152,6 +152,7 @@ impl KnownDeviceStore {
 
     /// Remove a specific network IP mapping for a device.
     /// If the network entry becomes empty, remove it.
+    /// If `addr` is empty, removes the entire subnet entry.
     pub fn remove_device_ip(
         &mut self,
         fingerprint: &str,
@@ -159,7 +160,9 @@ impl KnownDeviceStore {
         addr: &str,
     ) -> Result<(), crate::error::SecurityError> {
         if let Some(device) = self.devices.iter_mut().find(|d| d.fingerprint == fingerprint) {
-            if let Some(entry) = device.networks.get_mut(subnet) {
+            if addr.is_empty() {
+                device.networks.remove(subnet);
+            } else if let Some(entry) = device.networks.get_mut(subnet) {
                 entry.addresses.retain(|a| a != addr);
                 if entry.addresses.is_empty() {
                     device.networks.remove(subnet);

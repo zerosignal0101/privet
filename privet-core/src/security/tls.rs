@@ -85,7 +85,7 @@ impl rustls::server::danger::ClientCertVerifier for PrivetClientVerifier {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        false
+        true // Require client cert — reject MITM without one
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {

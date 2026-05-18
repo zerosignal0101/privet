@@ -71,6 +71,7 @@ where
     let hello_ack = ControlMessage::HelloAck(HelloAck {
         version: handshake::PROTOCOL_VERSION, accepted: true,
         fingerprint: identity.fingerprint.clone(),
+        device_name: identity.device_name.clone(),
     });
     crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &handshake::serialize(&hello_ack)?).await?;
 
@@ -398,7 +399,7 @@ pub async fn send_files_tcp<S>(
     security_mode: &crate::config::SecurityMode,
     tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-) -> Result<(SessionId, String), PrivetError>
+) -> Result<(SessionId, String, String), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -428,6 +429,7 @@ where
         }
     };
     let peer_fingerprint = hello_ack.fingerprint;
+    let peer_device_name = hello_ack.device_name;
 
     // 2b. If TLS is active, verify HelloAck fingerprint matches TLS certificate
     if let Some(tls_fp) = tls_peer_fingerprint {
@@ -575,5 +577,5 @@ where
     let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });
 
     tracing::info!("[tcp-send] transfer complete for session {session_id}");
-    Ok((session_id, peer_fingerprint))
+    Ok((session_id, peer_fingerprint, peer_device_name))
 }

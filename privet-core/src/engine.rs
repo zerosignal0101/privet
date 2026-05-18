@@ -252,7 +252,7 @@ impl PrivetEngine {
                                         pending_pairing,
                                     );
                                     if let Err(e) = receiver.receive(&event_tx).await {
-                                        tracing::error!("receive error: {e}");
+                                        tracing::warn!("receive finished: {e}");
                                     }
                                 });
                             }
@@ -483,7 +483,7 @@ impl PrivetEngine {
         // Try QUIC first
         let quic_result = self.try_send_quic(addr, &paths, &trusted, &self.config.security_mode).await;
 
-        let (session_id, peer_fingerprint) = match quic_result {
+        let (session_id, peer_fingerprint, peer_device_name) = match quic_result {
             Ok(r) => r,
             Err(quic_err) => {
                 let is_tcp_candidate = matches!(
@@ -561,12 +561,15 @@ impl PrivetEngine {
                     .await
                     {
                         Ok(tcp_result) => {
-                            self.log_transfer(tcp_result.0, &tcp_result.1, &paths, true)
+                            let tcp_session = tcp_result.0;
+                            let tcp_fp = tcp_result.1;
+                            let tcp_name = tcp_result.2;
+                            self.log_transfer(tcp_session, &tcp_fp, &paths, true)
                                 .await;
-                            self.record_to_known_devices(&tcp_result.1, &addr).await;
-                            self.emit_pairing_if_needed(&tcp_result.1, &addr).await;
-                            self.track_session(tcp_result.0).await;
-                            return Ok(tcp_result.0);
+                            self.record_to_known_devices(&tcp_fp, &addr, &tcp_name).await;
+                            self.emit_pairing_if_needed(&tcp_fp, &addr).await;
+                            self.track_session(tcp_session).await;
+                            return Ok(tcp_session);
                         }
                         Err(tcp_err) => {
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
@@ -591,7 +594,7 @@ impl PrivetEngine {
             .await;
 
         // Auto-record to known device store
-        self.record_to_known_devices(&peer_fingerprint, &addr).await;
+        self.record_to_known_devices(&peer_fingerprint, &addr, &peer_device_name).await;
 
         // Pairing flow
         self.emit_pairing_if_needed(&peer_fingerprint, &addr).await;
@@ -602,14 +605,14 @@ impl PrivetEngine {
         Ok(session_id)
     }
 
-    /// Try QUIC transport: connect and send. Returns (session_id, peer_fingerprint).
+    /// Try QUIC transport: connect and send. Returns (session_id, peer_fingerprint, peer_device_name).
     async fn try_send_quic(
         &self,
         addr: SocketAddr,
         paths: &[PathBuf],
         trusted: &[String],
         security_mode: &crate::config::SecurityMode,
-    ) -> Result<(SessionId, String)> {
+    ) -> Result<(SessionId, String, String)> {
         let client_config = tls::build_client_config(&self.identity, trusted)?;
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
@@ -681,7 +684,7 @@ impl PrivetEngine {
 
     /// Record a successful connection to the known device store.
     /// Called after a successful send to automatically remember the peer's IP.
-    async fn record_to_known_devices(&self, peer_fingerprint: &str, addr: &SocketAddr) {
+    async fn record_to_known_devices(&self, peer_fingerprint: &str, addr: &SocketAddr, peer_device_name: &str) {
         let subnet = crate::network::subnet_from_addr(
             &addr.ip(),
             crate::network::default_prefix_len(match addr.ip() {
@@ -690,8 +693,10 @@ impl PrivetEngine {
             }),
         );
 
-        // Try to find the device name from the discovered peers list
-        let device_name = {
+        // Use the device name from HelloAck, falling back to discovered peers or fingerprint
+        let device_name = if !peer_device_name.is_empty() {
+            peer_device_name.to_owned()
+        } else {
             let peers = self.peers.read().await;
             peers.values()
                 .find(|p| p.fingerprint == peer_fingerprint)
@@ -833,8 +838,10 @@ impl PrivetEngine {
     }
 
     /// Remove trust from a peer by fingerprint.
+    /// Also removes from the accept store since accept ⊆ trust.
     pub async fn untrust_peer(&self, fingerprint: &str) -> Result<()> {
         self.trust_store.lock().await.untrust(fingerprint)?;
+        let _ = self.accept_store.lock().await.unaccept(fingerprint);
         Ok(())
     }
 

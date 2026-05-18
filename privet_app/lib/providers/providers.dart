@@ -109,9 +109,6 @@ class TransferProgressNotifier
           percent: 100,
         ),
       };
-      Future.delayed(const Duration(seconds: 3), () {
-        state = Map.from(state)..remove(event.sessionId);
-      });
     } else if (event.type == PrivetEventType.transferFailed &&
         event.sessionId != null) {
       state = Map.from(state)..remove(event.sessionId);
@@ -137,6 +134,7 @@ class PairRequest {
 
 class PairingNotifier extends Notifier<List<PairRequest>> {
   StreamSubscription<PrivetEvent>? _sub;
+  Completer<void>? _resolutionCompleter;
 
   @override
   List<PairRequest> build() {
@@ -152,8 +150,35 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
         event.peer != null &&
         event.pairingCode != null) {
       if (!state.any((p) => p.peer.fingerprint == event.peer!.fingerprint)) {
+        _resolutionCompleter = Completer<void>();
         state = [...state, PairRequest(event.peer!, event.pairingCode!)];
       }
+    }
+  }
+
+  /// Wait for a pending pairing request to be resolved.
+  /// If no request has arrived yet, polls briefly for one.
+  Future<void> get waitForResolution async {
+    if (_resolutionCompleter != null) {
+      await _resolutionCompleter!.future;
+      return;
+    }
+    // No pending request yet — the PairRequest event may not have been
+    // processed by the event loop. Poll for up to 5 seconds.
+    for (var i = 0; i < 50; i++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (_resolutionCompleter != null) {
+        await _resolutionCompleter!.future;
+        return;
+      }
+    }
+  }
+
+  void _resolve(String fingerprint) {
+    state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+    if (state.isEmpty && _resolutionCompleter != null) {
+      _resolutionCompleter!.complete();
+      _resolutionCompleter = null;
     }
   }
 
@@ -163,7 +188,8 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
     final ok = await service.trustPeer(fingerprint);
     debugPrint('[pairing] trust_peer result: ok=$ok');
     if (ok) {
-      state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+      _resolve(fingerprint);
+      ref.read(trustedListProvider.notifier).refresh();
     }
     return ok;
   }
@@ -174,7 +200,9 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
     final ok = await service.trustAndAcceptPeer(fingerprint);
     debugPrint('[pairing] trust_and_accept_peer result: ok=$ok');
     if (ok) {
-      state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+      _resolve(fingerprint);
+      ref.read(trustedListProvider.notifier).refresh();
+      ref.read(acceptedListProvider.notifier).refresh();
     }
     return ok;
   }
@@ -185,7 +213,7 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
     final ok = await service.rejectPairing(fingerprint);
     debugPrint('[pairing] reject_pairing result: ok=$ok');
     if (ok) {
-      state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+      _resolve(fingerprint);
     }
     return ok;
   }
@@ -424,14 +452,31 @@ final settingsProvider =
 // ---------------------------------------------------------------------------
 
 class KnownDevicesNotifier extends Notifier<List<Map<String, dynamic>>> {
+  StreamSubscription<PrivetEvent>? _sub;
+
   @override
   List<Map<String, dynamic>> build() {
+    final service = ref.read(privetServiceProvider);
+    _sub = service.events.listen((event) {
+      // Refresh on events that may add/update known devices:
+      // peer discovered, known device probed, transfer complete
+      if (event.type == PrivetEventType.peerDiscovered ||
+          event.type == PrivetEventType.knownDeviceProbed ||
+          event.type == PrivetEventType.transferComplete) {
+        refresh();
+      }
+    });
+    ref.onDispose(() => _sub?.cancel());
+    refresh();
     return [];
   }
 
   Future<void> refresh() async {
     final service = ref.read(privetServiceProvider);
-    state = await service.getKnownDevices();
+    final list = await service.getKnownDevices();
+    if (list.isNotEmpty || state.isNotEmpty) {
+      state = list;
+    }
   }
 }
 
