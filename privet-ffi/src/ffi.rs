@@ -1,4 +1,5 @@
 use std::ffi::{CStr, CString};
+use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int};
 
 use crate::runtime;
@@ -579,6 +580,208 @@ pub extern "C" fn privet_get_identity() -> *mut c_char {
     };
 
     CString::new(json).unwrap_or_default().into_raw()
+}
+
+// ---------------------------------------------------------------------------
+// Known devices / network awareness
+// ---------------------------------------------------------------------------
+
+/// Get the list of current networks as a JSON string.
+/// Each network has "subnet", "interface_name", "local_ips" fields.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_current_networks() -> *mut c_char {
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let networks = engine.current_networks();
+    let json = match serde_json::to_string(&networks) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Probe known devices on the current network(s).
+/// Returns a JSON string of probed PeerInfo list.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_probe_known_devices() -> *mut c_char {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let peers = rt.block_on(engine.probe_known_devices());
+    let json = match serde_json::to_string(&peers) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Get the list of known devices as a JSON string.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_known_devices() -> *mut c_char {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let devices = rt.block_on(engine.known_devices());
+    let json = match serde_json::to_string(&devices) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Add a known device IP mapping.
+/// `args_json` is a JSON object with keys:
+///   "fingerprint", "peer_id", "device_name", "subnet", "addr" (IP:port), "label" (optional)
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_add_known_device_ip(args_json: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let args_str = unsafe {
+        if args_json.is_null() { return -1; }
+        match CStr::from_ptr(args_json).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+
+    let fingerprint = match args["fingerprint"].as_str() {
+        Some(s) => s.to_owned(),
+        None => return -1,
+    };
+    let peer_id_str = args["peer_id"].as_str().unwrap_or("");
+    let peer_id = match uuid::Uuid::parse_str(peer_id_str) {
+        Ok(u) => privet_core::PeerId(u),
+        Err(_) => privet_core::PeerId(uuid::Uuid::nil()),
+    };
+    let device_name = args["device_name"].as_str().unwrap_or("").to_owned();
+    let subnet = match args["subnet"].as_str() {
+        Some(s) => s.to_owned(),
+        None => return -1,
+    };
+    let addr: SocketAddr = match args["addr"].as_str().and_then(|s| s.parse().ok()) {
+        Some(a) => a,
+        None => return -1,
+    };
+    let label = args["label"].as_str().map(|s| s.to_owned());
+
+    match rt.block_on(engine.add_known_device_ip(fingerprint, peer_id, device_name, subnet, addr, label)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Remove a known device network IP mapping.
+/// `args_json` is a JSON object with keys: "fingerprint", "subnet", "addr" (optional)
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_remove_known_device_ip(args_json: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let args_str = unsafe {
+        if args_json.is_null() { return -1; }
+        match CStr::from_ptr(args_json).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+
+    let fingerprint = match args["fingerprint"].as_str() {
+        Some(s) => s,
+        None => return -1,
+    };
+    let subnet = match args["subnet"].as_str() {
+        Some(s) => s,
+        None => return -1,
+    };
+    let addr = args["addr"].as_str().unwrap_or("");
+
+    match rt.block_on(engine.remove_known_device_ip(fingerprint, subnet, addr)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Set a network label for a known device.
+/// `args_json` is a JSON object with keys: "fingerprint", "subnet", "label"
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_set_network_label(args_json: *const c_char) -> c_int {
+    let rt = runtime::get_runtime();
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let args_str = unsafe {
+        if args_json.is_null() { return -1; }
+        match CStr::from_ptr(args_json).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+
+    let fingerprint = match args["fingerprint"].as_str() {
+        Some(s) => s,
+        None => return -1,
+    };
+    let subnet = match args["subnet"].as_str() {
+        Some(s) => s,
+        None => return -1,
+    };
+    let label = match args["label"].as_str() {
+        Some(s) => s.to_owned(),
+        None => return -1,
+    };
+
+    match rt.block_on(engine.set_network_label(fingerprint, subnet, label)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 // ---------------------------------------------------------------------------

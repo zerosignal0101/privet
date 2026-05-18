@@ -2,6 +2,8 @@ pub mod config;
 pub mod discovery;
 pub mod engine;
 pub mod error;
+pub mod known_device;
+pub mod network;
 pub mod peer;
 pub mod protocol;
 pub mod security;
@@ -13,6 +15,8 @@ pub mod transport;
 pub use engine::{PrivetEngine, PrivetEvent};
 pub use config::{PrivetConfig, SecurityMode};
 pub use error::{PrivetError, Result};
+pub use known_device::{KnownDevice, KnownDeviceStore, NetworkEntry};
+pub use network::NetworkInfo;
 pub use peer::{PeerId, PeerInfo};
 pub use session::{SessionId, TransferSession, TransferProgress, FileManifest};
 

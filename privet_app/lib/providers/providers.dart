@@ -398,3 +398,64 @@ class SettingsNotifier extends Notifier<Settings> {
 
 final settingsProvider =
     NotifierProvider<SettingsNotifier, Settings>(SettingsNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Known devices (from Rust known_device_store)
+// ---------------------------------------------------------------------------
+
+class KnownDevicesNotifier extends Notifier<List<Map<String, dynamic>>> {
+  @override
+  List<Map<String, dynamic>> build() {
+    return [];
+  }
+
+  Future<void> refresh() async {
+    final service = ref.read(privetServiceProvider);
+    state = await service.getKnownDevices();
+  }
+}
+
+final knownDevicesProvider = NotifierProvider<KnownDevicesNotifier,
+    List<Map<String, dynamic>>>(KnownDevicesNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Current networks (from Rust network detection)
+// ---------------------------------------------------------------------------
+
+class CurrentNetworksNotifier extends Notifier<List<Map<String, dynamic>>> {
+  @override
+  List<Map<String, dynamic>> build() {
+    _load();
+    return [];
+  }
+
+  Future<void> _load() async {
+    final service = ref.read(privetServiceProvider);
+    state = await service.getCurrentNetworks();
+  }
+
+  Future<void> refresh() async {
+    await _load();
+  }
+}
+
+final currentNetworksProvider = NotifierProvider<CurrentNetworksNotifier,
+    List<Map<String, dynamic>>>(CurrentNetworksNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Probed known devices (on-demand scan results)
+// ---------------------------------------------------------------------------
+
+class ProbedDevicesNotifier extends Notifier<List<PeerInfo>> {
+  @override
+  List<PeerInfo> build() => [];
+
+  Future<void> scan() async {
+    final service = ref.read(privetServiceProvider);
+    final rawList = await service.probeKnownDevices();
+    state = rawList.map((e) => PeerInfo.fromJson(e)).toList();
+  }
+}
+
+final probedDevicesProvider = NotifierProvider<ProbedDevicesNotifier,
+    List<PeerInfo>>(ProbedDevicesNotifier.new);

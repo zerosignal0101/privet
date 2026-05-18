@@ -197,6 +197,45 @@ class PrivetFfiIsolate {
     if (r['ok'] == true) return r['data'] as String?;
     return null;
   }
+
+  Future<List<Map<String, dynamic>>> getCurrentNetworks() async {
+    final r = await _call('get_current_networks', {});
+    if (r['ok'] == true && r['data'] != null) {
+      return (r['data'] as List).cast<Map<String, dynamic>>();
+    }
+    return [];
+  }
+
+  Future<List<Map<String, dynamic>>> probeKnownDevices() async {
+    final r = await _call('probe_known_devices', {});
+    if (r['ok'] == true && r['data'] != null) {
+      return (r['data'] as List).cast<Map<String, dynamic>>();
+    }
+    return [];
+  }
+
+  Future<List<Map<String, dynamic>>> getKnownDevices() async {
+    final r = await _call('get_known_devices', {});
+    if (r['ok'] == true && r['data'] != null) {
+      return (r['data'] as List).cast<Map<String, dynamic>>();
+    }
+    return [];
+  }
+
+  Future<bool> addKnownDeviceIp(Map<String, dynamic> args) async {
+    final r = await _call('add_known_device_ip', args);
+    return r['ok'] == true;
+  }
+
+  Future<bool> removeKnownDeviceIp(Map<String, dynamic> args) async {
+    final r = await _call('remove_known_device_ip', args);
+    return r['ok'] == true;
+  }
+
+  Future<bool> setNetworkLabel(Map<String, dynamic> args) async {
+    final r = await _call('set_network_label', args);
+    return r['ok'] == true;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +369,24 @@ void _handleCommand(PrivetFfi ffi, _FfiCommand cmd) {
         break;
       case 'get_identity':
         _cmdGetIdentity(ffi, cmd);
+        break;
+      case 'get_current_networks':
+        _cmdGetCurrentNetworks(ffi, cmd);
+        break;
+      case 'probe_known_devices':
+        _cmdProbeKnownDevices(ffi, cmd);
+        break;
+      case 'get_known_devices':
+        _cmdGetKnownDevices(ffi, cmd);
+        break;
+      case 'add_known_device_ip':
+        _cmdAddKnownDeviceIp(ffi, cmd);
+        break;
+      case 'remove_known_device_ip':
+        _cmdRemoveKnownDeviceIp(ffi, cmd);
+        break;
+      case 'set_network_label':
+        _cmdSetNetworkLabel(ffi, cmd);
         break;
       default:
         cmd.replyTo.send({'ok': false, 'error': 'unknown command: ${cmd.cmd}'});
@@ -482,4 +539,74 @@ void _cmdGetIdentity(PrivetFfi ffi, _FfiCommand cmd) {
   final ptr = ffi.getIdentity();
   final json = ffi.readAndFreeJson(ptr);
   cmd.replyTo.send({'ok': true, 'data': json});
+}
+
+// ---------------------------------------------------------------------------
+// Known devices / network awareness command handlers
+// ---------------------------------------------------------------------------
+
+void _cmdGetCurrentNetworks(PrivetFfi ffi, _FfiCommand cmd) {
+  final ptr = ffi.getCurrentNetworks();
+  final json = ffi.readAndFreeJson(ptr);
+  if (json != null) {
+    final data = jsonDecode(json);
+    cmd.replyTo.send({'ok': true, 'data': data});
+  } else {
+    cmd.replyTo.send({'ok': true, 'data': []});
+  }
+}
+
+void _cmdProbeKnownDevices(PrivetFfi ffi, _FfiCommand cmd) {
+  final ptr = ffi.probeKnownDevices();
+  final json = ffi.readAndFreeJson(ptr);
+  if (json != null) {
+    final data = jsonDecode(json);
+    cmd.replyTo.send({'ok': true, 'data': data});
+  } else {
+    cmd.replyTo.send({'ok': true, 'data': []});
+  }
+}
+
+void _cmdGetKnownDevices(PrivetFfi ffi, _FfiCommand cmd) {
+  final ptr = ffi.getKnownDevices();
+  final json = ffi.readAndFreeJson(ptr);
+  if (json != null) {
+    final data = jsonDecode(json);
+    cmd.replyTo.send({'ok': true, 'data': data});
+  } else {
+    cmd.replyTo.send({'ok': true, 'data': []});
+  }
+}
+
+void _cmdAddKnownDeviceIp(PrivetFfi ffi, _FfiCommand cmd) {
+  final args = cmd.args;
+  final argsJson = jsonEncode(args).toNativeUtf8();
+  try {
+    final result = ffi.addKnownDeviceIp(argsJson);
+    cmd.replyTo.send({'ok': result == 0});
+  } finally {
+    calloc.free(argsJson);
+  }
+}
+
+void _cmdRemoveKnownDeviceIp(PrivetFfi ffi, _FfiCommand cmd) {
+  final args = cmd.args;
+  final argsJson = jsonEncode(args).toNativeUtf8();
+  try {
+    final result = ffi.removeKnownDeviceIp(argsJson);
+    cmd.replyTo.send({'ok': result == 0});
+  } finally {
+    calloc.free(argsJson);
+  }
+}
+
+void _cmdSetNetworkLabel(PrivetFfi ffi, _FfiCommand cmd) {
+  final args = cmd.args;
+  final argsJson = jsonEncode(args).toNativeUtf8();
+  try {
+    final result = ffi.setNetworkLabel(argsJson);
+    cmd.replyTo.send({'ok': result == 0});
+  } finally {
+    calloc.free(argsJson);
+  }
 }

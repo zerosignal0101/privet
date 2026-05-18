@@ -15,6 +15,8 @@ class SettingsPage extends ConsumerWidget {
     final identity = ref.watch(identityProvider);
     final trusted = ref.watch(trustedListProvider);
     final accepted = ref.watch(acceptedListProvider);
+    final knownDevices = ref.watch(knownDevicesProvider);
+    final currentNetworks = ref.watch(currentNetworksProvider);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -100,6 +102,10 @@ class SettingsPage extends ConsumerWidget {
 
           const Divider(),
 
+          // Current Network(s)
+          _CurrentNetworkSection(currentNetworks: currentNetworks),
+          const Divider(),
+
           // Trusted Devices management
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
@@ -155,6 +161,17 @@ class SettingsPage extends ConsumerWidget {
                     onPressed: () => _confirmUnaccept(context, ref, fp),
                   ),
                 )),
+
+          const Divider(),
+
+          // Known Devices management
+          _KnownDevicesSection(
+            knownDevices: knownDevices,
+            onRefresh: () => ref.read(knownDevicesProvider.notifier).refresh(),
+            onEdit: (device) => _editKnownDevice(context, ref, device),
+            onDelete: (fingerprint) => _deleteKnownDevice(context, ref, fingerprint),
+            onAddIp: (device) => _addDeviceIp(context, ref, device),
+          ),
 
           const Divider(),
 
@@ -242,6 +259,111 @@ class SettingsPage extends ConsumerWidget {
     }
   }
 
+  Future<void> _editKnownDevice(
+    BuildContext context,
+    WidgetRef ref,
+    Map<String, dynamic> device,
+  ) async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => _DeviceDetailDialog(device: device),
+    );
+  }
+
+  Future<void> _deleteKnownDevice(
+    BuildContext context,
+    WidgetRef ref,
+    String fingerprint,
+  ) async {
+    // Remove all network entries via Rust backend
+    // For now, we untrust and let the known_devices.json clean up
+    final service = PrivetService.instance;
+    // Delete all network mappings
+    final knownDevices = ref.read(knownDevicesProvider);
+    for (final device in knownDevices) {
+      if (device['fingerprint'] == fingerprint) {
+        final networks = device['networks'] as Map<String, dynamic>? ?? {};
+        for (final subnet in networks.keys) {
+          await service.removeKnownDeviceIp(
+            fingerprint: fingerprint,
+            subnet: subnet,
+            addr: '',
+          );
+        }
+      }
+    }
+    await ref.read(knownDevicesProvider.notifier).refresh();
+  }
+
+  Future<void> _addDeviceIp(
+    BuildContext context,
+    WidgetRef ref,
+    Map<String, dynamic> device,
+  ) async {
+    final subnetController = TextEditingController();
+    final addrController = TextEditingController();
+    final labelController = TextEditingController();
+
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add Network IP'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: subnetController,
+              decoration: const InputDecoration(
+                labelText: 'Subnet (e.g. 192.168.1.0/24)',
+                hintText: '192.168.1.0/24',
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: addrController,
+              decoration: const InputDecoration(
+                labelText: 'IP:Port (e.g. 192.168.1.100:53530)',
+                hintText: '192.168.1.100:53530',
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: labelController,
+              decoration: const InputDecoration(
+                labelText: 'Network Label (e.g. 公司网络)',
+                hintText: '公司网络',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, {
+              'subnet': subnetController.text,
+              'addr': addrController.text,
+              'label': labelController.text,
+            }),
+            child: const Text('Add'),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      final service = PrivetService.instance;
+      await service.addKnownDeviceIp(
+        fingerprint: device['fingerprint'] as String? ?? '',
+        peerId: device['peer_id'] as String? ?? '',
+        deviceName: device['device_name'] as String? ?? '',
+        subnet: result['subnet'] ?? '',
+        addr: result['addr'] ?? '',
+        label: result['label'],
+      );
+      await ref.read(knownDevicesProvider.notifier).refresh();
+    }
+  }
+
   Future<void> _restartEngine(BuildContext context, WidgetRef ref) async {
     final service = PrivetService.instance;
     await service.stop();
@@ -266,5 +388,309 @@ class SettingsPage extends ConsumerWidget {
         SnackBar(content: Text(ok ? 'Engine restarted' : 'Failed to restart')),
       );
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Current Network section
+// ---------------------------------------------------------------------------
+
+class _CurrentNetworkSection extends StatelessWidget {
+  final List<Map<String, dynamic>> currentNetworks;
+
+  const _CurrentNetworkSection({required this.currentNetworks});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          child: Row(
+            children: [
+              Text(
+                'Current Network(s)',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const Spacer(),
+              if (currentNetworks.isEmpty)
+                const SizedBox(
+                  width: 16, height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+            ],
+          ),
+        ),
+        if (currentNetworks.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text('Detecting network...', style: TextStyle(color: Colors.grey)),
+          )
+        else
+          ...currentNetworks.map((net) => ListTile(
+                dense: true,
+                leading: const Icon(Icons.wifi, size: 20),
+                title: Text(
+                  net['subnet'] as String? ?? 'Unknown',
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                ),
+                subtitle: Text(
+                  (net['local_ips'] as List<dynamic>?)
+                      ?.map((ip) => ip.toString())
+                      .join(', ') ?? '',
+                  style: const TextStyle(fontSize: 11),
+                ),
+              )),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Known Devices section
+// ---------------------------------------------------------------------------
+
+class _KnownDevicesSection extends StatelessWidget {
+  final List<Map<String, dynamic>> knownDevices;
+  final VoidCallback onRefresh;
+  final void Function(Map<String, dynamic>) onEdit;
+  final void Function(String fingerprint) onDelete;
+  final void Function(Map<String, dynamic>) onAddIp;
+
+  const _KnownDevicesSection({
+    required this.knownDevices,
+    required this.onRefresh,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onAddIp,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          child: Row(
+            children: [
+              Text(
+                'Known Devices',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.refresh, size: 20),
+                onPressed: onRefresh,
+                tooltip: 'Refresh known devices',
+              ),
+            ],
+          ),
+        ),
+        if (knownDevices.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text(
+              'No known devices. Devices discovered via mDNS/beacon or manually sent will appear here.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          )
+        else
+          ...knownDevices.map((device) => _KnownDeviceTile(
+                device: device,
+                onEdit: () => onEdit(device),
+                onAddIp: () => onAddIp(device),
+                onDelete: () => onDelete(device['fingerprint'] as String? ?? ''),
+              )),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Known Device Tile
+// ---------------------------------------------------------------------------
+
+class _KnownDeviceTile extends StatelessWidget {
+  final Map<String, dynamic> device;
+  final VoidCallback onEdit;
+  final VoidCallback onAddIp;
+  final VoidCallback onDelete;
+
+  const _KnownDeviceTile({
+    required this.device,
+    required this.onEdit,
+    required this.onAddIp,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final name = device['device_name'] as String? ?? 'Unknown';
+    final fingerprint = device['fingerprint'] as String? ?? '';
+    final shortFp = fingerprint.length > 12
+        ? fingerprint.substring(0, 12)
+        : fingerprint;
+    final networks = device['networks'] as Map<String, dynamic>? ?? {};
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.devices, size: 20),
+              title: Text(name, style: const TextStyle(fontWeight: FontWeight.w500)),
+              subtitle: Text(shortFp,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: Colors.grey)),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.add_link, size: 18),
+                    onPressed: onAddIp,
+                    tooltip: 'Add network IP',
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+                    onPressed: onDelete,
+                    tooltip: 'Remove device',
+                  ),
+                ],
+              ),
+            ),
+            // Show each network entry
+            ...networks.entries.map((entry) {
+              final subnet = entry.key;
+              final netInfo = entry.value as Map<String, dynamic>;
+              final addrs = (netInfo['addresses'] as List<dynamic>?)
+                      ?.cast<String>() ?? [];
+              final label = netInfo['label'] as String?;
+
+              return Padding(
+                padding: const EdgeInsets.only(left: 48, bottom: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.lan, size: 14, color: Colors.grey.shade600),
+                        const SizedBox(width: 4),
+                        Text(
+                          label ?? subnet,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey.shade700,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ],
+                    ),
+                    ...addrs.map((addr) => Padding(
+                      padding: const EdgeInsets.only(left: 18),
+                      child: Text(
+                        addr,
+                        style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                      ),
+                    )),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Device Detail Dialog
+// ---------------------------------------------------------------------------
+
+class _DeviceDetailDialog extends ConsumerWidget {
+  final Map<String, dynamic> device;
+
+  const _DeviceDetailDialog({required this.device});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final name = device['device_name'] as String? ?? 'Unknown';
+    final fingerprint = device['fingerprint'] as String? ?? '';
+    final networks = device['networks'] as Map<String, dynamic>? ?? {};
+
+    return AlertDialog(
+      title: Text(name),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(
+              title: const Text('Fingerprint'),
+              subtitle: Text(
+                fingerprint,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+              ),
+            ),
+            const Divider(),
+            Text('Network IP Mappings',
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+            if (networks.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(8),
+                child: Text('No network mappings', style: TextStyle(color: Colors.grey)),
+              )
+            else
+              ...networks.entries.map((entry) {
+                final subnet = entry.key;
+                final netInfo = entry.value as Map<String, dynamic>;
+                final addrs = (netInfo['addresses'] as List<dynamic>?)
+                        ?.cast<String>() ?? [];
+                final label = netInfo['label'] as String?;
+                final lastSeen = netInfo['last_seen'] as String?;
+
+                return ListTile(
+                  dense: true,
+                  title: Text(label ?? subnet,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      ...addrs.map((a) => Text(a, style: const TextStyle(fontSize: 11))),
+                      if (lastSeen != null)
+                        Text('Last seen: $lastSeen', style: const TextStyle(fontSize: 10, color: Colors.grey)),
+                    ],
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline, size: 16, color: Colors.red),
+                    onPressed: () async {
+                      final service = PrivetService.instance;
+                      await service.removeKnownDeviceIp(
+                        fingerprint: fingerprint,
+                        subnet: subnet,
+                        addr: '',
+                      );
+                      await ref.read(knownDevicesProvider.notifier).refresh();
+                      if (context.mounted) Navigator.pop(context);
+                    },
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    );
   }
 }

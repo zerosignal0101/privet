@@ -21,6 +21,7 @@ enum PrivetEventType {
   networkChanged,
   awaitingAccept,
   awaitingPairing,
+  knownDeviceProbed,
 }
 
 class PrivetEvent {
@@ -238,6 +239,58 @@ class PrivetService {
   }
 
   // -----------------------------------------------------------------------
+  // Network awareness / known devices
+  // -----------------------------------------------------------------------
+
+  Future<List<Map<String, dynamic>>> getCurrentNetworks() =>
+      _ffiIsolate.getCurrentNetworks();
+
+  Future<List<Map<String, dynamic>>> probeKnownDevices() =>
+      _ffiIsolate.probeKnownDevices();
+
+  Future<List<Map<String, dynamic>>> getKnownDevices() =>
+      _ffiIsolate.getKnownDevices();
+
+  Future<bool> addKnownDeviceIp({
+    required String fingerprint,
+    required String peerId,
+    required String deviceName,
+    required String subnet,
+    required String addr,
+    String? label,
+  }) =>
+      _ffiIsolate.addKnownDeviceIp({
+        'fingerprint': fingerprint,
+        'peer_id': peerId,
+        'device_name': deviceName,
+        'subnet': subnet,
+        'addr': addr,
+        if (label != null) 'label': label,
+      });
+
+  Future<bool> removeKnownDeviceIp({
+    required String fingerprint,
+    required String subnet,
+    String addr = '',
+  }) =>
+      _ffiIsolate.removeKnownDeviceIp({
+        'fingerprint': fingerprint,
+        'subnet': subnet,
+        'addr': addr,
+      });
+
+  Future<bool> setNetworkLabel({
+    required String fingerprint,
+    required String subnet,
+    required String label,
+  }) =>
+      _ffiIsolate.setNetworkLabel({
+        'fingerprint': fingerprint,
+        'subnet': subnet,
+        'label': label,
+      });
+
+  // -----------------------------------------------------------------------
   // Internal: convert raw events to typed PrivetEvents
   // -----------------------------------------------------------------------
 
@@ -340,6 +393,15 @@ class PrivetService {
               ? PeerInfo.fromJson(extra!['peer'] as Map<String, dynamic>)
               : null,
           pairingCode: extra?['code'] as String?,
+        );
+        break;
+      case 10: // KnownDeviceProbed
+        event = PrivetEvent(
+          type: PrivetEventType.knownDeviceProbed,
+          peerId: peerId,
+          peer: extra != null
+              ? PeerInfo.fromJson(extra)
+              : null,
         );
         break;
       default:

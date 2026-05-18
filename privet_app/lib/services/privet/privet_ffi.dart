@@ -41,6 +41,7 @@ const int eventIncomingTransfer = 6;
 const int eventNetworkChanged = 7;
 const int eventAwaitingAccept = 8;
 const int eventAwaitingPairing = 9;
+const int eventKnownDeviceProbed = 10;
 
 // ---------------------------------------------------------------------------
 // FFI function typedefs
@@ -118,6 +119,24 @@ typedef PrivetFreeStringDart = void Function(Pointer<Utf8>);
 typedef PrivetPollEventNative = Pointer<Utf8> Function();
 typedef PrivetPollEventDart = Pointer<Utf8> Function();
 
+typedef PrivetGetCurrentNetworksNative = Pointer<Utf8> Function();
+typedef PrivetGetCurrentNetworksDart = Pointer<Utf8> Function();
+
+typedef PrivetProbeKnownDevicesNative = Pointer<Utf8> Function();
+typedef PrivetProbeKnownDevicesDart = Pointer<Utf8> Function();
+
+typedef PrivetGetKnownDevicesNative = Pointer<Utf8> Function();
+typedef PrivetGetKnownDevicesDart = Pointer<Utf8> Function();
+
+typedef PrivetAddKnownDeviceIpNative = Int32 Function(Pointer<Utf8> argsJson);
+typedef PrivetAddKnownDeviceIpDart = int Function(Pointer<Utf8> argsJson);
+
+typedef PrivetRemoveKnownDeviceIpNative = Int32 Function(Pointer<Utf8> argsJson);
+typedef PrivetRemoveKnownDeviceIpDart = int Function(Pointer<Utf8> argsJson);
+
+typedef PrivetSetNetworkLabelNative = Int32 Function(Pointer<Utf8> argsJson);
+typedef PrivetSetNetworkLabelDart = int Function(Pointer<Utf8> argsJson);
+
 // ---------------------------------------------------------------------------
 // PrivetFfi — raw FFI bindings (singleton)
 // ---------------------------------------------------------------------------
@@ -151,6 +170,12 @@ class PrivetFfi {
   late PrivetGetSessionsDart _getSessions;
   late PrivetGetIdentityDart _getIdentity;
   late PrivetFreeStringDart _freeString;
+  late PrivetGetCurrentNetworksDart _getCurrentNetworks;
+  late PrivetProbeKnownDevicesDart _probeKnownDevices;
+  late PrivetGetKnownDevicesDart _getKnownDevices;
+  late PrivetAddKnownDeviceIpDart _addKnownDeviceIp;
+  late PrivetRemoveKnownDeviceIpDart _removeKnownDeviceIp;
+  late PrivetSetNetworkLabelDart _setNetworkLabel;
 
   /// Load the native library and bind all FFI functions.
   bool initialize() {
@@ -204,6 +229,18 @@ class PrivetFfi {
         PrivetGetIdentityDart>('privet_get_identity');
     _freeString = _lib!.lookupFunction<PrivetFreeStringNative,
         PrivetFreeStringDart>('privet_free_string');
+    _getCurrentNetworks = _lib!.lookupFunction<PrivetGetCurrentNetworksNative,
+        PrivetGetCurrentNetworksDart>('privet_get_current_networks');
+    _probeKnownDevices = _lib!.lookupFunction<PrivetProbeKnownDevicesNative,
+        PrivetProbeKnownDevicesDart>('privet_probe_known_devices');
+    _getKnownDevices = _lib!.lookupFunction<PrivetGetKnownDevicesNative,
+        PrivetGetKnownDevicesDart>('privet_get_known_devices');
+    _addKnownDeviceIp = _lib!.lookupFunction<PrivetAddKnownDeviceIpNative,
+        PrivetAddKnownDeviceIpDart>('privet_add_known_device_ip');
+    _removeKnownDeviceIp = _lib!.lookupFunction<PrivetRemoveKnownDeviceIpNative,
+        PrivetRemoveKnownDeviceIpDart>('privet_remove_known_device_ip');
+    _setNetworkLabel = _lib!.lookupFunction<PrivetSetNetworkLabelNative,
+        PrivetSetNetworkLabelDart>('privet_set_network_label');
 
     _initialized = true;
     return true;
@@ -280,6 +317,13 @@ class PrivetFfi {
   Pointer<Utf8> getIdentity() => _getIdentity();
 
   void freeString(Pointer<Utf8> ptr) => _freeString(ptr);
+
+  Pointer<Utf8> getCurrentNetworks() => _getCurrentNetworks();
+  Pointer<Utf8> probeKnownDevices() => _probeKnownDevices();
+  Pointer<Utf8> getKnownDevices() => _getKnownDevices();
+  int addKnownDeviceIp(Pointer<Utf8> argsJson) => _addKnownDeviceIp(argsJson);
+  int removeKnownDeviceIp(Pointer<Utf8> argsJson) => _removeKnownDeviceIp(argsJson);
+  int setNetworkLabel(Pointer<Utf8> argsJson) => _setNetworkLabel(argsJson);
 
   /// Read a C-allocated JSON string and free it.
   String? readAndFreeJson(Pointer<Utf8> ptr) {

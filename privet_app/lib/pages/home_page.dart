@@ -18,6 +18,7 @@ class HomePage extends ConsumerStatefulWidget {
 }
 
 class _HomePageState extends ConsumerState<HomePage> {
+  bool _isScanning = false;
 
   @override
   void initState() {
@@ -65,6 +66,15 @@ class _HomePageState extends ConsumerState<HomePage> {
     }
   }
 
+  Future<void> _scanKnownDevices() async {
+    setState(() => _isScanning = true);
+    try {
+      await ref.read(probedDevicesProvider.notifier).scan();
+    } finally {
+      if (mounted) setState(() => _isScanning = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final peers = ref.watch(peerListProvider);
@@ -72,6 +82,7 @@ class _HomePageState extends ConsumerState<HomePage> {
     final incoming = ref.watch(incomingTransferProvider);
     final progress = ref.watch(transferProgressProvider);
     final isRunning = ref.watch(engineRunningProvider);
+    final probedDevices = ref.watch(probedDevicesProvider);
 
     return Scaffold(
       appBar: AppBar(
@@ -133,7 +144,48 @@ class _HomePageState extends ConsumerState<HomePage> {
                         progress: e.value,
                       )),
 
-                  // Peer list
+                  // Known / Probed Devices section
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                    child: Row(
+                      children: [
+                        Text(
+                          'Known Devices',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const Spacer(),
+                        SizedBox(
+                          height: 32,
+                          child: _isScanning
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : TextButton.icon(
+                                  onPressed: _scanKnownDevices,
+                                  icon: const Icon(Icons.search, size: 16),
+                                  label: const Text('Scan', style: TextStyle(fontSize: 12)),
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (probedDevices.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: Text(
+                        'Tap "Scan" to check for known devices on this network',
+                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    )
+                  else
+                    ...probedDevices.map((peer) => _ProbedPeerTile(
+                          peer: peer,
+                          onSend: () => _sendToPeer(peer),
+                        )),
+
+                  // Nearbby Devices (auto-discovered)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
                     child: Text(
@@ -230,7 +282,45 @@ class _HomePageState extends ConsumerState<HomePage> {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-widgets
+// Probed Peer Tile — for known devices found via directed probe
+// ---------------------------------------------------------------------------
+
+class _ProbedPeerTile extends StatelessWidget {
+  final PeerInfo peer;
+  final VoidCallback onSend;
+
+  const _ProbedPeerTile({required this.peer, required this.onSend});
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = peer.isTrusted
+        ? Icon(Icons.verified_user, color: Colors.green.shade700, size: 20)
+        : Icon(Icons.link, color: Colors.blue.shade600, size: 20);
+
+    return ListTile(
+      dense: true,
+      leading: icon,
+      title: Text(peer.name, style: const TextStyle(fontSize: 14)),
+      subtitle: Row(
+        children: [
+          Icon(Icons.check_circle, size: 12, color: Colors.green.shade600),
+          const SizedBox(width: 4),
+          Text('Online', style: TextStyle(fontSize: 11, color: Colors.green.shade700)),
+          const SizedBox(width: 8),
+          Text(peer.displayFingerprint,
+            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        ],
+      ),
+      trailing: IconButton(
+        icon: const Icon(Icons.send, size: 18),
+        onPressed: onSend,
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-widgets (unchanged)
 // ---------------------------------------------------------------------------
 
 class _PeerTile extends StatelessWidget {

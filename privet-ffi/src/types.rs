@@ -34,6 +34,7 @@ pub const EVENT_INCOMING_TRANSFER: c_int = 6;
 pub const EVENT_NETWORK_CHANGED: c_int = 7;
 pub const EVENT_AWAITING_ACCEPT: c_int = 8;
 pub const EVENT_AWAITING_PAIRING: c_int = 9;
+pub const EVENT_KNOWN_DEVICE_PROBED: c_int = 10;
 
 /// Encode a UUID as a 36-byte fixed buffer (NUL-terminated).
 pub fn uuid_to_bytes(id: &uuid::Uuid) -> [u8; 36] {
@@ -134,6 +135,11 @@ impl CEvent {
                     "peer": peer,
                     "code": code,
                 }));
+            }
+            privet_core::PrivetEvent::KnownDeviceProbed { peer } => {
+                ce.event_type = EVENT_KNOWN_DEVICE_PROBED;
+                ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
+                ce.extra_json = json_to_cstring(peer);
             }
         }
 

@@ -10,6 +10,8 @@ use quinn::Endpoint;
 use crate::config::PrivetConfig;
 use crate::discovery::{DiscoveryEvent, DiscoveryManager};
 use crate::error::{PrivetError, Result};
+use crate::known_device::KnownDeviceStore;
+use crate::network::NetworkInfo;
 use crate::peer::{PeerId, PeerInfo};
 use crate::security::identity::DeviceIdentity;
 use crate::security::tls;
@@ -42,6 +44,10 @@ pub enum PrivetEvent {
         session_id: SessionId,
         peer: PeerInfo,
         code: String,
+    },
+    /// Emitted when a known device is probed and found online on the current network.
+    KnownDeviceProbed {
+        peer: PeerInfo,
     },
     NetworkChanged,
 }
@@ -77,6 +83,8 @@ pub struct PrivetEngine {
     trust_store: Arc<tokio::sync::Mutex<TrustStore>>,
     /// Accept store — which trusted devices auto-accept transfers.
     accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
+    /// Known device store — device-to-network/IP mappings for directed discovery.
+    known_device_store: Arc<tokio::sync::Mutex<KnownDeviceStore>>,
     /// Oneshot channels for pending incoming transfer decisions (session_id → sender).
     pending_incoming: Arc<RwLock<HashMap<SessionId, tokio::sync::oneshot::Sender<bool>>>>,
     /// Oneshot channels for pending pairing decisions (peer_fingerprint → sender).
@@ -136,6 +144,16 @@ impl PrivetEngine {
         let accept_store = crate::security::accept::AcceptStore::load_or_create(accept_path)?;
         tracing::debug!("PrivetEngine::new: accept_store loaded");
 
+        // Load known device store
+        let known_device_path = config
+            .security
+            .cert_dir
+            .as_ref()
+            .map(|d| d.join("known_devices.json"))
+            .unwrap_or_else(|| PathBuf::from("known_devices.json"));
+        let known_device_store = KnownDeviceStore::load_or_create(known_device_path)?;
+        tracing::debug!("PrivetEngine::new: known_device_store loaded");
+
         // Initialize transfer log
         let log_dir = config
             .log_dir
@@ -157,6 +175,7 @@ impl PrivetEngine {
             identity,
             trust_store: Arc::new(tokio::sync::Mutex::new(trust_store)),
             accept_store: Arc::new(tokio::sync::Mutex::new(accept_store)),
+            known_device_store: Arc::new(tokio::sync::Mutex::new(known_device_store)),
             pending_incoming: Arc::new(RwLock::new(HashMap::new())),
             pending_pairing: Arc::new(RwLock::new(HashMap::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -342,10 +361,38 @@ impl PrivetEngine {
 
             let peers = Arc::clone(&self.peers);
             let event_tx = self.event_tx.clone();
+            let known_device_store = self.known_device_store.clone();
             tokio::spawn(async move {
                 while let Some(event) = discovery_rx.recv().await {
                     match event {
                         DiscoveryEvent::PeerDiscovered(info) => {
+                            // Auto-record discovered device to known device store
+                            if let Some(addr) = info.primary_address() {
+                                let subnet = crate::network::subnet_from_addr(
+                                    &addr.ip(),
+                                    crate::network::default_prefix_len(match addr.ip() {
+                                        std::net::IpAddr::V4(ref v4) => v4,
+                                        std::net::IpAddr::V6(_) => {
+                                            // skip IPv6 for now
+                                            let mut map = peers.write().await;
+                                            map.insert(info.id, info.clone());
+                                            drop(map);
+                                            let _ = event_tx.send(PrivetEvent::PeerDiscovered(info));
+                                            continue;
+                                        }
+                                    }),
+                                );
+                                let mut store = known_device_store.lock().await;
+                                let _ = store.add_or_update_device(
+                                    info.fingerprint.clone(),
+                                    info.id.clone(),
+                                    info.name.clone(),
+                                    subnet,
+                                    addr,
+                                    None,
+                                );
+                            }
+
                             let mut map = peers.write().await;
                             map.insert(info.id, info.clone());
                             drop(map);
@@ -511,6 +558,7 @@ impl PrivetEngine {
                         Ok(tcp_result) => {
                             self.log_transfer(tcp_result.0, &tcp_result.1, &paths, true)
                                 .await;
+                            self.record_to_known_devices(&tcp_result.1, &addr).await;
                             self.emit_pairing_if_needed(&tcp_result.1, &addr).await;
                             self.track_session(tcp_result.0).await;
                             return Ok(tcp_result.0);
@@ -536,6 +584,9 @@ impl PrivetEngine {
         // Log
         self.log_transfer(session_id, &peer_fingerprint, &paths, true)
             .await;
+
+        // Auto-record to known device store
+        self.record_to_known_devices(&peer_fingerprint, &addr).await;
 
         // Pairing flow
         self.emit_pairing_if_needed(&peer_fingerprint, &addr).await;
@@ -623,6 +674,47 @@ impl PrivetEngine {
         }
     }
 
+    /// Record a successful connection to the known device store.
+    /// Called after a successful send to automatically remember the peer's IP.
+    async fn record_to_known_devices(&self, peer_fingerprint: &str, addr: &SocketAddr) {
+        let subnet = crate::network::subnet_from_addr(
+            &addr.ip(),
+            crate::network::default_prefix_len(match addr.ip() {
+                std::net::IpAddr::V4(ref v4) => v4,
+                std::net::IpAddr::V6(_) => return, // skip IPv6 for now
+            }),
+        );
+
+        // Try to find the device name from the discovered peers list
+        let device_name = {
+            let peers = self.peers.read().await;
+            peers.values()
+                .find(|p| p.fingerprint == peer_fingerprint)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| peer_fingerprint[..8.min(peer_fingerprint.len())].to_string())
+        };
+
+        let peer_id = {
+            let peers = self.peers.read().await;
+            peers.values()
+                .find(|p| p.fingerprint == peer_fingerprint)
+                .map(|p| p.id.clone())
+                .unwrap_or_else(|| PeerId(uuid::Uuid::nil()))
+        };
+
+        let mut store = self.known_device_store.lock().await;
+        if let Err(e) = store.add_or_update_device(
+            peer_fingerprint.to_owned(),
+            peer_id,
+            device_name,
+            subnet,
+            *addr,
+            None,
+        ) {
+            tracing::warn!("Failed to record known device: {e}");
+        }
+    }
+
     /// Mark session as completed in the sessions map.
     async fn track_session(&self, session_id: SessionId) {
         let mut sessions = self.sessions.write().await;
@@ -638,12 +730,31 @@ impl PrivetEngine {
     }
 
     /// Send files to a peer resolved by display name.
+    /// Falls back to known device store if the peer is not discovered via mDNS/beacon.
     pub async fn send_files_to_name(&self, name: &str, paths: Vec<PathBuf>) -> Result<SessionId> {
-        let peer = self
-            .resolve_peer_by_name(name)
-            .await
-            .ok_or_else(|| PrivetError::PeerNotFound(name.to_owned()))?;
-        self.send_files(&peer.id, paths).await
+        // First, try discovered peers
+        if let Some(peer) = self.resolve_peer_by_name(name).await {
+            return self.send_files(&peer.id, paths).await;
+        }
+
+        // Fallback: look up in known device store for current network
+        let networks = self.current_networks();
+        let store = self.known_device_store.lock().await;
+
+        for net_info in &networks {
+            if let Some(device) = store.get_device_by_name(name) {
+                if let Some(entry) = device.networks.get(&net_info.subnet) {
+                    if let Some(addr_str) = entry.addresses.first() {
+                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                            drop(store);
+                            return self.send_files_to_addr(addr, paths).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(PrivetError::PeerNotFound(name.to_owned()))
     }
 
     /// Resolve a peer by display name from the discovered peers list.
@@ -732,6 +843,102 @@ impl PrivetEngine {
     /// List all active sessions.
     pub async fn list_sessions(&self) -> Vec<TransferSession> {
         self.sessions.read().await.values().cloned().collect()
+    }
+
+    /// Detect current networks and return their info.
+    pub fn current_networks(&self) -> Vec<NetworkInfo> {
+        crate::network::detect_current_networks_smart()
+    }
+
+    /// Probe known devices on the current network(s).
+    /// Returns a list of probed devices that are online.
+    /// Emits `KnownDeviceProbed` events for each online device.
+    pub async fn probe_known_devices(&self) -> Vec<PeerInfo> {
+        let networks = self.current_networks();
+        let subnets: Vec<String> = networks.iter().map(|n| n.subnet.clone()).collect();
+
+        if subnets.is_empty() {
+            return Vec::new();
+        }
+
+        let store = self.known_device_store.lock().await;
+        let probed = crate::discovery::probe::probe_all_known_devices(&store, &subnets).await;
+        drop(store);
+
+        let trusted = self.trust_store.lock().await.trusted_fingerprints();
+        let mut online_peers = Vec::new();
+
+        for device in probed {
+            let is_trusted = trusted.iter().any(|fp| fp == &device.fingerprint);
+            let peer_info = device.to_peer_info(is_trusted);
+
+            // Add to discovered peers
+            let mut map = self.peers.write().await;
+            map.insert(peer_info.id, peer_info.clone());
+            drop(map);
+
+            // Emit event
+            let _ = self.event_tx.send(PrivetEvent::KnownDeviceProbed {
+                peer: peer_info.clone(),
+            });
+
+            online_peers.push(peer_info);
+        }
+
+        online_peers
+    }
+
+    /// Add a known device IP mapping manually.
+    pub async fn add_known_device_ip(
+        &self,
+        fingerprint: String,
+        peer_id: PeerId,
+        device_name: String,
+        subnet: String,
+        addr: SocketAddr,
+        label: Option<String>,
+    ) -> Result<()> {
+        self.known_device_store.lock().await.add_device_ip(
+            fingerprint, peer_id, device_name, subnet, addr, label,
+        )?;
+        Ok(())
+    }
+
+    /// Remove a network IP mapping for a known device.
+    pub async fn remove_known_device_ip(
+        &self,
+        fingerprint: &str,
+        subnet: &str,
+        addr: &str,
+    ) -> Result<()> {
+        self.known_device_store.lock().await.remove_device_ip(fingerprint, subnet, addr)?;
+        Ok(())
+    }
+
+    /// Remove a network entry for a known device.
+    pub async fn remove_known_device_network(
+        &self,
+        fingerprint: &str,
+        subnet: &str,
+    ) -> Result<()> {
+        self.known_device_store.lock().await.remove_device_network(fingerprint, subnet)?;
+        Ok(())
+    }
+
+    /// Set a human-readable label for a network entry.
+    pub async fn set_network_label(
+        &self,
+        fingerprint: &str,
+        subnet: &str,
+        label: String,
+    ) -> Result<()> {
+        self.known_device_store.lock().await.set_network_label(fingerprint, subnet, label)?;
+        Ok(())
+    }
+
+    /// Get all known devices.
+    pub async fn known_devices(&self) -> Vec<crate::known_device::KnownDevice> {
+        self.known_device_store.lock().await.get_devices().to_vec()
     }
 
     /// Get the device identity.

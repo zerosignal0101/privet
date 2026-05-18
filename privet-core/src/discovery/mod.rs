@@ -1,5 +1,6 @@
 pub mod beacon;
 pub mod mdns;
+pub mod probe;
 pub mod scanner;
 
 use std::net::SocketAddr;
