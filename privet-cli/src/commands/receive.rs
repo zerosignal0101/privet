@@ -25,6 +25,10 @@ pub struct ReceiveArgs {
     /// Non-interactive mode: reject all pairing requests and non-auto-accepted transfers
     #[arg(long)]
     pub non_interactive: bool,
+
+    /// Force TCP fallback (skip QUIC)
+    #[arg(long)]
+    pub force_tcp: bool,
 }
 
 pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Result<()> {
@@ -43,6 +47,10 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
         };
     } else if args.auto_accept_trusted {
         config.security_mode = privet_core::SecurityMode::AllowAll;
+    }
+
+    if args.force_tcp {
+        config.transport.force_tcp_fallback = true;
     }
 
     let engine = privet_core::PrivetEngine::new(config.clone()).await?;
@@ -128,9 +136,11 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
             }
             Some(privet_core::PrivetEvent::TransferComplete { .. }) => {
                 println!("\n  Transfer complete");
+                active_session = None;
             }
             Some(privet_core::PrivetEvent::TransferFailed { error, .. }) => {
                 println!("\n  Transfer failed: {error}");
+                active_session = None;
             }
             Some(event) => {
                 tracing::debug!("Event: {event:?}");

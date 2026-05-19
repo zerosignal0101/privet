@@ -30,6 +30,10 @@ pub struct SendArgs {
     /// Non-interactive mode: fail immediately if pairing is required
     #[arg(long)]
     pub non_interactive: bool,
+
+    /// Force TCP fallback (skip QUIC)
+    #[arg(long)]
+    pub force_tcp: bool,
 }
 
 pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Result<()> {
@@ -50,6 +54,10 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
         };
     } else if args.auto_accept {
         config.security_mode = privet_core::SecurityMode::AllowAll;
+    }
+
+    if args.force_tcp {
+        config.transport.force_tcp_fallback = true;
     }
 
     let has_ip = args.to_ip.is_some();

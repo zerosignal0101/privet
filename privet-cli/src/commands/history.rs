@@ -38,9 +38,16 @@ pub struct HistoryArgs {
     /// Target peer name for --resend (resolves via discovery)
     #[arg(long = "to-name")]
     pub to_name: Option<String>,
+
+    /// Force TCP fallback (skip QUIC)
+    #[arg(long)]
+    pub force_tcp: bool,
 }
 
-pub async fn run(args: HistoryArgs, config: PrivetConfig) -> privet_core::Result<()> {
+pub async fn run(args: HistoryArgs, mut config: PrivetConfig) -> privet_core::Result<()> {
+    if args.force_tcp {
+        config.transport.force_tcp_fallback = true;
+    }
     let engine = PrivetEngine::new(config).await?;
 
     // Handle --delete

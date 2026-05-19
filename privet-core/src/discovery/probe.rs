@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -50,7 +51,11 @@ impl ProbedDevice {
 /// Returns true if the connection succeeds (or times out positively).
 pub async fn probe_address(addr: SocketAddr, timeout_duration: Duration) -> bool {
     match timeout(timeout_duration, TcpStream::connect(addr)).await {
-        Ok(Ok(_stream)) => true,
+        Ok(Ok(mut stream)) => {
+            // Write probe marker byte so receiver can distinguish from TLS
+            let _ = stream.write_all(&[0x00]).await;
+            true
+        }
         _ => false,
     }
 }

@@ -379,11 +379,28 @@ impl PrivetEngine {
                                     let sm = session_meta_tcp.clone();
                                     let tl = transfer_log_tcp.clone();
                                     tokio::spawn(async move {
+                                        // Peek first byte: probe marker (0x00) vs TLS ClientHello
+                                        let mut peek_buf = [0u8; 1];
+                                        let is_probe = tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            stream.peek(&mut peek_buf),
+                                        )
+                                        .await
+                                        .ok()
+                                            .and_then(|r| r.ok())
+                                            .map(|n| n == 1 && peek_buf[0] == 0x00)
+                                            .unwrap_or(false);
+
+                                        if is_probe {
+                                            // Probe marker — close silently
+                                            return;
+                                        }
+
                                         // Wrap with TLS
                                         let tls_stream = match acceptor.accept(stream).await {
                                             Ok(s) => s,
                                             Err(e) => {
-                                                tracing::error!("TCP TLS handshake error from {addr}: {e}");
+                                                tracing::warn!("TCP TLS handshake from {addr} failed: {e}");
                                                 return;
                                             }
                                         };
