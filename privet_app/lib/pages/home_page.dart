@@ -1,14 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/peer.dart';
 import '../models/transfer.dart';
+import '../models/transfer_history.dart';
 import '../providers/providers.dart';
 import '../services/privet/privet_service.dart';
-import 'transfer_page.dart';
-import 'settings_page.dart';
+import '../widgets/transfer_tile.dart';
+import '../widgets/pairing_banner.dart';
+import 'send_preparation_page.dart';
 
 class HomePage extends ConsumerStatefulWidget {
   const HomePage({super.key});
@@ -28,48 +29,39 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   Future<void> _initEngine() async {
     final service = PrivetService.instance;
-    // Wait for SharedPreferences to load before reading settings
     await ref.read(settingsProvider.notifier).ready;
     final settings = ref.read(settingsProvider);
 
-    // Get the app's documents directory for data storage (important on Android).
     String? dataDir;
     try {
       final dir = await getApplicationDocumentsDirectory();
       dataDir = dir.path;
-      debugPrint('[home] dataDir=$dataDir');
-    } catch (e) {
-      debugPrint('[home] getApplicationDocumentsDirectory failed: $e');
-    }
+    } catch (_) {}
 
-    // Use public Downloads folder for received files (user-accessible).
-    String? downloadDir;
+    // Resolve actual download dir and persist it so history can read it
+    String? resolvedDownloadDir;
     if (settings.downloadDir.isNotEmpty) {
-      downloadDir = settings.downloadDir;
+      resolvedDownloadDir = settings.downloadDir;
     } else {
       try {
-        final dir = await getDownloadsDirectory();
-        downloadDir = dir?.path;
-        debugPrint('[home] downloadDir=$downloadDir');
-      } catch (e) {
-        debugPrint('[home] getDownloadsDirectory failed: $e');
-      }
+        resolvedDownloadDir = (await getDownloadsDirectory())?.path;
+      } catch (_) {}
+    }
+    if (resolvedDownloadDir != null) {
+      await ref.read(settingsProvider.notifier).setDownloadDir(resolvedDownloadDir);
     }
 
     final ok = await service.start(
       deviceName: settings.deviceName,
       dataDir: dataDir,
-      downloadDir: downloadDir,
+      downloadDir: resolvedDownloadDir,
       securityMode: settings.securityMode,
     );
-    debugPrint('[home] _initEngine: ok=$ok, lastError=${service.lastError}');
     if (mounted) {
       ref.read(engineRunningProvider.notifier).setRunning(ok);
     }
     if (ok) {
-      // Clear stale transfer state from previous engine instance
-      ref.read(incomingTransferProvider.notifier).clear();
-      ref.read(transferProgressProvider.notifier).clear();
+      ref.read(activeTransfersProvider.notifier).clear();
     }
   }
 
@@ -86,24 +78,25 @@ class _HomePageState extends ConsumerState<HomePage> {
   Widget build(BuildContext context) {
     final peers = ref.watch(peerListProvider);
     final pairingRequests = ref.watch(pairingProvider);
-    final incoming = ref.watch(incomingTransferProvider);
-    final progress = ref.watch(transferProgressProvider);
+    final activeMap = ref.watch(activeTransfersProvider);
     final isRunning = ref.watch(engineRunningProvider);
     final probedDevices = ref.watch(probedDevicesProvider);
-    final activeTransfers = progress.entries.where((e) => e.value.percent < 100).toList();
+
+    final activeList = activeMap.values.toList();
+    final awaitingAccept = activeList.where((t) => t.isAwaitingAccept).toList();
+    final transferring = activeList.where((t) =>
+        t.state == TransferState.transferring ||
+        t.state == TransferState.negotiating ||
+        t.state == TransferState.paused ||
+        t.state == TransferState.completing).toList();
+    final completed = activeList.where((t) => t.isCompleted || t.isFailed).toList();
+    final otherIncoming = activeList
+        .where((t) => t.direction == TransferDirection.receiving && !t.isAwaitingAccept && !t.isCompleted && !t.isFailed)
+        .toList();
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Privet'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const SettingsPage()),
-            ),
-          ),
-        ],
       ),
       body: !isRunning
           ? const Center(child: Text('Engine not running'))
@@ -111,82 +104,56 @@ class _HomePageState extends ConsumerState<HomePage> {
               onRefresh: () => ref.read(peerListProvider.notifier).refresh(),
               child: ListView(
                 children: [
-                  // Pairing requests banner
+                  // Pairing requests
                   if (pairingRequests.isNotEmpty)
-                    ...pairingRequests.map((req) => _PairingBanner(
+                    ...pairingRequests.map((req) => PairingBanner(
                           request: req,
-                          onTrust: () => ref
-                              .read(pairingProvider.notifier)
+                          onTrust: () => ref.read(pairingProvider.notifier)
                               .trust(req.peer.fingerprint),
-                          onTrustAndAccept: () => ref
-                              .read(pairingProvider.notifier)
+                          onTrustAndAccept: () => ref.read(pairingProvider.notifier)
                               .trustAndAccept(req.peer.fingerprint),
-                          onDismiss: () => ref
-                              .read(pairingProvider.notifier)
+                          onDismiss: () => ref.read(pairingProvider.notifier)
                               .reject(req.peer.fingerprint),
                         )),
 
-                  // Incoming transfers (informational — auto-processing in AllowAll)
-                  if (incoming.any((t) => !t.isAwaitingAccept))
-                    ...incoming
-                        .where((t) => !t.isAwaitingAccept)
-                        .map((t) => _IncomingTransferTile(transfer: t)),
+                  // Awaiting accept
+                  if (awaitingAccept.isNotEmpty)
+                    ...awaitingAccept.map((t) => TransferTile(transfer: t)),
 
-                  // Awaiting user decision (Strict mode)
-                  if (incoming.any((t) => t.isAwaitingAccept))
-                    ...incoming
-                        .where((t) => t.isAwaitingAccept)
-                        .map((t) => _IncomingTransferTile(
-                              transfer: t,
-                              isAwaiting: true,
-                              onAccept: () => ref
-                                  .read(incomingTransferProvider.notifier)
-                                  .accept(t.sessionId),
-                              onAcceptAlways: () {
-                                ref
-                                    .read(incomingTransferProvider.notifier)
-                                    .accept(t.sessionId);
-                                if (t.peer != null) {
-                                  PrivetService.instance
-                                      .trustAndAcceptPeer(t.peer!.fingerprint);
-                                  ref.read(acceptedListProvider.notifier).refresh();
-                                }
-                              },
-                              onReject: () => ref
-                                  .read(incomingTransferProvider.notifier)
-                                  .reject(t.sessionId),
-                            )),
-
-                  // Active transfers (filter out completed at 100%)
-                  if (activeTransfers.isNotEmpty)
+                  // Active transfers
+                  if (transferring.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                      child: Text(
-                        'Active Transfers',
-                        style: Theme.of(context).textTheme.titleMedium,
-                      ),
+                      child: Text('Active Transfers',
+                          style: Theme.of(context).textTheme.titleMedium),
                     ),
-                  ...activeTransfers.map((e) => _ActiveTransferTile(
-                        sessionId: e.key,
-                        progress: e.value,
-                      )),
+                  ...transferring.map((t) => TransferTile(transfer: t)),
 
-                  // Known / Probed Devices section
+                  // Other incoming (auto-processing)
+                  ...otherIncoming.map((t) => TransferTile(transfer: t)),
+
+                  // Recently completed/failed
+                  if (completed.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                      child: Text('Recent',
+                          style: Theme.of(context).textTheme.titleMedium),
+                    ),
+                  ...completed.map((t) => TransferTile(transfer: t)),
+
+                  // Probed / Known devices
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
                     child: Row(
                       children: [
-                        Text(
-                          'Known Devices',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
+                        Text('Known Devices',
+                            style: Theme.of(context).textTheme.titleMedium),
                         const Spacer(),
                         SizedBox(
                           height: 32,
                           child: _isScanning
                               ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
+                                  width: 16, height: 16,
                                   child: CircularProgressIndicator(strokeWidth: 2),
                                 )
                               : TextButton.icon(
@@ -209,122 +176,53 @@ class _HomePageState extends ConsumerState<HomePage> {
                   else
                     ...probedDevices.map((peer) => _ProbedPeerTile(
                           peer: peer,
-                          onSend: () => _sendToPeer(peer),
+                          onSend: () => _navigateToSend(peer),
                         )),
 
-                  // Nearbby Devices (auto-discovered)
+                  // Nearby devices
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                    child: Text(
-                      'Nearby Devices',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
+                    child: Text('Nearby Devices',
+                        style: Theme.of(context).textTheme.titleMedium),
                   ),
                   if (peers.isEmpty)
                     const Padding(
                       padding: EdgeInsets.all(32),
-                      child: Center(
-                        child: Text('Scanning for devices...'),
-                      ),
+                      child: Center(child: Text('Scanning for devices...')),
                     )
                   else
                     ...peers.map((peer) => _PeerTile(
                           peer: peer,
-                          onSend: () => _sendToPeer(peer),
+                          onSend: () => _navigateToSend(peer),
                         )),
                 ],
               ),
             ),
       floatingActionButton: FloatingActionButton(
-        onPressed: _sendByAddress,
+        onPressed: () => _navigateToSend(null),
         child: const Icon(Icons.send),
       ),
     );
   }
 
-  Future<void> _sendToPeer(PeerInfo peer) async {
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-    if (result == null || result.files.isEmpty) return;
-
-    final paths = result.files.map((f) => f.path!).toList();
-    final addr = peer.addresses.isNotEmpty ? peer.addresses.first : '';
-
-    final service = PrivetService.instance;
-    var sessionId = await service.sendFilesToAddr(addr, paths);
-
-    // If send failed (likely PairingRequired), wait for pairing
-    // to resolve then retry once.
-    if (sessionId == null) {
-      await ref.read(pairingProvider.notifier).waitForResolution;
-      sessionId = await service.sendFilesToAddr(addr, paths);
-    }
-
-    final sid = sessionId;
-    if (sid != null && mounted) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => TransferPage(sessionId: sid),
+  void _navigateToSend(PeerInfo? peer) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SendPreparationPage(
+          initialPeerAddress: peer?.addresses.isNotEmpty == true
+              ? peer!.addresses.first
+              : null,
+          initialPeerName: peer?.name,
+          initialPeerFingerprint: peer?.fingerprint,
         ),
-      );
-    }
-  }
-
-  Future<void> _sendByAddress() async {
-    final controller = TextEditingController();
-    final addr = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Send to Address'),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(
-            hintText: '192.168.1.5:53530',
-            labelText: 'IP:Port',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
-            child: const Text('Send'),
-          ),
-        ],
       ),
     );
-
-    if (addr == null || addr.isEmpty) return;
-
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-    if (result == null || result.files.isEmpty) return;
-
-    final paths = result.files.map((f) => f.path!).toList();
-    final service = PrivetService.instance;
-    var sessionId = await service.sendFilesToAddr(addr, paths);
-
-    // Retry after pairing resolves if needed
-    if (sessionId == null) {
-      await ref.read(pairingProvider.notifier).waitForResolution;
-      sessionId = await service.sendFilesToAddr(addr, paths);
-    }
-
-    final sid2 = sessionId;
-    if (sid2 != null && mounted) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => TransferPage(sessionId: sid2),
-        ),
-      );
-    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Probed Peer Tile — for known devices found via directed probe
+// Probed Peer Tile
 // ---------------------------------------------------------------------------
 
 class _ProbedPeerTile extends StatelessWidget {
@@ -335,22 +233,23 @@ class _ProbedPeerTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final icon = peer.isTrusted
-        ? Icon(Icons.verified_user, color: Colors.green.shade700, size: 20)
-        : Icon(Icons.link, color: Colors.blue.shade600, size: 20);
-
     return ListTile(
       dense: true,
-      leading: icon,
+      leading: Icon(
+        peer.isTrusted ? Icons.verified_user : Icons.link,
+        color: peer.isTrusted ? Colors.green.shade700 : Colors.blue.shade600,
+        size: 20,
+      ),
       title: Text(peer.name, style: const TextStyle(fontSize: 14)),
       subtitle: Row(
         children: [
           Icon(Icons.check_circle, size: 12, color: Colors.green.shade600),
           const SizedBox(width: 4),
-          Text('Online', style: TextStyle(fontSize: 11, color: Colors.green.shade700)),
+          Text('Online',
+              style: TextStyle(fontSize: 11, color: Colors.green.shade700)),
           const SizedBox(width: 8),
           Text(peer.displayFingerprint,
-            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              style: const TextStyle(fontSize: 11, color: Colors.grey)),
         ],
       ),
       trailing: IconButton(
@@ -362,7 +261,7 @@ class _ProbedPeerTile extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-widgets (unchanged)
+// Peer Tile
 // ---------------------------------------------------------------------------
 
 class _PeerTile extends StatelessWidget {
@@ -373,12 +272,10 @@ class _PeerTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final icon = peer.isTrusted
-        ? Icon(Icons.verified_user, color: Colors.green.shade700)
-        : const Icon(Icons.devices);
-
     return ListTile(
-      leading: icon,
+      leading: peer.isTrusted
+          ? Icon(Icons.verified_user, color: Colors.green.shade700)
+          : const Icon(Icons.devices),
       title: Text(peer.name),
       subtitle: Text(
         '${peer.displayFingerprint}${peer.platform != null ? ' · ${peer.platform}' : ''}',
@@ -386,160 +283,6 @@ class _PeerTile extends StatelessWidget {
       trailing: IconButton(
         icon: const Icon(Icons.send),
         onPressed: onSend,
-      ),
-    );
-  }
-}
-
-class _PairingBanner extends StatelessWidget {
-  final PairRequest request;
-  final VoidCallback onTrust;
-  final VoidCallback onTrustAndAccept;
-  final VoidCallback onDismiss;
-
-  const _PairingBanner({
-    required this.request,
-    required this.onTrust,
-    required this.onTrustAndAccept,
-    required this.onDismiss,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      color: Colors.orange.shade50,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Pairing Request from ${request.peer.name}',
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 4),
-            Text('Verification code: ${request.code}'),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              alignment: WrapAlignment.end,
-              children: [
-                TextButton.icon(
-                  onPressed: onDismiss,
-                  icon: const Icon(Icons.close, size: 14),
-                  label: const Text('Reject', style: TextStyle(fontSize: 12)),
-                ),
-                OutlinedButton.icon(
-                  onPressed: onTrust,
-                  icon: const Icon(Icons.verified, size: 14),
-                  label: const Text('Trust', style: TextStyle(fontSize: 12)),
-                ),
-                FilledButton.icon(
-                  onPressed: onTrustAndAccept,
-                  icon: const Icon(Icons.star, size: 14),
-                  label: const Text('Trust & Accept', style: TextStyle(fontSize: 12)),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _IncomingTransferTile extends StatelessWidget {
-  final IncomingTransfer transfer;
-  final bool isAwaiting;
-  final VoidCallback? onAccept;
-  final VoidCallback? onAcceptAlways;
-  final VoidCallback? onReject;
-
-  const _IncomingTransferTile({
-    required this.transfer,
-    this.isAwaiting = false,
-    this.onAccept,
-    this.onAcceptAlways,
-    this.onReject,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final fileCount = transfer.files.length;
-    final totalSize = transfer.files.fold<int>(0, (sum, f) => sum + f.size);
-
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      child: ListTile(
-        leading: Icon(
-          isAwaiting ? Icons.help_outline : Icons.download,
-          color: isAwaiting ? Colors.orange : null,
-        ),
-        title: Text(
-          isAwaiting
-              ? 'Accept transfer ($fileCount file${fileCount != 1 ? 's' : ''})?'
-              : 'Receiving: $fileCount file${fileCount != 1 ? 's' : ''}',
-        ),
-        subtitle: Text(
-          isAwaiting
-              ? '${_formatSize(totalSize)} — tap check to accept'
-              : _formatSize(totalSize),
-        ),
-        trailing: isAwaiting
-            ? Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.close, color: Colors.red),
-                    tooltip: 'Reject',
-                    onPressed: onReject,
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.check, color: Colors.green),
-                    tooltip: 'Accept',
-                    onPressed: onAccept,
-                  ),
-                  IconButton(
-                    icon: Icon(Icons.star, color: Colors.blue.shade600),
-                    tooltip: 'Always accept from this device',
-                    onPressed: onAcceptAlways,
-                  ),
-                ],
-              )
-            : null,
-      ),
-    );
-  }
-
-  String _formatSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
-}
-
-class _ActiveTransferTile extends StatelessWidget {
-  final String sessionId;
-  final TransferProgress progress;
-
-  const _ActiveTransferTile({
-    required this.sessionId,
-    required this.progress,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return ListTile(
-      leading: const Icon(Icons.swap_vert),
-      title: Text(progress.speedText),
-      subtitle: Text(
-        '${progress.sizeText} · ${progress.percent.toStringAsFixed(1)}%',
-      ),
-      trailing: const SizedBox(
-        width: 100,
-        child: LinearProgressIndicator(),
       ),
     );
   }

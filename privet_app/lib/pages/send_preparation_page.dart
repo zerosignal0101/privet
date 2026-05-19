@@ -1,0 +1,459 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:open_file/open_file.dart';
+
+import '../providers/providers.dart';
+import '../widgets/peer_picker_sheet.dart';
+
+/// Multi-file send preparation screen.
+/// Allows adding files incrementally, changing recipient, then sending.
+class SendPreparationPage extends ConsumerStatefulWidget {
+  /// Pre-filled peer info (for resend from history).
+  final String? initialPeerAddress;
+  final String? initialPeerName;
+  final String? initialPeerFingerprint;
+
+  /// Pre-filled file paths (for resend from history).
+  final List<String>? initialFilePaths;
+
+  const SendPreparationPage({
+    super.key,
+    this.initialPeerAddress,
+    this.initialPeerName,
+    this.initialPeerFingerprint,
+    this.initialFilePaths,
+  });
+
+  @override
+  ConsumerState<SendPreparationPage> createState() => _SendPreparationPageState();
+}
+
+class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
+  bool _initialised = false;
+
+  void _initFromParams() {
+    if (_initialised) return;
+    _initialised = true;
+    final state = ref.read(sendPreparationProvider);
+
+    if (widget.initialFilePaths != null && state.filePaths.isEmpty && widget.initialFilePaths!.isNotEmpty) {
+      final existing = widget.initialFilePaths!
+          .where((p) => File(p).existsSync())
+          .toList();
+      final missing = widget.initialFilePaths!.length - existing.length;
+      ref.read(sendPreparationProvider.notifier).addFiles(existing);
+      if (missing > 0) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('$missing file${missing > 1 ? "s were" : " was"} missing and removed')),
+            );
+          }
+        });
+      }
+    }
+    if (widget.initialPeerAddress != null && state.peerAddress == null) {
+      ref.read(sendPreparationProvider.notifier).setPeer(
+        widget.initialPeerAddress!,
+        name: widget.initialPeerName,
+        fingerprint: widget.initialPeerFingerprint,
+      );
+    }
+  }
+
+  Future<bool> _onWillPop() async {
+    final state = ref.read(sendPreparationProvider);
+    if (state.filePaths.isEmpty) return true;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Discard file selection?'),
+        content: const Text('You have selected files. Do you want to discard them?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Discard')),
+        ],
+      ),
+    );
+    return confirmed ?? false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(sendPreparationProvider);
+    _initFromParams();
+
+    // Resolve pending pairing to keep state fresh
+    final pairing = ref.watch(pairingProvider);
+    if (state.pairingRequest != null && pairing.isEmpty) {
+      ref.read(sendPreparationProvider.notifier).clearPairing();
+    }
+
+    final body = Column(
+      children: [
+        _RecipientSection(
+          peerName: state.peerName,
+          peerAddress: state.peerAddress,
+          onChangeTap: () => _pickPeer(context, ref),
+        ),
+        const Divider(height: 1),
+
+        // Pairing banner
+        if (state.pairingRequest != null)
+          _PairingCard(
+            request: state.pairingRequest!,
+            onTrust: () => ref.read(sendPreparationProvider.notifier).trustPeer(),
+            onTrustAndAccept: () =>
+                ref.read(sendPreparationProvider.notifier).trustAndAcceptPeer(),
+            onReject: () =>
+                ref.read(sendPreparationProvider.notifier).rejectPeer(),
+          ),
+
+        // Sending indicator
+        if (state.sending)
+          const Padding(
+            padding: EdgeInsets.all(12),
+            child: Row(
+              children: [
+                SizedBox(width: 16, height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 12),
+                Text('Starting transfer...',
+                    style: TextStyle(color: Colors.grey)),
+              ],
+            ),
+          ),
+
+        // Error message
+        if (state.sendError != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+            child: Text(state.sendError!,
+                style: const TextStyle(color: Colors.red, fontSize: 13)),
+          ),
+
+        Expanded(
+          child: state.filePaths.isEmpty
+              ? ListView(
+                  children: [
+                    const SizedBox(height: 60),
+                    Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.note_add, size: 48,
+                              color: Colors.grey.shade300),
+                          const SizedBox(height: 12),
+                          const Text('No files selected',
+                              style: TextStyle(color: Colors.grey)),
+                        ],
+                      ),
+                    ),
+                    _AddFileButton(onTap: () => _pickFiles(ref)),
+                  ],
+                )
+              : ListView.builder(
+                  itemCount: state.filePaths.length + 1,
+                  itemBuilder: (_, i) {
+                    if (i == state.filePaths.length) {
+                      return _AddFileButton(onTap: () => _pickFiles(ref));
+                    }
+                    return _FileItem(
+                      path: state.filePaths[i],
+                      onRemove: () =>
+                          ref.read(sendPreparationProvider.notifier).removeFile(i),
+                    );
+                  },
+                ),
+        ),
+        const Divider(height: 1),
+        _BottomBar(
+          fileCount: state.filePaths.length,
+          sending: state.sending,
+          onSend: state.isReady ? () => _send(context, ref) : null,
+        ),
+      ],
+    );
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        final shouldPop = await _onWillPop();
+        if (shouldPop && context.mounted) Navigator.pop(context);
+      },
+      child: Scaffold(
+        appBar: AppBar(title: const Text('Send Files')),
+        body: body,
+      ),
+    );
+  }
+
+  void _pickPeer(BuildContext context, WidgetRef ref) {
+    PeerPickerSheet.show(context, onSelected: (addr, {name, fingerprint}) {
+      ref.read(sendPreparationProvider.notifier).setPeer(addr, name: name, fingerprint: fingerprint);
+    });
+  }
+
+  void _pickFiles(WidgetRef ref) async {
+    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (result != null && result.files.isNotEmpty) {
+      final paths = result.files.map((f) => f.path!).toList();
+      final ids = <String, String?>{};
+      for (int i = 0; i < result.files.length; i++) {
+        final f = result.files[i];
+        if (f.path != null && f.identifier != null) {
+          ids[f.path!] = f.identifier;
+        }
+      }
+      ref.read(sendPreparationProvider.notifier).addFiles(
+        paths,
+        identifiers: ids.isNotEmpty ? ids : null,
+      );
+    }
+  }
+
+  Future<void> _send(BuildContext context, WidgetRef ref) async {
+    final sessionId = await ref.read(sendPreparationProvider.notifier).send();
+    if (sessionId != null && context.mounted) {
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Transfer started')),
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recipient section
+// ---------------------------------------------------------------------------
+
+class _RecipientSection extends StatelessWidget {
+  final String? peerName;
+  final String? peerAddress;
+  final VoidCallback onChangeTap;
+
+  const _RecipientSection({
+    this.peerName,
+    this.peerAddress,
+    required this.onChangeTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: const Icon(Icons.person),
+      title: Text(peerName ?? 'No recipient selected'),
+      subtitle: peerAddress != null ? Text(peerAddress!) : null,
+      trailing: TextButton(
+        onPressed: onChangeTap,
+        child: const Text('Change'),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File item
+// ---------------------------------------------------------------------------
+
+class _FileItem extends StatelessWidget {
+  final String path;
+  final VoidCallback onRemove;
+
+  const _FileItem({required this.path, required this.onRemove});
+
+  @override
+  Widget build(BuildContext context) {
+    final file = File(path);
+    final exists = file.existsSync();
+    final size = exists ? file.lengthSync() : 0;
+    final name = path.split(Platform.pathSeparator).last;
+
+    return ListTile(
+      leading: Icon(
+        exists ? Icons.insert_drive_file : Icons.error_outline,
+        color: exists ? null : Colors.red,
+      ),
+      title: Text(
+        name,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 14,
+          color: exists ? null : Colors.grey,
+        ),
+      ),
+      subtitle: Text(
+        exists ? _formatSize(size) : 'File not found',
+        style: TextStyle(
+          fontSize: 12,
+          color: exists ? Colors.grey : Colors.red.shade300,
+        ),
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (exists)
+            IconButton(
+              icon: const Icon(Icons.open_in_new, size: 18),
+              tooltip: 'Open file',
+              onPressed: () => OpenFile.open(path),
+            ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            onPressed: onRemove,
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Add file button
+// ---------------------------------------------------------------------------
+
+class _AddFileButton extends StatelessWidget {
+  final VoidCallback onTap;
+
+  const _AddFileButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: OutlinedButton.icon(
+        onPressed: onTap,
+        icon: const Icon(Icons.add, size: 18),
+        label: const Text('Add files'),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bottom bar with send button
+// ---------------------------------------------------------------------------
+
+class _BottomBar extends StatelessWidget {
+  final int fileCount;
+  final bool sending;
+  final VoidCallback? onSend;
+
+  const _BottomBar({
+    required this.fileCount,
+    this.sending = false,
+    required this.onSend,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomPad = MediaQuery.of(context).viewPadding.bottom + 8;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPad),
+      child: Row(
+        children: [
+          Text(
+            '$fileCount file${fileCount != 1 ? 's' : ''} selected',
+            style: const TextStyle(fontSize: 14),
+          ),
+          const Spacer(),
+          FilledButton.icon(
+            onPressed: sending ? null : onSend,
+            icon: sending
+                ? const SizedBox(
+                    width: 18, height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  )
+                : const Icon(Icons.send, size: 18),
+            label: Text(sending ? 'Sending...' : 'Send'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing card shown inside the preparation page
+// ---------------------------------------------------------------------------
+
+class _PairingCard extends StatelessWidget {
+  final PairRequest request;
+  final VoidCallback onTrust;
+  final VoidCallback onTrustAndAccept;
+  final VoidCallback onReject;
+
+  const _PairingCard({
+    required this.request,
+    required this.onTrust,
+    required this.onTrustAndAccept,
+    required this.onReject,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      color: Colors.orange.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.shield, size: 18, color: Colors.orange),
+                const SizedBox(width: 8),
+                Text('Pairing required',
+                    style: TextStyle(fontWeight: FontWeight.bold,
+                        color: Colors.orange.shade800)),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text('Trust this device to send files?',
+                style: const TextStyle(fontSize: 13)),
+            if (request.code.isNotEmpty)
+              Text('Verification code: ${request.code}',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                TextButton.icon(
+                  onPressed: onReject,
+                  icon: const Icon(Icons.close, size: 14),
+                  label: const Text('Reject', style: TextStyle(fontSize: 12)),
+                ),
+                OutlinedButton.icon(
+                  onPressed: onTrust,
+                  icon: const Icon(Icons.verified, size: 14),
+                  label: const Text('Trust', style: TextStyle(fontSize: 12)),
+                ),
+                FilledButton.icon(
+                  onPressed: onTrustAndAccept,
+                  icon: const Icon(Icons.star, size: 14),
+                  label: const Text('Trust & Accept',
+                      style: TextStyle(fontSize: 12)),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -17,7 +17,8 @@ use crate::security::identity::DeviceIdentity;
 use crate::security::tls;
 use crate::security::trust::TrustStore;
 use crate::session::{SessionId, SessionState, TransferProgress, TransferSession};
-use crate::storage::records::{TransferLog, TransferRecord};
+use crate::session::TransferDirection;
+use crate::storage::records::{TransferLog, TransferRecord, TransferFileRecord, TransferRecordState};
 use crate::transport::endpoint;
 
 /// Events emitted by the engine for the UI / CLI / FFI layer.
@@ -26,9 +27,9 @@ pub enum PrivetEvent {
     PeerDiscovered(PeerInfo),
     PeerLost(PeerId),
     PairRequest { peer: PeerInfo, code: String },
-    TransferProgress { session_id: SessionId, progress: TransferProgress },
-    TransferComplete { session_id: SessionId },
-    TransferFailed { session_id: SessionId, error: String },
+    TransferProgress { session_id: SessionId, progress: TransferProgress, direction: TransferDirection },
+    TransferComplete { session_id: SessionId, direction: TransferDirection },
+    TransferFailed { session_id: SessionId, error: String, direction: TransferDirection },
     IncomingTransfer { session_id: SessionId, peer: PeerInfo, files: crate::session::FileManifest },
     /// Emitted when an incoming transfer arrives from a trusted peer that is NOT
     /// in the auto-accept list. The UI/CLI should call `accept_transfer` or
@@ -225,6 +226,7 @@ impl PrivetEngine {
         let accept_store_tcp = accept_store.clone();
         let pending_incoming_tcp = pending_incoming.clone();
         let pending_pairing_tcp = pending_pairing.clone();
+        let transfer_log = self.transfer_log.clone();
 
         let listener = async move {
             loop {
@@ -240,6 +242,7 @@ impl PrivetEngine {
                                 let known_device_store = known_device_store.clone();
                                 let pending_incoming = pending_incoming.clone();
                                 let pending_pairing = pending_pairing.clone();
+                                let transfer_log = transfer_log.clone();
                                 tokio::spawn(async move {
                                     let receiver = crate::transfer::receiver::Receiver::new(
                                         conn,
@@ -254,8 +257,31 @@ impl PrivetEngine {
                                         pending_incoming,
                                         pending_pairing,
                                     );
-                                    if let Err(e) = receiver.receive(&event_tx).await {
-                                        tracing::warn!("receive finished: {e}");
+                                    match receiver.receive(&event_tx).await {
+                                        Ok((session_id, _fp, peer_name, file_records)) => {
+                                            if let Some(log) = &transfer_log {
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs()).ok();
+                                                let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
+                                                let _ = log.append(&crate::storage::records::TransferRecord {
+                                                    session_id,
+                                                    direction: crate::session::TransferDirection::Receiving,
+                                                    peer_fingerprint: _fp,
+                                                    peer_name,
+                                                    files: file_records,
+                                                    total_bytes,
+                                                    bytes_transferred: total_bytes,
+                                                    started_at: None,
+                                                    completed_at: now,
+                                                    state: crate::storage::records::TransferRecordState::Completed,
+                                                    error: None,
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("receive finished: {e}");
+                                        }
                                     }
                                 });
                             }
@@ -483,6 +509,39 @@ impl PrivetEngine {
     ) -> Result<SessionId> {
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
 
+        // Build file records early for both success and failure logging
+        let file_records: Vec<TransferFileRecord> = paths.iter().map(|p| {
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            TransferFileRecord {
+                path: p.to_string_lossy().to_string(),
+                size,
+                is_dir: std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false),
+            }
+        }).collect();
+        let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
+
+        // Helper to log a failed send
+        let log_fail = |log: Option<&TransferLog>, session_id: SessionId, error: &str| {
+            if let Some(l) = log {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).ok();
+                let _ = l.append(&TransferRecord {
+                    session_id,
+                    direction: TransferDirection::Sending,
+                    peer_fingerprint: String::new(),
+                    peer_name: String::new(),
+                    files: file_records.clone(),
+                    total_bytes,
+                    bytes_transferred: 0,
+                    started_at: None,
+                    completed_at: now,
+                    state: TransferRecordState::Failed,
+                    error: Some(error.to_owned()),
+                });
+            }
+        };
+
         // Try QUIC first
         let quic_result = self.try_send_quic(addr, &paths, &trusted, &self.config.security_mode).await;
 
@@ -501,9 +560,11 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TCP connect failed: {e}");
+                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id: SessionId::new(),
                                 error: msg.clone(),
+                                direction: TransferDirection::Sending,
                             });
                             return Err(PrivetError::Transport(e));
                         }
@@ -515,9 +576,11 @@ impl PrivetEngine {
                         Ok(c) => c,
                         Err(e) => {
                             let msg = format!("TLS client config error: {e}");
+                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id: SessionId::new(),
                                 error: msg.clone(),
+                                direction: TransferDirection::Sending,
                             });
                             return Err(PrivetError::Security(e));
                         }
@@ -527,9 +590,11 @@ impl PrivetEngine {
                         Ok(n) => n,
                         Err(_) => {
                             let msg: String = "invalid TLS server name".into();
+                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id: SessionId::new(),
                                 error: msg.clone(),
+                                direction: TransferDirection::Sending,
                             });
                             return Err(PrivetError::Security(
                                 crate::error::SecurityError::Tls(msg),
@@ -540,9 +605,11 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TLS handshake failed: {e}");
+                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id: SessionId::new(),
                                 error: msg.clone(),
+                                direction: TransferDirection::Sending,
                             });
                             return Err(PrivetError::Security(
                                 crate::error::SecurityError::Tls(msg),
@@ -567,34 +634,45 @@ impl PrivetEngine {
                             let tcp_session = tcp_result.0;
                             let tcp_fp = tcp_result.1;
                             let tcp_name = tcp_result.2;
-                            self.log_transfer(tcp_session, &tcp_fp, &paths, true)
-                                .await;
+                            self.log_transfer(
+                                tcp_session, TransferDirection::Sending, &tcp_fp, &tcp_name,
+                                file_records.clone(), total_bytes, total_bytes,
+                                TransferRecordState::Completed, None,
+                            ).await;
                             self.record_to_known_devices(&tcp_fp, &addr, &tcp_name).await;
                             self.emit_pairing_if_needed(&tcp_fp, &addr).await;
                             self.track_session(tcp_session).await;
                             return Ok(tcp_session);
                         }
                         Err(tcp_err) => {
+                            let err_msg = tcp_err.to_string();
+                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &err_msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id: SessionId::new(),
-                                error: tcp_err.to_string(),
+                                error: err_msg,
+                                direction: TransferDirection::Sending,
                             });
                             return Err(tcp_err);
                         }
                     }
                 }
 
+                let err_msg = quic_err.to_string();
+                log_fail(self.transfer_log.as_ref(), SessionId::new(), &err_msg);
                 let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                     session_id: SessionId::new(),
-                    error: quic_err.to_string(),
+                    error: err_msg,
+                    direction: TransferDirection::Sending,
                 });
                 return Err(quic_err);
             }
         };
 
         // Log
-        self.log_transfer(session_id, &peer_fingerprint, &paths, true)
-            .await;
+        self.log_transfer(
+            session_id, TransferDirection::Sending, &peer_fingerprint, &peer_device_name,
+            file_records, total_bytes, total_bytes, TransferRecordState::Completed, None,
+        ).await;
 
         // Auto-record to known device store
         self.record_to_known_devices(&peer_fingerprint, &addr, &peer_device_name).await;
@@ -641,23 +719,36 @@ impl PrivetEngine {
         sender.send(paths, &self.event_tx, trusted, security_mode).await
     }
 
-    /// Log a completed transfer to the JSONL transfer log.
+    /// Log a transfer to the JSONL transfer log.
     async fn log_transfer(
         &self,
         session_id: SessionId,
+        direction: TransferDirection,
         peer_fingerprint: &str,
-        paths: &[PathBuf],
-        completed: bool,
+        peer_name: &str,
+        files: Vec<TransferFileRecord>,
+        total_bytes: u64,
+        bytes_transferred: u64,
+        state: TransferRecordState,
+        error: Option<String>,
     ) {
         if let Some(log) = &self.transfer_log {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .ok();
             let _ = log.append(&TransferRecord {
                 session_id,
-                direction: crate::session::TransferDirection::Sending,
+                direction,
                 peer_fingerprint: peer_fingerprint.to_owned(),
-                files: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
-                total_bytes: 0,
-                bytes_transferred: 0,
-                completed,
+                peer_name: peer_name.to_owned(),
+                files,
+                total_bytes,
+                bytes_transferred,
+                started_at: None,
+                completed_at: now,
+                state,
+                error,
             });
         }
     }
@@ -978,6 +1069,54 @@ impl PrivetEngine {
     /// Get the config.
     pub fn config(&self) -> &PrivetConfig {
         &self.config
+    }
+
+    /// Get transfer history, sorted by completed_at descending, with limit/offset.
+    pub fn transfer_history(&self, limit: usize, offset: usize) -> Vec<TransferRecord> {
+        let log = match &self.transfer_log {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        match log.read_all_sorted() {
+            Ok(records) => records.into_iter().skip(offset).take(limit).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Get a single transfer record by session_id.
+    pub fn transfer_record(&self, session_id: &SessionId) -> Option<TransferRecord> {
+        let log = match &self.transfer_log {
+            Some(l) => l,
+            None => return None,
+        };
+        match log.read_all() {
+            Ok(records) => records.into_iter().find(|r| r.session_id == *session_id),
+            Err(_) => None,
+        }
+    }
+
+    /// Delete a transfer record by session_id (rewrites the log without it).
+    pub fn delete_transfer_record(&self, session_id: &SessionId) -> Result<()> {
+        let log = match &self.transfer_log {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let records: Vec<TransferRecord> = match log.read_all() {
+            Ok(r) => r.into_iter().filter(|r| r.session_id != *session_id).collect(),
+            Err(_) => return Ok(()),
+        };
+        // Rewrite the log file
+        let path = log.path().to_owned();
+        let temp_path = path.with_extension("jsonl.tmp");
+        let mut file = std::fs::File::create(&temp_path)?;
+        for record in &records {
+            if let Ok(json) = serde_json::to_string(record) {
+                use std::io::Write;
+                let _ = writeln!(file, "{json}");
+            }
+        }
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
     }
 }
 

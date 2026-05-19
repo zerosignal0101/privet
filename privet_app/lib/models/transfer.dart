@@ -1,3 +1,5 @@
+import 'transfer_history.dart';
+
 class SessionId {
   final String uuid;
   const SessionId(this.uuid);
@@ -55,6 +57,58 @@ enum TransferState {
   completed,
   failed,
   cancelled,
+}
+
+/// An active (in-progress, awaiting, or just-completed) transfer.
+class ActiveTransfer {
+  final String sessionId;
+  final TransferDirection direction;
+  final TransferProgress progress;
+  final String? peerName;
+  final String? peerFingerprint;
+  final List<FileEntry> files;
+  final TransferState state;
+
+  const ActiveTransfer({
+    required this.sessionId,
+    required this.direction,
+    required this.progress,
+    this.peerName,
+    this.peerFingerprint,
+    this.files = const [],
+    required this.state,
+  });
+
+  ActiveTransfer copyWith({
+    TransferProgress? progress,
+    TransferState? state,
+    String? peerName,
+    String? peerFingerprint,
+  }) =>
+      ActiveTransfer(
+        sessionId: sessionId,
+        direction: direction,
+        progress: progress ?? this.progress,
+        peerName: peerName ?? this.peerName,
+        peerFingerprint: peerFingerprint ?? this.peerFingerprint,
+        files: files,
+        state: state ?? this.state,
+      );
+
+  String get fileCountText {
+    if (files.isEmpty) return '';
+    final count = files.length;
+    return '$count file${count > 1 ? 's' : ''}';
+  }
+
+  bool get isCompleted => state == TransferState.completed;
+  bool get isFailed => state == TransferState.failed;
+  bool get isTransferring => state == TransferState.transferring;
+  bool get isAwaitingAccept => state == TransferState.waitingAcceptance;
+
+  String get directionIcon {
+    return direction == TransferDirection.sending ? '↑' : '↓';
+  }
 }
 
 class FileEntry {

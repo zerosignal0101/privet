@@ -47,6 +47,7 @@ pub fn emit_event(event: privet_core::PrivetEvent) {
         "speed_bps": ce.speed_bps,
         "bytes_transferred": ce.bytes_transferred,
         "total_bytes": ce.total_bytes,
+        "direction": ce.direction,
         "extra_json": if ce.extra_json.is_null() {
             None
         } else {

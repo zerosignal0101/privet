@@ -236,6 +236,35 @@ class PrivetFfiIsolate {
     final r = await _call('set_network_label', args);
     return r['ok'] == true;
   }
+
+  Future<List<Map<String, dynamic>>> getTransferHistory({
+    int limit = 100, int offset = 0,
+  }) async {
+    final r = await _call('get_transfer_history', {
+      'limit': limit, 'offset': offset,
+    });
+    if (r['ok'] == true && r['data'] != null) {
+      return (r['data'] as List).cast<Map<String, dynamic>>();
+    }
+    return [];
+  }
+
+  Future<Map<String, dynamic>?> getTransferRecord(String sessionId) async {
+    final r = await _call('get_transfer_record', {
+      'session_id': sessionId,
+    });
+    if (r['ok'] == true && r['data'] != null) {
+      return r['data'] as Map<String, dynamic>?;
+    }
+    return null;
+  }
+
+  Future<bool> deleteTransferRecord(String sessionId) async {
+    final r = await _call('delete_transfer_record', {
+      'session_id': sessionId,
+    });
+    return r['ok'] == true;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +335,7 @@ void _pollEvents(PrivetFfi ffi, _IsolateInit init) {
         'speed_bps': (data['speed_bps'] as num?)?.toDouble() ?? 0.0,
         'bytes_transferred': data['bytes_transferred'] as int? ?? 0,
         'total_bytes': data['total_bytes'] as int? ?? 0,
+        'direction': data['direction'] as int? ?? 255,
         'extra': extra,
       });
     } catch (_) {}
@@ -387,6 +417,15 @@ void _handleCommand(PrivetFfi ffi, _FfiCommand cmd) {
         break;
       case 'set_network_label':
         _cmdSetNetworkLabel(ffi, cmd);
+        break;
+      case 'get_transfer_history':
+        _cmdGetTransferHistory(ffi, cmd);
+        break;
+      case 'get_transfer_record':
+        _cmdGetTransferRecord(ffi, cmd);
+        break;
+      case 'delete_transfer_record':
+        _cmdDeleteTransferRecord(ffi, cmd);
         break;
       default:
         cmd.replyTo.send({'ok': false, 'error': 'unknown command: ${cmd.cmd}'});
@@ -611,5 +650,44 @@ void _cmdSetNetworkLabel(PrivetFfi ffi, _FfiCommand cmd) {
     cmd.replyTo.send({'ok': result == 0});
   } finally {
     calloc.free(argsJson);
+  }
+}
+
+void _cmdGetTransferHistory(PrivetFfi ffi, _FfiCommand cmd) {
+  final limit = cmd.args['limit'] as int? ?? 100;
+  final offset = cmd.args['offset'] as int? ?? 0;
+  final ptr = ffi.getTransferHistory(limit, offset);
+  final json = ffi.readAndFreeJson(ptr);
+  if (json != null) {
+    final data = jsonDecode(json);
+    cmd.replyTo.send({'ok': true, 'data': data});
+  } else {
+    cmd.replyTo.send({'ok': true, 'data': []});
+  }
+}
+
+void _cmdGetTransferRecord(PrivetFfi ffi, _FfiCommand cmd) {
+  final sessionId = (cmd.args['session_id'] as String).toNativeUtf8();
+  try {
+    final ptr = ffi.getTransferRecord(sessionId);
+    final json = ffi.readAndFreeJson(ptr);
+    if (json != null && json != 'null') {
+      final data = jsonDecode(json);
+      cmd.replyTo.send({'ok': true, 'data': data});
+    } else {
+      cmd.replyTo.send({'ok': true, 'data': null});
+    }
+  } finally {
+    calloc.free(sessionId);
+  }
+}
+
+void _cmdDeleteTransferRecord(PrivetFfi ffi, _FfiCommand cmd) {
+  final sessionId = (cmd.args['session_id'] as String).toNativeUtf8();
+  try {
+    final result = ffi.deleteTransferRecord(sessionId);
+    cmd.replyTo.send({'ok': result == 0});
+  } finally {
+    calloc.free(sessionId);
   }
 }

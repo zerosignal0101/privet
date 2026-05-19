@@ -275,10 +275,24 @@ class SettingsPage extends ConsumerWidget {
     WidgetRef ref,
     String fingerprint,
   ) async {
-    // Remove all network entries via Rust backend
-    // For now, we untrust and let the known_devices.json clean up
+    final name = ref.read(knownDevicesProvider)
+        .where((d) => d['fingerprint'] == fingerprint)
+        .map((d) => d['device_name'] as String? ?? 'this device')
+        .firstOrNull ?? 'this device';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove Known Device?'),
+        content: Text('Remove $name from known devices?\nIt will be re-discovered if still reachable.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
     final service = PrivetService.instance;
-    // Delete all network mappings
     final knownDevices = ref.read(knownDevicesProvider);
     for (final device in knownDevices) {
       if (device['fingerprint'] == fingerprint) {
@@ -383,8 +397,7 @@ class SettingsPage extends ConsumerWidget {
     );
     ref.read(engineRunningProvider.notifier).setRunning(ok);
     if (ok) {
-      ref.read(incomingTransferProvider.notifier).clear();
-      ref.read(transferProgressProvider.notifier).clear();
+      ref.read(activeTransfersProvider.notifier).clear();
     }
 
     if (context.mounted) {

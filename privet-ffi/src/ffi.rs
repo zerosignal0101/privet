@@ -582,6 +582,72 @@ pub extern "C" fn privet_get_identity() -> *mut c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
+/// Get transfer history as JSON array, sorted by completed_at descending.
+/// `limit` (0 = no limit), `offset` for pagination.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_transfer_history(limit: u32, offset: u32) -> *mut c_char {
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let records = engine.transfer_history(limit as usize, offset as usize);
+    let json = match serde_json::to_string(&records) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Get a single transfer record by session_id (hyphenated UUID string).
+/// Returns JSON object or null if not found.
+/// Caller must free the returned string with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_get_transfer_record(session_id_str: *const c_char) -> *mut c_char {
+    let sid = match parse_session_id(session_id_str) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+
+    let record = engine.transfer_record(&sid);
+    let json = match serde_json::to_string(&record) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Delete a transfer record by session_id (hyphenated UUID string).
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_delete_transfer_record(session_id_str: *const c_char) -> c_int {
+    let sid = match parse_session_id(session_id_str) {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    let guard = runtime::get_engine().lock().unwrap();
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    match engine.delete_transfer_record(&sid) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Known devices / network awareness
 // ---------------------------------------------------------------------------

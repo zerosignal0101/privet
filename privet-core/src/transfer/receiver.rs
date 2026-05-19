@@ -96,7 +96,7 @@ impl Receiver {
     pub async fn receive(
         &self,
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-    ) -> Result<(SessionId, String), PrivetError> {
+    ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>), PrivetError> {
         let (mut ctrl_send, mut ctrl_recv) = self.conn.accept_bi()
             .await.map_err(|e| TransportError::ConnectionLost(format!("accept-bi: {e}")))?;
 
@@ -111,6 +111,7 @@ impl Receiver {
             }.into()),
         };
         let peer_fingerprint = hello.fingerprint.clone();
+        let _peer_device_name = hello.device_name.clone();
 
         // 2. TLS fingerprint verification (MITM protection)
         // Verify the peer's TLS certificate fingerprint matches the Hello claim.
@@ -196,7 +197,7 @@ impl Receiver {
             // also handle the read error gracefully below.
             if self.conn.close_reason().is_some() {
                 tracing::info!("[receiver] pairing resolved but sender closed connection, returning Ok");
-                return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+                return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
             }
 
             // Try to read Offer — will fail if sender closed the connection.
@@ -209,14 +210,14 @@ impl Receiver {
                     // Sender sent a Reject (pairing needed) instead of Offer.
                     if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&data) {
                         tracing::info!("[receiver] sender rejected: {}", rej.reason);
-                        return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+                        return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
                     }
                     // Sender retried with Offer on this same connection
                     return self.handle_offer(data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await;
                 }
                 _ => {
                     tracing::info!("[receiver] pairing resolved but no Offer (connection dead or timeout), returning Ok");
-                    return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+                    return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
                 }
             }
         }
@@ -232,9 +233,10 @@ impl Receiver {
         // Sender may have sent a Reject instead (pairing needed on its side)
         if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&offer_data) {
             tracing::info!("[receiver] sender rejected: {}", rej.reason);
-            return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone()));
+            return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
         }
-        self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await
+        let (session_id, fp, device_name, file_records) = self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await?;
+        Ok((session_id, fp, device_name, file_records))
     }
 
     async fn handle_offer(
@@ -245,7 +247,8 @@ impl Receiver {
         mut ctrl_send: quinn::SendStream,
         mut ctrl_recv: quinn::RecvStream,
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-    ) -> Result<(SessionId, String), PrivetError> {
+    ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>), PrivetError> {
+        let peer_device_name = hello.device_name.clone();
         let offer = match handshake::deserialize(&offer_data)? {
             ControlMessage::Offer(o) => o,
             other => return Err(crate::error::ProtocolError::UnexpectedMessage {
@@ -360,14 +363,26 @@ impl Receiver {
         let total_size = offer.total_size;
         let tracker = std::sync::Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
         let mut files_received = 0usize;
+        let mut actual_dests: Vec<PathBuf> = Vec::new();
         while files_received < file_count {
             let mut data_stream = self.conn.accept_uni().await
                 .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
             let header_data = control::read_control_frame(&mut data_stream).await?;
             let stream_header: StreamHeader = data::deserialize_stream_header(&header_data)?;
             files_received += stream_header.files.len();
-            receive_stream_files(&mut data_stream, &stream_header, &self.download_dir, &tracker, event_tx, session_id, total_size).await?;
+            let dests = receive_stream_files(&mut data_stream, &stream_header, &self.download_dir, &tracker, event_tx, session_id, total_size).await?;
+            actual_dests.extend(dests);
         }
+
+        // Build file_records from the actual paths (handles duplicate filenames)
+        let actual_file_records: Vec<crate::storage::records::TransferFileRecord> = actual_dests.iter().map(|p| {
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            crate::storage::records::TransferFileRecord {
+                path: p.to_string_lossy().to_string(), // absolute path, independent of download dir setting
+                size,
+                is_dir: false,
+            }
+        }).collect();
 
         // Complete → Verified
         let complete_data = control::read_control_frame(&mut ctrl_recv).await?;
@@ -378,9 +393,9 @@ impl Receiver {
 
         let mut buf = [0u8; 1];
         let _ = ctrl_recv.read(&mut buf).await;
-        let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });
+        let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Receiving });
         tracing::info!("[receiver] transfer complete for session {session_id}");
-        Ok((session_id, peer_fingerprint.to_owned()))
+        Ok((session_id, peer_fingerprint.to_owned(), peer_device_name.clone(), actual_file_records))
     }
 }
 
@@ -389,7 +404,8 @@ async fn receive_stream_files(
     download_dir: &PathBuf, tracker: &std::sync::Arc<std::sync::Mutex<ProgressTracker>>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     session_id: SessionId, total_size: u64,
-) -> Result<(), PrivetError> {
+) -> Result<Vec<PathBuf>, PrivetError> {
+    let mut actual_dests = Vec::new();
     for file_entry in &stream_header.files {
         // Use atomic create_new (O_CREAT|O_EXCL) to avoid FUSE caching races
         let dest;
@@ -401,6 +417,7 @@ async fn receive_stream_files(
             file = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(file_entry.start_offset)).await?;
+            actual_dests.push(dest.clone());
         } else {
             // New file: atomically create with unique name
             let base = download_dir.join(&file_entry.relative_path);
@@ -408,6 +425,7 @@ async fn receive_stream_files(
                 .map_err(PrivetError::Io)?;
             dest = pair.0;
             file = pair.1;
+            actual_dests.push(dest.clone());
         }
         let expected_bytes = file_entry.total_size.saturating_sub(file_entry.start_offset);
         let mut written: u64 = 0;
@@ -422,11 +440,12 @@ async fn receive_stream_files(
             let (tx, sp) = { let mut t = tracker.lock().unwrap(); t.record(chunk.length as u64); (t.bytes_transferred(), t.speed_bps()) };
             let _ = event_tx.send(crate::engine::PrivetEvent::TransferProgress {
                 session_id, progress: crate::session::TransferProgress { total_bytes: total_size, bytes_transferred: tx, current_speed_bps: sp, per_file: vec![] },
+                direction: crate::session::TransferDirection::Receiving,
             });
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
     }
-    Ok(())
+    Ok(actual_dests)
 }
 
 pub(crate) fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> { Ok(u64::MAX) }

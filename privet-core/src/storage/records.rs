@@ -5,19 +5,39 @@ use serde::{Deserialize, Serialize};
 use crate::session::{SessionId, TransferDirection};
 
 /// Append-only transfer record log (JSONL format).
+#[derive(Clone)]
 pub struct TransferLog {
     path: std::path::PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFileRecord {
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TransferRecordState {
+    Completed,
+    Failed,
+    Cancelled,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferRecord {
     pub session_id: SessionId,
     pub direction: TransferDirection,
     pub peer_fingerprint: String,
-    pub files: Vec<String>,
+    pub peer_name: String,
+    pub files: Vec<TransferFileRecord>,
     pub total_bytes: u64,
     pub bytes_transferred: u64,
-    pub completed: bool,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub state: TransferRecordState,
+    pub error: Option<String>,
 }
 
 impl TransferLog {
@@ -44,10 +64,25 @@ impl TransferLog {
 
     pub fn read_all(&self) -> std::io::Result<Vec<TransferRecord>> {
         let content = std::fs::read_to_string(&self.path)?;
-        content
+        Ok(content
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|line| serde_json::from_str(line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
-            .collect()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Read all records sorted by completed_at descending (most recent first).
+    pub fn read_all_sorted(&self) -> std::io::Result<Vec<TransferRecord>> {
+        let mut records = self.read_all()?;
+        records.sort_by(|a, b| {
+            let a_time = a.completed_at.unwrap_or(0);
+            let b_time = b.completed_at.unwrap_or(0);
+            b_time.cmp(&a_time)
+        });
+        Ok(records)
     }
 }

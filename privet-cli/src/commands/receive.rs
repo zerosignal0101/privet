@@ -116,7 +116,7 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
                 println!("  Session: {session_id}");
                 println!("  Files: {} ({})", files.files.len(), super::format_size(files.total_size));
             }
-            Some(privet_core::PrivetEvent::TransferProgress { session_id: _, progress }) => {
+            Some(privet_core::PrivetEvent::TransferProgress { session_id: _, progress, .. }) => {
                 print!(
                     "\r  [{:.1}%] {:.1} MB/s  {:.1}/{:.1} MB",
                     progress.percent(),
@@ -127,11 +127,11 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
-            Some(privet_core::PrivetEvent::TransferComplete { session_id }) => {
-                println!("\n  Transfer complete: {session_id}");
+            Some(privet_core::PrivetEvent::TransferComplete { .. }) => {
+                println!("\n  Transfer complete");
             }
-            Some(privet_core::PrivetEvent::TransferFailed { session_id, error }) => {
-                println!("\n  Transfer failed: {session_id}: {error}");
+            Some(privet_core::PrivetEvent::TransferFailed { error, .. }) => {
+                println!("\n  Transfer failed: {error}");
             }
             Some(event) => {
                 tracing::debug!("Event: {event:?}");

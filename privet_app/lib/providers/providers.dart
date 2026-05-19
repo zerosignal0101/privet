@@ -6,8 +6,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/peer.dart';
 import '../models/transfer.dart';
+import '../models/transfer_history.dart';
 import '../models/device_identity.dart';
 import '../services/privet/privet_service.dart';
+import '../services/privet/file_identifier_store.dart';
 
 // ---------------------------------------------------------------------------
 // Service provider
@@ -43,11 +45,15 @@ class PeerListNotifier extends Notifier<List<PeerInfo>> {
     final service = ref.read(privetServiceProvider);
     _sub = service.events.listen(_onEvent);
     ref.onDispose(() => _sub?.cancel());
-    _loadPeers();
+    ref.listen(engineRunningProvider, (prev, next) {
+      if (next == true && prev == false) _loadPeers();
+    });
+    Future.microtask(() => _loadPeers());
     return [];
   }
 
   Future<void> _loadPeers() async {
+    if (!ref.read(engineRunningProvider)) return;
     final service = ref.read(privetServiceProvider);
     final peers = await service.getPeers();
     state = peers;
@@ -75,18 +81,22 @@ final peerListProvider =
     NotifierProvider<PeerListNotifier, List<PeerInfo>>(PeerListNotifier.new);
 
 // ---------------------------------------------------------------------------
-// Transfer progress: map of session_id → progress
+// Active transfers: map of session_id → ActiveTransfer
+// Merges the old TransferProgressNotifier + IncomingTransferNotifier.
 // ---------------------------------------------------------------------------
 
-class TransferProgressNotifier
-    extends Notifier<Map<String, TransferProgress>> {
+class ActiveTransfersNotifier extends Notifier<Map<String, ActiveTransfer>> {
   StreamSubscription<PrivetEvent>? _sub;
+  final Map<String, Timer> _timers = {};
 
   @override
-  Map<String, TransferProgress> build() {
+  Map<String, ActiveTransfer> build() {
     final service = ref.read(privetServiceProvider);
     _sub = service.events.listen(_onEvent);
-    ref.onDispose(() => _sub?.cancel());
+    ref.onDispose(() {
+      _sub?.cancel();
+      for (final t in _timers.values) t.cancel();
+    });
     return {};
   }
 
@@ -94,33 +104,157 @@ class TransferProgressNotifier
     if (event.type == PrivetEventType.transferProgress &&
         event.sessionId != null &&
         event.progress != null) {
+      final sid = event.sessionId!;
+      final existing = state[sid];
+      final direction = event.direction == 0
+          ? TransferDirection.sending
+          : TransferDirection.receiving;
       state = {
         ...state,
-        event.sessionId!: event.progress!,
+        sid: ActiveTransfer(
+          sessionId: sid,
+          direction: existing?.direction ?? direction,
+          progress: event.progress!,
+          peerName: existing?.peerName,
+          peerFingerprint: existing?.peerFingerprint,
+          files: existing?.files ?? [],
+          state: TransferState.transferring,
+        ),
       };
     } else if (event.type == PrivetEventType.transferComplete &&
         event.sessionId != null) {
-      state = {
-        ...state,
-        event.sessionId!: const TransferProgress(
-          totalBytes: 1,
-          bytesTransferred: 1,
-          currentSpeedBps: 0,
-          percent: 100,
-        ),
-      };
+      final sid = event.sessionId!;
+      final existing = state[sid];
+      if (existing != null) {
+        state = {
+          ...state,
+          sid: existing.copyWith(
+            state: TransferState.completed,
+            progress: const TransferProgress(
+              totalBytes: 1, bytesTransferred: 1,
+              currentSpeedBps: 0, percent: 100,
+            ),
+          ),
+        };
+        _startRemoveTimer(sid);
+      }
     } else if (event.type == PrivetEventType.transferFailed &&
         event.sessionId != null) {
-      state = Map.from(state)..remove(event.sessionId);
+      final sid = event.sessionId!;
+      final existing = state[sid];
+      if (existing != null) {
+        state = {
+          ...state,
+          sid: existing.copyWith(state: TransferState.failed),
+        };
+        _startRemoveTimer(sid);
+      }
+    } else if ((event.type == PrivetEventType.incomingTransfer ||
+            event.type == PrivetEventType.awaitingAccept) &&
+        event.sessionId != null) {
+      final sid = event.sessionId!;
+      final isAwaiting = event.type == PrivetEventType.awaitingAccept;
+      final peerName = event.peer?.name;
+      final peerFp = event.peer?.fingerprint;
+      state = {
+        ...state,
+        sid: ActiveTransfer(
+          sessionId: sid,
+          direction: TransferDirection.receiving,
+          progress: const TransferProgress(
+            totalBytes: 0, bytesTransferred: 0,
+            currentSpeedBps: 0, percent: 0,
+          ),
+          peerName: peerName,
+          peerFingerprint: peerFp,
+          files: event.files ?? [],
+          state: isAwaiting
+              ? TransferState.waitingAcceptance
+              : TransferState.transferring,
+        ),
+      };
     }
   }
 
-  /// Clear all progress — called on engine restart.
-  void clear() => state = {};
+  void _startRemoveTimer(String sessionId) {
+    _timers[sessionId]?.cancel();
+    _timers[sessionId] = Timer(const Duration(seconds: 5), () {
+      final map = Map<String, ActiveTransfer>.from(state);
+      map.remove(sessionId);
+      state = map;
+      _timers.remove(sessionId);
+    });
+  }
+
+  /// Register a send session (called when sendFilesToAddr returns a sessionId
+  /// before the first TransferProgress event arrives).
+  /// Does nothing if the session is already tracked (events arrived first).
+  void registerSendSession(
+    String sessionId, {
+    String? peerName,
+    String? peerFingerprint,
+    List<FileEntry> files = const [],
+  }) {
+    if (state.containsKey(sessionId)) return;
+    state = {
+      ...state,
+      sessionId: ActiveTransfer(
+        sessionId: sessionId,
+        direction: TransferDirection.sending,
+        progress: const TransferProgress(
+          totalBytes: 0, bytesTransferred: 0,
+          currentSpeedBps: 0, percent: 0,
+        ),
+        peerName: peerName,
+        peerFingerprint: peerFingerprint,
+        files: files,
+        state: TransferState.negotiating,
+      ),
+    };
+  }
+
+  Future<bool> acceptTransfer(String sessionId) async {
+    final ok = await ref.read(privetServiceProvider).acceptTransfer(sessionId);
+    if (ok) {
+      final existing = state[sessionId];
+      if (existing != null) {
+        state = {
+          ...state,
+          sessionId: existing.copyWith(state: TransferState.transferring),
+        };
+      }
+    }
+    return ok;
+  }
+
+  Future<bool> rejectTransfer(String sessionId) async {
+    final ok = await ref.read(privetServiceProvider).rejectTransfer(sessionId);
+    state = Map.from(state)..remove(sessionId);
+    return ok;
+  }
+
+  /// Clear all — called on engine restart.
+  void clear() {
+    for (final t in _timers.values) t.cancel();
+    _timers.clear();
+    state = {};
+  }
 }
 
-final transferProgressProvider = NotifierProvider<TransferProgressNotifier,
-    Map<String, TransferProgress>>(TransferProgressNotifier.new);
+final activeTransfersProvider = NotifierProvider<ActiveTransfersNotifier,
+    Map<String, ActiveTransfer>>(ActiveTransfersNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Legacy aliases — for backward compatibility during migration
+// ---------------------------------------------------------------------------
+
+final transferProgressProvider =
+    Provider<Map<String, TransferProgress>>((ref) {
+  final active = ref.watch(activeTransfersProvider);
+  return Map.fromEntries(
+    active.entries.map((e) => MapEntry(e.key, e.value.progress)),
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Pairing requests: list of pending pair requests
@@ -163,8 +297,6 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
       await _resolutionCompleter!.future;
       return;
     }
-    // No pending request yet — the PairRequest event may not have been
-    // processed by the event loop. Poll for up to 5 seconds.
     for (var i = 0; i < 50; i++) {
       await Future.delayed(const Duration(milliseconds: 100));
       if (_resolutionCompleter != null) {
@@ -223,89 +355,60 @@ final pairingProvider =
     NotifierProvider<PairingNotifier, List<PairRequest>>(PairingNotifier.new);
 
 // ---------------------------------------------------------------------------
-// Incoming transfers: list of pending incoming transfer requests
+// IncomingTransfer (kept for backward compat, reads from ActiveTransfersNotifier)
 // ---------------------------------------------------------------------------
 
 class IncomingTransfer {
   final String sessionId;
   final PeerInfo? peer;
   final List<FileEntry> files;
-  final bool isAwaitingAccept; // true for AwaitingAccept events, false for informational IncomingTransfer
-  const IncomingTransfer(this.sessionId, this.peer, this.files, {this.isAwaitingAccept = false});
+  final bool isAwaitingAccept;
+  const IncomingTransfer(this.sessionId, this.peer, this.files,
+      {this.isAwaitingAccept = false});
 }
 
-class IncomingTransferNotifier extends Notifier<List<IncomingTransfer>> {
-  StreamSubscription<PrivetEvent>? _sub;
-
-  @override
-  List<IncomingTransfer> build() {
-    final service = ref.read(privetServiceProvider);
-    _sub = service.events.listen(_onEvent);
-    ref.onDispose(() => _sub?.cancel());
-    return [];
-  }
-
-  void _onEvent(PrivetEvent event) {
-    if ((event.type == PrivetEventType.incomingTransfer ||
-            event.type == PrivetEventType.awaitingAccept) &&
-        event.sessionId != null) {
-      final isAwaiting = event.type == PrivetEventType.awaitingAccept;
-      debugPrint('[IncomingTransferNotifier] _onEvent: ${event.type} sessionId=${event.sessionId} isAwaitingAccept=$isAwaiting');
-      state = [
-        ...state.where((t) => t.sessionId != event.sessionId),
-        IncomingTransfer(event.sessionId!, event.peer, event.files ?? [], isAwaitingAccept: isAwaiting),
-      ];
-      debugPrint('[IncomingTransferNotifier] state count=${state.length}');
-    } else if ((event.type == PrivetEventType.transferComplete ||
-            event.type == PrivetEventType.transferFailed) &&
-        event.sessionId != null) {
-      debugPrint('[IncomingTransferNotifier] removal event: ${event.type} sessionId=${event.sessionId}');
-      state = state.where((t) => t.sessionId != event.sessionId).toList();
-    }
-  }
-
-  Future<bool> accept(String sessionId) async {
-    debugPrint('[IncomingTransferNotifier] accept called: sessionId=$sessionId');
-    final service = ref.read(privetServiceProvider);
-    final ok = await service.acceptTransfer(sessionId);
-    debugPrint('[IncomingTransferNotifier] accept result: ok=$ok');
-    if (ok) {
-      state = state.where((t) => t.sessionId != sessionId).toList();
-      debugPrint('[IncomingTransferNotifier] accept: state count=${state.length}');
-    }
-    return ok;
-  }
-
-  Future<bool> reject(String sessionId) async {
-    debugPrint('[IncomingTransferNotifier] reject called: sessionId=$sessionId');
-    final service = ref.read(privetServiceProvider);
-    final ok = await service.rejectTransfer(sessionId);
-    debugPrint('[IncomingTransferNotifier] reject result: ok=$ok');
-    if (ok) {
-      state = state.where((t) => t.sessionId != sessionId).toList();
-    }
-    return ok;
-  }
-
-  /// Clear all pending incoming transfers — called on engine restart.
-  void clear() => state = [];
-}
-
-final incomingTransferProvider = NotifierProvider<IncomingTransferNotifier,
-    List<IncomingTransfer>>(IncomingTransferNotifier.new);
+final incomingTransferProvider =
+    Provider<List<IncomingTransfer>>((ref) {
+  final active = ref.watch(activeTransfersProvider);
+  return active.values
+      .where((t) =>
+          t.direction == TransferDirection.receiving &&
+          (t.state == TransferState.waitingAcceptance ||
+           t.state == TransferState.negotiating ||
+           t.state == TransferState.transferring))
+      .map((t) => IncomingTransfer(
+            t.sessionId,
+            t.peerFingerprint != null
+                ? PeerInfo(
+                    id: PeerId(''),
+                    name: t.peerName ?? '',
+                    addresses: [],
+                    fingerprint: t.peerFingerprint ?? '',
+                    isTrusted: false,
+                  )
+                : null,
+            t.files,
+            isAwaitingAccept: t.isAwaitingAccept,
+          ))
+      .toList();
+});
 
 // ---------------------------------------------------------------------------
-// Trusted peers list (for settings management)
+// Trusted peers list
 // ---------------------------------------------------------------------------
 
 class TrustedListNotifier extends Notifier<List<String>> {
   @override
   List<String> build() {
-    _load();
+    ref.listen(engineRunningProvider, (prev, next) {
+      if (next == true && prev == false) refresh();
+    });
+    Future.microtask(() => _load());
     return [];
   }
 
   Future<void> _load() async {
+    if (!ref.read(engineRunningProvider)) return;
     final service = ref.read(privetServiceProvider);
     state = await service.getTrustedFingerprints();
   }
@@ -327,17 +430,21 @@ final trustedListProvider =
     NotifierProvider<TrustedListNotifier, List<String>>(TrustedListNotifier.new);
 
 // ---------------------------------------------------------------------------
-// Accepted (auto-accept) peers list (for settings management)
+// Accepted (auto-accept) peers list
 // ---------------------------------------------------------------------------
 
 class AcceptedListNotifier extends Notifier<List<String>> {
   @override
   List<String> build() {
-    _load();
+    ref.listen(engineRunningProvider, (prev, next) {
+      if (next == true && prev == false) refresh();
+    });
+    Future.microtask(() => _load());
     return [];
   }
 
   Future<void> _load() async {
+    if (!ref.read(engineRunningProvider)) return;
     final service = ref.read(privetServiceProvider);
     state = await service.getAcceptedFingerprints();
   }
@@ -374,7 +481,7 @@ final identityProvider = FutureProvider<DeviceIdentity?>((ref) async {
 class Settings {
   final String deviceName;
   final String downloadDir;
-  final String securityMode; // 'allow_all', 'trust_required', 'strict'
+  final String securityMode;
   final bool enableTcpFallback;
 
   const Settings({
@@ -448,7 +555,7 @@ final settingsProvider =
     NotifierProvider<SettingsNotifier, Settings>(SettingsNotifier.new);
 
 // ---------------------------------------------------------------------------
-// Known devices (from Rust known_device_store)
+// Known devices
 // ---------------------------------------------------------------------------
 
 class KnownDevicesNotifier extends Notifier<List<Map<String, dynamic>>> {
@@ -458,8 +565,6 @@ class KnownDevicesNotifier extends Notifier<List<Map<String, dynamic>>> {
   List<Map<String, dynamic>> build() {
     final service = ref.read(privetServiceProvider);
     _sub = service.events.listen((event) {
-      // Refresh on events that may add/update known devices:
-      // peer discovered, known device probed, transfer complete
       if (event.type == PrivetEventType.peerDiscovered ||
           event.type == PrivetEventType.knownDeviceProbed ||
           event.type == PrivetEventType.transferComplete) {
@@ -467,7 +572,10 @@ class KnownDevicesNotifier extends Notifier<List<Map<String, dynamic>>> {
       }
     });
     ref.onDispose(() => _sub?.cancel());
-    refresh();
+    ref.listen(engineRunningProvider, (prev, next) {
+      if (next == true && prev == false) refresh();
+    });
+    Future.microtask(() => refresh());
     return [];
   }
 
@@ -484,17 +592,24 @@ final knownDevicesProvider = NotifierProvider<KnownDevicesNotifier,
     List<Map<String, dynamic>>>(KnownDevicesNotifier.new);
 
 // ---------------------------------------------------------------------------
-// Current networks (from Rust network detection)
+// Current networks
 // ---------------------------------------------------------------------------
 
 class CurrentNetworksNotifier extends Notifier<List<Map<String, dynamic>>> {
   @override
   List<Map<String, dynamic>> build() {
+    // Reload when engine becomes running
+    ref.listen(engineRunningProvider, (prev, next) {
+      if (next == true && prev == false) refresh();
+    });
+    // Also try immediately — engine may already be running
     _load();
     return [];
   }
 
   Future<void> _load() async {
+    // Don't bother if engine isn't running
+    if (!ref.read(engineRunningProvider)) return;
     final service = ref.read(privetServiceProvider);
     state = await service.getCurrentNetworks();
   }
@@ -508,7 +623,7 @@ final currentNetworksProvider = NotifierProvider<CurrentNetworksNotifier,
     List<Map<String, dynamic>>>(CurrentNetworksNotifier.new);
 
 // ---------------------------------------------------------------------------
-// Probed known devices (on-demand scan results)
+// Probed known devices (on-demand scan)
 // ---------------------------------------------------------------------------
 
 class ProbedDevicesNotifier extends Notifier<List<PeerInfo>> {
@@ -524,3 +639,290 @@ class ProbedDevicesNotifier extends Notifier<List<PeerInfo>> {
 
 final probedDevicesProvider = NotifierProvider<ProbedDevicesNotifier,
     List<PeerInfo>>(ProbedDevicesNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Transfer history
+// ---------------------------------------------------------------------------
+
+class TransferHistoryNotifier extends Notifier<List<TransferHistoryRecord>> {
+  StreamSubscription<PrivetEvent>? _sub;
+
+  @override
+  List<TransferHistoryRecord> build() {
+    // Auto-refresh when a transfer completes or fails
+    final service = ref.read(privetServiceProvider);
+    _sub = service.events.listen((event) {
+      if (event.type == PrivetEventType.transferComplete ||
+          event.type == PrivetEventType.transferFailed) {
+        refresh();
+      }
+    });
+    ref.onDispose(() => _sub?.cancel());
+    // Reload when engine becomes running
+    ref.listen(engineRunningProvider, (prev, next) {
+      if (next == true && prev == false) refresh();
+    });
+    // Initial load
+    Future.microtask(() => refresh());
+    return [];
+  }
+
+  Future<void> load({int limit = 100, int offset = 0}) async {
+    final service = ref.read(privetServiceProvider);
+    final raw = await service.getTransferHistory(limit: limit, offset: offset);
+    final records = raw.map((j) => TransferHistoryRecord.fromJson(j)).toList();
+
+    // Merge Dart-side file identifiers (Android content:// URIs) for send records
+    for (int i = 0; i < records.length; i++) {
+      final rec = records[i];
+      if (rec.direction == TransferDirection.sending) {
+        final ids = await FileIdentifierStore.instance
+            .getSessionIdentifiers(rec.sessionId);
+        if (ids.isNotEmpty) {
+          final updatedFiles = rec.files.map((f) {
+            final id = ids[f.path];
+            if (id != null) {
+              return TransferFileRecord(
+                path: f.path, identifier: id,
+                size: f.size, isDir: f.isDir,
+              );
+            }
+            return f;
+          }).toList();
+          records[i] = TransferHistoryRecord(
+            sessionId: rec.sessionId,
+            direction: rec.direction,
+            peerFingerprint: rec.peerFingerprint,
+            peerName: rec.peerName,
+            files: updatedFiles,
+            totalBytes: rec.totalBytes,
+            bytesTransferred: rec.bytesTransferred,
+            startedAt: rec.startedAt,
+            completedAt: rec.completedAt,
+            state: rec.state,
+            error: rec.error,
+          );
+        }
+      }
+    }
+    state = records;
+  }
+
+  Future<void> refresh() => load();
+
+  Future<TransferHistoryRecord?> getRecord(String sessionId) async {
+    final service = ref.read(privetServiceProvider);
+    final raw = await service.getTransferRecord(sessionId);
+    if (raw != null) return TransferHistoryRecord.fromJson(raw);
+    return null;
+  }
+
+  Future<bool> deleteRecord(String sessionId) async {
+    final service = ref.read(privetServiceProvider);
+    final ok = await service.deleteTransferRecord(sessionId);
+    if (ok) {
+      state = state.where((r) => r.sessionId != sessionId).toList();
+    }
+    return ok;
+  }
+}
+
+final transferHistoryProvider = NotifierProvider<TransferHistoryNotifier,
+    List<TransferHistoryRecord>>(TransferHistoryNotifier.new);
+
+// ---------------------------------------------------------------------------
+// Send preparation state
+// ---------------------------------------------------------------------------
+
+class SendPreparationState {
+  final List<String> filePaths;
+  /// Path → identifier (Android content:// URI) for files picked via file_picker.
+  final Map<String, String?> fileIdentifiers;
+  final String? peerName;
+  final String? peerAddress;
+  final String? peerFingerprint;
+  final PairRequest? pairingRequest;
+  final String? sendError;
+  final bool sending;
+
+  const SendPreparationState({
+    this.filePaths = const [],
+    this.fileIdentifiers = const {},
+    this.peerName,
+    this.peerAddress,
+    this.peerFingerprint,
+    this.pairingRequest,
+    this.sendError,
+    this.sending = false,
+  });
+
+  SendPreparationState copyWith({
+    List<String>? filePaths,
+    Map<String, String?>? fileIdentifiers,
+    String? peerName,
+    String? peerAddress,
+    String? peerFingerprint,
+    bool? clearPeer,
+    PairRequest? pairingRequest,
+    bool? clearPairing,
+    String? sendError,
+    bool? sending,
+  }) =>
+      SendPreparationState(
+        filePaths: filePaths ?? this.filePaths,
+        fileIdentifiers: fileIdentifiers ?? this.fileIdentifiers,
+        peerName: clearPeer == true ? null : (peerName ?? this.peerName),
+        peerAddress: clearPeer == true ? null : (peerAddress ?? this.peerAddress),
+        peerFingerprint: clearPeer == true ? null : (peerFingerprint ?? this.peerFingerprint),
+        pairingRequest: clearPairing == true ? null : (pairingRequest ?? this.pairingRequest),
+        sendError: sendError == '' ? null : (sendError ?? this.sendError),
+        sending: sending ?? this.sending,
+      );
+
+  bool get isReady => filePaths.isNotEmpty && (peerAddress != null) && !sending;
+}
+
+class SendPreparationNotifier extends Notifier<SendPreparationState> {
+  @override
+  SendPreparationState build() => const SendPreparationState();
+
+  void addFiles(List<String> paths, {Map<String, String?>? identifiers}) {
+    state = state.copyWith(
+      filePaths: [...state.filePaths, ...paths],
+      fileIdentifiers: identifiers != null
+          ? {...state.fileIdentifiers, ...identifiers}
+          : state.fileIdentifiers,
+      sendError: '',
+    );
+  }
+
+  void removeFile(int index) {
+    final paths = [...state.filePaths]..removeAt(index);
+    final removedPath = state.filePaths[index];
+    final ids = Map<String, String?>.from(state.fileIdentifiers)..remove(removedPath);
+    state = state.copyWith(filePaths: paths, fileIdentifiers: ids, sendError: '');
+  }
+
+  void clearFiles() {
+    state = state.copyWith(filePaths: [], fileIdentifiers: {}, sendError: '');
+  }
+
+  void setPeer(String address, {String? name, String? fingerprint}) {
+    state = state.copyWith(
+      peerAddress: address,
+      peerName: name,
+      peerFingerprint: fingerprint,
+      sendError: '',
+      clearPairing: true,
+    );
+  }
+
+  void clearPeer() {
+    state = state.copyWith(clearPeer: true, sendError: '', clearPairing: true);
+  }
+
+  void clearPairing() {
+    state = state.copyWith(clearPairing: true);
+  }
+
+  /// Try to send, handling pairing if the peer is not trusted.
+  /// Returns session_id on success, null on unrecoverable failure.
+  Future<String?> send() async {
+    if (!state.isReady) return null;
+    state = state.copyWith(sending: true, sendError: '', clearPairing: true);
+
+    final service = ref.read(privetServiceProvider);
+
+    // First attempt
+    var sessionId = await service.sendFilesToAddr(
+      state.peerAddress!,
+      state.filePaths,
+    );
+
+    // If failed, handle pairing flow — poll for the PairRequest event
+    // (which may arrive asynchronously via the 50ms event poll loop)
+    if (sessionId == null) {
+      state = state.copyWith(
+        sendError: 'Pairing required',
+      );
+
+      // Poll for the PairRequest to arrive
+      PairRequest? pr;
+      for (int i = 0; i < 50; i++) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        final p = ref.read(pairingProvider);
+        if (p.isNotEmpty) {
+          pr = p.last;
+          state = state.copyWith(pairingRequest: pr);
+          break;
+        }
+      }
+
+      if (pr == null) {
+        state = state.copyWith(
+          sending: false,
+          sendError: 'No pairing response from peer',
+        );
+        return null;
+      }
+
+      // Wait for user to accept/reject pairing (Trust button on the card)
+      await ref.read(pairingProvider.notifier).waitForResolution;
+
+      // Retry after pairing
+      sessionId = await service.sendFilesToAddr(
+        state.peerAddress!,
+        state.filePaths,
+      );
+    }
+
+    if (sessionId != null) {
+      ref.read(activeTransfersProvider.notifier).registerSendSession(
+        sessionId,
+        peerName: state.peerName,
+        peerFingerprint: state.peerFingerprint,
+      );
+      // Persist file identifiers for history
+      if (state.fileIdentifiers.isNotEmpty) {
+        FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
+      }
+      state = state.copyWith(sending: false, clearPairing: true);
+    } else {
+      state = state.copyWith(
+        sending: false,
+        sendError: 'Failed to start transfer after pairing',
+      );
+    }
+    return sessionId;
+  }
+
+  /// Handle pairing decision from within the preparation page.
+  Future<bool> trustPeer() async {
+    if (state.pairingRequest == null) return false;
+    final fp = state.pairingRequest!.peer.fingerprint;
+    final ok = await ref.read(pairingProvider.notifier).trust(fp);
+    if (ok) state = state.copyWith(clearPairing: true);
+    return ok;
+  }
+
+  Future<bool> trustAndAcceptPeer() async {
+    if (state.pairingRequest == null) return false;
+    final fp = state.pairingRequest!.peer.fingerprint;
+    final ok = await ref.read(pairingProvider.notifier).trustAndAccept(fp);
+    if (ok) state = state.copyWith(clearPairing: true);
+    return ok;
+  }
+
+  Future<bool> rejectPeer() async {
+    if (state.pairingRequest == null) return false;
+    final fp = state.pairingRequest!.peer.fingerprint;
+    final ok = await ref.read(pairingProvider.notifier).reject(fp);
+    if (ok) state = state.copyWith(clearPairing: true, sendError: 'Pairing rejected');
+    return ok;
+  }
+}
+
+final sendPreparationProvider =
+    NotifierProvider<SendPreparationNotifier, SendPreparationState>(
+  SendPreparationNotifier.new,
+);

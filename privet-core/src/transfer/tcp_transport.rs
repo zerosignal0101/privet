@@ -299,7 +299,7 @@ where
     let verified_data = handshake::serialize(&verified)?;
     crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &verified_data).await?;
 
-    let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });
+    let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Receiving });
 
     tracing::info!("[tcp-recv] transfer complete for session {session_id}");
     Ok((session_id, peer_fingerprint))
@@ -378,6 +378,7 @@ where
                     current_speed_bps: bytes_so_far.1,
                     per_file: vec![],
                 },
+                direction: crate::session::TransferDirection::Receiving,
             });
         }
 
@@ -566,6 +567,7 @@ where
                     current_speed_bps: bytes_so_far.1,
                     per_file: vec![],
                 },
+                direction: crate::session::TransferDirection::Sending,
             });
         }
     }
@@ -579,7 +581,7 @@ where
     let (_, verified_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
     let _verified = handshake::deserialize(&verified_data)?;
 
-    let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });
+    let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Sending });
 
     tracing::info!("[tcp-send] transfer complete for session {session_id}");
     Ok((session_id, peer_fingerprint, peer_device_name))

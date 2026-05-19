@@ -27,6 +27,9 @@ final class CEvent extends Struct {
   @Uint64()
   external int totalBytes;
 
+  @Uint8()
+  external int direction; // 0=Sending, 1=Receiving, 255=N/A
+
   external Pointer<Utf8> extraJson;
 }
 
@@ -137,6 +140,15 @@ typedef PrivetRemoveKnownDeviceIpDart = int Function(Pointer<Utf8> argsJson);
 typedef PrivetSetNetworkLabelNative = Int32 Function(Pointer<Utf8> argsJson);
 typedef PrivetSetNetworkLabelDart = int Function(Pointer<Utf8> argsJson);
 
+typedef PrivetGetTransferHistoryNative = Pointer<Utf8> Function(Uint32 limit, Uint32 offset);
+typedef PrivetGetTransferHistoryDart = Pointer<Utf8> Function(int limit, int offset);
+
+typedef PrivetGetTransferRecordNative = Pointer<Utf8> Function(Pointer<Utf8> sessionId);
+typedef PrivetGetTransferRecordDart = Pointer<Utf8> Function(Pointer<Utf8> sessionId);
+
+typedef PrivetDeleteTransferRecordNative = Int32 Function(Pointer<Utf8> sessionId);
+typedef PrivetDeleteTransferRecordDart = int Function(Pointer<Utf8> sessionId);
+
 // ---------------------------------------------------------------------------
 // PrivetFfi — raw FFI bindings (singleton)
 // ---------------------------------------------------------------------------
@@ -176,6 +188,9 @@ class PrivetFfi {
   late PrivetAddKnownDeviceIpDart _addKnownDeviceIp;
   late PrivetRemoveKnownDeviceIpDart _removeKnownDeviceIp;
   late PrivetSetNetworkLabelDart _setNetworkLabel;
+  late PrivetGetTransferHistoryDart _getTransferHistory;
+  late PrivetGetTransferRecordDart _getTransferRecord;
+  late PrivetDeleteTransferRecordDart _deleteTransferRecord;
 
   /// Load the native library and bind all FFI functions.
   bool initialize() {
@@ -241,6 +256,12 @@ class PrivetFfi {
         PrivetRemoveKnownDeviceIpDart>('privet_remove_known_device_ip');
     _setNetworkLabel = _lib!.lookupFunction<PrivetSetNetworkLabelNative,
         PrivetSetNetworkLabelDart>('privet_set_network_label');
+    _getTransferHistory = _lib!.lookupFunction<PrivetGetTransferHistoryNative,
+        PrivetGetTransferHistoryDart>('privet_get_transfer_history');
+    _getTransferRecord = _lib!.lookupFunction<PrivetGetTransferRecordNative,
+        PrivetGetTransferRecordDart>('privet_get_transfer_record');
+    _deleteTransferRecord = _lib!.lookupFunction<PrivetDeleteTransferRecordNative,
+        PrivetDeleteTransferRecordDart>('privet_delete_transfer_record');
 
     _initialized = true;
     return true;
@@ -324,6 +345,10 @@ class PrivetFfi {
   int addKnownDeviceIp(Pointer<Utf8> argsJson) => _addKnownDeviceIp(argsJson);
   int removeKnownDeviceIp(Pointer<Utf8> argsJson) => _removeKnownDeviceIp(argsJson);
   int setNetworkLabel(Pointer<Utf8> argsJson) => _setNetworkLabel(argsJson);
+
+  Pointer<Utf8> getTransferHistory(int limit, int offset) => _getTransferHistory(limit, offset);
+  Pointer<Utf8> getTransferRecord(Pointer<Utf8> sessionId) => _getTransferRecord(sessionId);
+  int deleteTransferRecord(Pointer<Utf8> sessionId) => _deleteTransferRecord(sessionId);
 
   /// Read a C-allocated JSON string and free it.
   String? readAndFreeJson(Pointer<Utf8> ptr) {

@@ -33,6 +33,7 @@ class PrivetEvent {
   final String? pairingCode;
   final List<FileEntry>? files;
   final String? error;
+  final int direction; // 0=Sending, 1=Receiving, 255=N/A
 
   const PrivetEvent({
     required this.type,
@@ -43,6 +44,7 @@ class PrivetEvent {
     this.pairingCode,
     this.files,
     this.error,
+    this.direction = 255,
   });
 }
 
@@ -294,6 +296,21 @@ class PrivetService {
       });
 
   // -----------------------------------------------------------------------
+  // Transfer history
+  // -----------------------------------------------------------------------
+
+  Future<List<Map<String, dynamic>>> getTransferHistory({
+    int limit = 100, int offset = 0,
+  }) =>
+      _ffiIsolate.getTransferHistory(limit: limit, offset: offset);
+
+  Future<Map<String, dynamic>?> getTransferRecord(String sessionId) =>
+      _ffiIsolate.getTransferRecord(sessionId);
+
+  Future<bool> deleteTransferRecord(String sessionId) =>
+      _ffiIsolate.deleteTransferRecord(sessionId);
+
+  // -----------------------------------------------------------------------
   // Internal: convert raw events to typed PrivetEvents
   // -----------------------------------------------------------------------
 
@@ -335,6 +352,7 @@ class PrivetService {
         event = PrivetEvent(
           type: PrivetEventType.transferProgress,
           sessionId: sessionId,
+          direction: raw['direction'] as int? ?? 255,
           progress: TransferProgress(
             totalBytes: raw['total_bytes'] as int? ?? 0,
             bytesTransferred: raw['bytes_transferred'] as int? ?? 0,
@@ -347,12 +365,14 @@ class PrivetService {
         event = PrivetEvent(
           type: PrivetEventType.transferComplete,
           sessionId: sessionId,
+          direction: raw['direction'] as int? ?? 255,
         );
         break;
       case 5: // TransferFailed
         event = PrivetEvent(
           type: PrivetEventType.transferFailed,
           sessionId: sessionId,
+          direction: raw['direction'] as int? ?? 255,
           error: extra?['error'] as String?,
         );
         break;

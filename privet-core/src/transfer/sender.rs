@@ -271,7 +271,7 @@ impl Sender {
         self.conn.close(0u32.into(), b"done");
 
         tracing::info!("[sender] transfer complete for session {session_id}");
-        let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id });
+        let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Sending });
 
         Ok((session_id, peer_fingerprint, peer_device_name))
     }
@@ -401,6 +401,7 @@ async fn send_file_batch(
                     current_speed_bps: bytes_so_far.1,
                     per_file: vec![],
                 },
+                direction: crate::session::TransferDirection::Sending,
             });
         }
     }

@@ -18,6 +18,8 @@ pub struct CEvent {
     pub speed_bps: f64,
     pub bytes_transferred: u64,
     pub total_bytes: u64,
+    /// 0 = Sending, 1 = Receiving, 255 = N/A
+    pub direction: u8,
     /// JSON-encoded extra payload (must be freed with `privet_free_string`).
     /// Null if no extra data.
     pub extra_json: *mut std::os::raw::c_char,
@@ -70,6 +72,7 @@ impl CEvent {
             speed_bps: 0.0,
             bytes_transferred: 0,
             total_bytes: 0,
+            direction: 255, // N/A by default
             extra_json: std::ptr::null_mut(),
         };
 
@@ -91,22 +94,34 @@ impl CEvent {
                     "code": code,
                 }));
             }
-            privet_core::PrivetEvent::TransferProgress { session_id, progress } => {
+            privet_core::PrivetEvent::TransferProgress { session_id, progress, direction } => {
                 ce.event_type = EVENT_TRANSFER_PROGRESS;
                 ce.session_id = uuid_to_bytes(&session_id.0);
                 ce.progress_percent = progress.percent();
                 ce.speed_bps = progress.current_speed_bps;
                 ce.bytes_transferred = progress.bytes_transferred;
                 ce.total_bytes = progress.total_bytes;
+                ce.direction = match direction {
+                    privet_core::session::TransferDirection::Sending => 0,
+                    privet_core::session::TransferDirection::Receiving => 1,
+                };
             }
-            privet_core::PrivetEvent::TransferComplete { session_id } => {
+            privet_core::PrivetEvent::TransferComplete { session_id, direction } => {
                 ce.event_type = EVENT_TRANSFER_COMPLETE;
                 ce.session_id = uuid_to_bytes(&session_id.0);
+                ce.direction = match direction {
+                    privet_core::session::TransferDirection::Sending => 0,
+                    privet_core::session::TransferDirection::Receiving => 1,
+                };
             }
-            privet_core::PrivetEvent::TransferFailed { session_id, error } => {
+            privet_core::PrivetEvent::TransferFailed { session_id, error, direction } => {
                 ce.event_type = EVENT_TRANSFER_FAILED;
                 ce.session_id = uuid_to_bytes(&session_id.0);
                 ce.extra_json = json_to_cstring(&serde_json::json!({ "error": error }));
+                ce.direction = match direction {
+                    privet_core::session::TransferDirection::Sending => 0,
+                    privet_core::session::TransferDirection::Receiving => 1,
+                };
             }
             privet_core::PrivetEvent::IncomingTransfer { session_id, peer, files } => {
                 ce.event_type = EVENT_INCOMING_TRANSFER;
