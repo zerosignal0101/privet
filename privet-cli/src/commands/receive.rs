@@ -159,6 +159,14 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
         }
     }
 
-    engine.shutdown().await?;
+    // Graceful shutdown with timeout to avoid hanging on orphaned tasks
+    match tokio::time::timeout(std::time::Duration::from_secs(3), engine.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Shutdown error: {e}"),
+        Err(_) => {
+            eprintln!("Shutdown timed out, exiting.");
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }

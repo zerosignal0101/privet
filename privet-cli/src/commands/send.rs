@@ -123,7 +123,14 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
                 std::process::exit(1);
             }
 
-            engine.shutdown().await?;
+            match tokio::time::timeout(std::time::Duration::from_secs(3), engine.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("Shutdown error: {e}"),
+                Err(_) => {
+                    eprintln!("Shutdown timed out, exiting.");
+                    std::process::exit(1);
+                }
+            }
         }
         _ => {
             eprintln!("Either --to-ip <addr:port> or --to-name <name> must be provided");
