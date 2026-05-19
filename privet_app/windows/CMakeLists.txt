@@ -101,7 +101,7 @@ if(EXISTS "${PRIVET_FFI_DLL}")
     COMPONENT Runtime)
   message(STATUS "Privet FFI DLL found: ${PRIVET_FFI_DLL}")
 else()
-  message(WARNING "privet_ffi.dll not found at ${PRIVET_FFI_DLL}. Run 'cargo build -p privet-ffi --release' first.")
+  message(WARNING "privet_ffi.dll not found at ${PRIVET_FFI_DLL}. Run 'bash scripts/build-windows-rust.sh' first.")
 endif()
 
 # Fully re-copy the assets directory on each build to avoid having stale files
