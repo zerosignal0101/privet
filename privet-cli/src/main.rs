@@ -29,6 +29,8 @@ enum Commands {
     Status,
     /// Manage trusted peers and pairing
     Pair(commands::pair::PairArgs),
+    /// View, delete, or resend from transfer history
+    History(commands::history::HistoryArgs),
 }
 
 #[tokio::main]
@@ -76,5 +78,6 @@ async fn run_command(
             println!("No active transfers (daemon not yet implemented)");
             Ok(())
         }
+        Commands::History(args) => commands::history::run(args, config).await,
     }
 }

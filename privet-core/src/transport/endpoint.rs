@@ -121,18 +121,9 @@ fn reuseable_udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket
     Ok(std::net::UdpSocket::from(sock))
 }
 
-/// Create a TCP listener with SO_REUSEADDR for reliable engine restart.
-pub fn reuseable_tcp_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    sock.set_reuse_address(true)?;
-    sock.bind(&socket2::SockAddr::from(addr))?;
-    sock.listen(128)?;
-    // Convert to tokio TcpListener.
-    let std_listener: std::net::TcpListener = sock.into();
-    tokio::net::TcpListener::from_std(std_listener)
+/// Create a TCP listener for TCP fallback.
+/// Uses `tokio::net::TcpListener::bind` directly — the QUIC endpoint uses UDP
+/// on the same port, which does not conflict with TCP.
+pub async fn reuseable_tcp_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr).await
 }

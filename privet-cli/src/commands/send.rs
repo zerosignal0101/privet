@@ -67,19 +67,10 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
             let mut events = engine.subscribe_events().await;
             println!("Sending {} file(s) to {addr}...", args.files.len());
 
-            let sid = privet_core::SessionId::new();
-            let session_id = match engine.send_files_to_addr(addr, args.files.clone(), sid).await {
-                Ok(id) => id,
-                Err(privet_core::PrivetError::Security(
-                    privet_core::error::SecurityError::PairingRequired,
-                )) => {
-                    handle_pairing_required(&engine, &mut events, args.non_interactive).await?;
-                    let sid2 = privet_core::SessionId::new();
-                    engine.send_files_to_addr(addr, args.files, sid2).await?
-                }
-                Err(e) => return Err(e),
-            };
-            println!("Transfer complete! Session: {session_id}");
+            let session_id = send_to_addr_with_progress(
+                &engine, &mut events, addr, args.files.clone(), args.non_interactive,
+            ).await?;
+            println!("\nTransfer complete! Session: {session_id}");
         }
         (false, true) => {
             let name = args.to_name.as_ref().unwrap();
@@ -98,17 +89,10 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
                         println!("Found peer '{}' at {}", peer.name, peer.primary_address().map_or("?".into(), |a| a.to_string()));
                         found = true;
                         println!("Sending {} file(s)...", args.files.len());
-                        let session_id = match engine.send_files(&peer.id, args.files.clone()).await {
-                            Ok(id) => id,
-                            Err(privet_core::PrivetError::Security(
-                                privet_core::error::SecurityError::PairingRequired,
-                            )) => {
-                                handle_pairing_required(&engine, &mut events, args.non_interactive).await?;
-                                engine.send_files(&peer.id, args.files.clone()).await?
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        println!("Transfer complete! Session: {session_id}");
+                        let session_id = send_to_peer_with_progress(
+                            &engine, &mut events, &peer.id, args.files.clone(), args.non_interactive,
+                        ).await?;
+                        println!("\nTransfer complete! Session: {session_id}");
                         break;
                     }
                 }
@@ -119,17 +103,10 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
                 if let Some(peer) = peers.iter().find(|p| p.name == *name) {
                     found = true;
                     println!("Sending {} file(s) to '{}'...", args.files.len(), name);
-                    let session_id = match engine.send_files(&peer.id, args.files.clone()).await {
-                        Ok(id) => id,
-                        Err(privet_core::PrivetError::Security(
-                            privet_core::error::SecurityError::PairingRequired,
-                        )) => {
-                            handle_pairing_required(&engine, &mut events, args.non_interactive).await?;
-                            engine.send_files(&peer.id, args.files.clone()).await?
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    println!("Transfer complete! Session: {session_id}");
+                    let session_id = send_to_peer_with_progress(
+                        &engine, &mut events, &peer.id, args.files.clone(), args.non_interactive,
+                    ).await?;
+                    println!("\nTransfer complete! Session: {session_id}");
                 }
             }
 
@@ -147,6 +124,112 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
     }
 
     Ok(())
+}
+
+/// Send files to an IP address with progress display and Ctrl+C handling.
+async fn send_to_addr_with_progress(
+    engine: &privet_core::PrivetEngine,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<privet_core::PrivetEvent>,
+    addr: SocketAddr,
+    files: Vec<PathBuf>,
+    non_interactive: bool,
+) -> privet_core::Result<privet_core::SessionId> {
+    loop {
+        let sid = privet_core::SessionId::new();
+        let send_future = engine.send_files_to_addr(addr, files.clone(), sid);
+        tokio::pin!(send_future);
+
+        let result = loop {
+            tokio::select! {
+                result = &mut send_future => {
+                    break result;
+                }
+                event = events.recv() => {
+                    match event {
+                        Some(privet_core::PrivetEvent::TransferProgress { progress, .. }) => {
+                            print!("{}", super::format_progress_line(&progress));
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                        Some(privet_core::PrivetEvent::TransferComplete { .. }) => {
+                            // Handled by send returning Ok - nothing extra needed
+                        }
+                        Some(privet_core::PrivetEvent::TransferFailed { error, .. }) => {
+                            tracing::debug!("send progress: transfer failed event: {error}");
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nCancelling transfer...");
+                    let _ = engine.cancel_transfer(&sid).await;
+                    println!("Transfer cancelled.");
+                    std::process::exit(0);
+                }
+            }
+        };
+
+        match result {
+            Ok(session_id) => return Ok(session_id),
+            Err(privet_core::PrivetError::Security(
+                privet_core::error::SecurityError::PairingRequired,
+            )) => {
+                handle_pairing_required(engine, events, non_interactive).await?;
+                continue; // retry the send
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Send files to a discovered peer ID with progress display and Ctrl+C handling.
+async fn send_to_peer_with_progress(
+    engine: &privet_core::PrivetEngine,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<privet_core::PrivetEvent>,
+    peer_id: &privet_core::PeerId,
+    files: Vec<PathBuf>,
+    non_interactive: bool,
+) -> privet_core::Result<privet_core::SessionId> {
+    loop {
+        let send_future = engine.send_files(peer_id, files.clone());
+        tokio::pin!(send_future);
+
+        let result = loop {
+            tokio::select! {
+                result = &mut send_future => {
+                    break result;
+                }
+                event = events.recv() => {
+                    match event {
+                        Some(privet_core::PrivetEvent::TransferProgress { progress, .. }) => {
+                            print!("{}", super::format_progress_line(&progress));
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nCancelling transfer...");
+                    // For send_files we don't have the session_id easily,
+                    // but we can use cancel_all or just exit
+                    println!("Shutting down...");
+                    std::process::exit(0);
+                }
+            }
+        };
+
+        match result {
+            Ok(session_id) => return Ok(session_id),
+            Err(privet_core::PrivetError::Security(
+                privet_core::error::SecurityError::PairingRequired,
+            )) => {
+                handle_pairing_required(engine, events, non_interactive).await?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Handle a PairingRequired error by waiting for the PairRequest event

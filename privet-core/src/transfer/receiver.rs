@@ -306,6 +306,17 @@ impl Receiver {
             .write()
             .await
             .insert(session_id, cancel_flag.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
+        let file_records: Vec<crate::storage::records::TransferFileRecord> = offer.files.files.iter()
+            .map(|f| crate::storage::records::TransferFileRecord {
+                path: f.relative_path.clone(),
+                size: f.size,
+                is_dir: f.is_dir,
+            })
+            .collect();
         self.session_meta.write().await.insert(
             session_id,
             crate::engine::SessionMeta {
@@ -315,6 +326,9 @@ impl Receiver {
                     .collect(),
                 peer_name: hello.device_name.clone(),
                 peer_fingerprint: peer_fingerprint.to_owned(),
+                files: file_records,
+                total_bytes: offer.total_size,
+                started_at: now,
             },
         );
 

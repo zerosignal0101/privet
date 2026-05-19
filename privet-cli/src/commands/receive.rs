@@ -60,9 +60,13 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
     };
     println!("Waiting for incoming transfers... (mode: {mode}, Ctrl+C to stop)");
 
+    let mut active_session: Option<privet_core::SessionId> = None;
+
     loop {
-        match events.recv().await {
-            Some(privet_core::PrivetEvent::AwaitingPairing { session_id: _, peer, code }) => {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Some(privet_core::PrivetEvent::AwaitingPairing { session_id: _, peer, code }) => {
                 if args.non_interactive {
                     println!("\nPairing request from {} (non-interactive, rejecting)", peer.name);
                     engine.reject_pairing(&peer.fingerprint).await?;
@@ -116,14 +120,9 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
                 println!("  Session: {session_id}");
                 println!("  Files: {} ({})", files.files.len(), super::format_size(files.total_size));
             }
-            Some(privet_core::PrivetEvent::TransferProgress { session_id: _, progress, .. }) => {
-                print!(
-                    "\r  [{:.1}%] {:.1} MB/s  {:.1}/{:.1} MB",
-                    progress.percent(),
-                    progress.current_speed_bps / 1_000_000.0,
-                    progress.bytes_transferred as f64 / 1_000_000.0,
-                    progress.total_bytes as f64 / 1_000_000.0,
-                );
+            Some(privet_core::PrivetEvent::TransferProgress { session_id, progress, .. }) => {
+                active_session = Some(session_id);
+                print!("{}", super::format_progress_line(&progress));
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
@@ -137,6 +136,16 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
                 tracing::debug!("Event: {event:?}");
             }
             None => break,
+        }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down...");
+                if let Some(sid) = active_session.take() {
+                    let _ = engine.cancel_transfer(&sid).await;
+                    println!("Active transfer cancelled.");
+                }
+                break;
+            }
         }
     }
 

@@ -86,6 +86,12 @@ pub struct SessionMeta {
     pub peer_name: String,
     /// Peer fingerprint (for history records on cancel).
     pub peer_fingerprint: String,
+    /// File records for history logging on cancel.
+    pub files: Vec<crate::storage::records::TransferFileRecord>,
+    /// Total transfer size in bytes.
+    pub total_bytes: u64,
+    /// Timestamp when the transfer started (unix epoch seconds).
+    pub started_at: Option<u64>,
 }
 
 /// The top-level engine that orchestrates all subsystems.
@@ -245,10 +251,13 @@ impl PrivetEngine {
         let pending_pairing = self.pending_pairing.clone();
         let cancel_signals = self.cancel_signals.clone();
         let session_meta = self.session_meta.clone();
+        let cancel_signals_tcp = cancel_signals.clone();
+        let session_meta_tcp = session_meta.clone();
         let accept_store_tcp = accept_store.clone();
         let pending_incoming_tcp = pending_incoming.clone();
         let pending_pairing_tcp = pending_pairing.clone();
         let transfer_log = self.transfer_log.clone();
+        let transfer_log_tcp = transfer_log.clone();
 
         let listener = async move {
             loop {
@@ -349,7 +358,7 @@ impl PrivetEngine {
                     }
                 };
 
-                let tcp_listener = endpoint::reuseable_tcp_listener(tcp_addr);
+                let tcp_listener = endpoint::reuseable_tcp_listener(tcp_addr).await;
                 match tcp_listener {
                     Ok(listener) => {
                         tracing::info!("TCP fallback listening on {tcp_addr} (TLS)");
@@ -366,6 +375,9 @@ impl PrivetEngine {
                                     let pi = tcp_pending_incoming.clone();
                                     let pp = tcp_pending_pairing.clone();
                                     let acceptor = tokio_rustls::TlsAcceptor::from(tls_server_cfg.clone());
+                                    let cs = cancel_signals_tcp.clone();
+                                    let sm = session_meta_tcp.clone();
+                                    let tl = transfer_log_tcp.clone();
                                     tokio::spawn(async move {
                                         // Wrap with TLS
                                         let tls_stream = match acceptor.accept(stream).await {
@@ -380,14 +392,40 @@ impl PrivetEngine {
                                         let tls_fp = tls_peer_fingerprint!(&tls_stream);
 
                                         let tf = ts.lock().await.trusted_fingerprints();
-                                        if let Err(e) =
-                                            crate::transfer::tcp_transport::receive_tcp(
-                                                tls_stream, dl, ck, &id, &tf, &aa,
-                                                tls_fp.as_deref(), as_, &*pi, &*pp, &ev,
-                                            )
-                                            .await
+                                        match crate::transfer::tcp_transport::receive_tcp(
+                                            tls_stream, dl, ck, &id, &tf, &aa,
+                                            tls_fp.as_deref(), as_, &*pi, &*pp, &ev,
+                                            &cs, &sm,
+                                        )
+                                        .await
                                         {
-                                            tracing::error!("TCP recv error from {addr}: {e}");
+                                            Ok((session_id, fp, peer_name, file_records)) => {
+                                                if let Some(log) = &tl {
+                                                    let now = std::time::SystemTime::now()
+                                                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                                        .map(|d| d.as_secs()).ok();
+                                                    let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
+                                                    let _ = log.append(&crate::storage::records::TransferRecord {
+                                                        session_id,
+                                                        direction: crate::session::TransferDirection::Receiving,
+                                                        peer_fingerprint: fp,
+                                                        peer_name,
+                                                        files: file_records,
+                                                        total_bytes,
+                                                        bytes_transferred: total_bytes,
+                                                        started_at: None,
+                                                        completed_at: now,
+                                                        state: crate::storage::records::TransferRecordState::Completed,
+                                                        error: None,
+                                                    });
+                                                }
+                                            }
+                                            Err(PrivetError::TransferCancelled) => {
+                                                tracing::info!("TCP receive cancelled");
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("TCP recv error from {addr}: {e}");
+                                            }
                                         }
                                     });
                                 }
@@ -552,9 +590,14 @@ impl PrivetEngine {
             }
         }).collect();
         let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
+        let send_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
 
         // Helper to log a failed send
-        let log_fail = |log: Option<&TransferLog>, session_id: SessionId, error: &str| {
+        let log_fail = |log: Option<&TransferLog>, session_id: SessionId, error: &str,
+                        peer_fp: &str, peer_name: &str, started_at: Option<u64>| {
             if let Some(l) = log {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -562,12 +605,12 @@ impl PrivetEngine {
                 let _ = l.append(&TransferRecord {
                     session_id,
                     direction: TransferDirection::Sending,
-                    peer_fingerprint: String::new(),
-                    peer_name: String::new(),
+                    peer_fingerprint: peer_fp.to_owned(),
+                    peer_name: peer_name.to_owned(),
                     files: file_records.clone(),
                     total_bytes,
                     bytes_transferred: 0,
-                    started_at: None,
+                    started_at,
                     completed_at: now,
                     state: TransferRecordState::Failed,
                     error: Some(error.to_owned()),
@@ -575,8 +618,13 @@ impl PrivetEngine {
             }
         };
 
-        // Try QUIC first
-        let quic_result = self.try_send_quic(session_id, addr, &paths, &trusted, &self.config.security_mode).await;
+        // Try QUIC first (skip if force_tcp_fallback is set)
+        let quic_result = if self.config.transport.force_tcp_fallback {
+            tracing::info!("force_tcp_fallback: skipping QUIC, going directly to TCP");
+            Err(PrivetError::ConnectionTimeout)
+        } else {
+            self.try_send_quic(session_id, addr, &paths, &trusted, &self.config.security_mode, &file_records, total_bytes).await
+        };
 
         let (session_id, peer_fingerprint, peer_device_name) = match quic_result {
             Ok(r) => r,
@@ -593,7 +641,7 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TCP connect failed: {e}");
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -609,7 +657,7 @@ impl PrivetEngine {
                         Ok(c) => c,
                         Err(e) => {
                             let msg = format!("TLS client config error: {e}");
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -623,7 +671,7 @@ impl PrivetEngine {
                         Ok(n) => n,
                         Err(_) => {
                             let msg: String = "invalid TLS server name".into();
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -638,7 +686,7 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TLS handshake failed: {e}");
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -650,6 +698,25 @@ impl PrivetEngine {
                         }
                     };
                     let tls_fp = tls_peer_fingerprint!(&tls_stream);
+
+                    // Register cancel signal and metadata for TCP send
+                    let tcp_cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let tcp_started_at = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .ok();
+                    self.cancel_signals.write().await.insert(session_id, tcp_cancel_flag.clone());
+                    self.session_meta.write().await.insert(session_id, SessionMeta {
+                        direction: TransferDirection::Sending,
+                        file_relative_paths: paths.iter()
+                            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                            .collect(),
+                        peer_name: String::new(),
+                        peer_fingerprint: String::new(),
+                        files: file_records.clone(),
+                        total_bytes,
+                        started_at: tcp_started_at,
+                    });
                     match crate::transfer::tcp_transport::send_files_tcp(
                         tls_stream,
                         addr,
@@ -660,16 +727,20 @@ impl PrivetEngine {
                         &self.config.security_mode,
                         tls_fp.as_deref(),
                         &self.event_tx,
+                        Some(tcp_cancel_flag),
                     )
                     .await
                     {
                         Ok(tcp_result) => {
+                            self.cancel_signals.write().await.remove(&session_id);
+                            self.session_meta.write().await.remove(&session_id);
                             let tcp_session = tcp_result.0;
                             let tcp_fp = tcp_result.1;
                             let tcp_name = tcp_result.2;
                             self.log_transfer(
                                 tcp_session, TransferDirection::Sending, &tcp_fp, &tcp_name,
                                 file_records.clone(), total_bytes, total_bytes,
+                                tcp_started_at,
                                 TransferRecordState::Completed, None,
                             ).await;
                             self.record_to_known_devices(&tcp_fp, &addr, &tcp_name).await;
@@ -678,10 +749,12 @@ impl PrivetEngine {
                             return Ok(tcp_session);
                         }
                         Err(tcp_err) => {
+                            self.cancel_signals.write().await.remove(&session_id);
+                            self.session_meta.write().await.remove(&session_id);
                             let err_msg = tcp_err.to_string();
-                            log_fail(self.transfer_log.as_ref(), session_id, &err_msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                                session_id: session_id,
+                                session_id,
                                 error: err_msg,
                                 direction: TransferDirection::Sending,
                             });
@@ -691,9 +764,9 @@ impl PrivetEngine {
                 }
 
                 let err_msg = quic_err.to_string();
-                log_fail(self.transfer_log.as_ref(), session_id, &err_msg);
+                log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None);
                 let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                    session_id: session_id,
+                    session_id,
                     error: err_msg,
                     direction: TransferDirection::Sending,
                 });
@@ -709,12 +782,16 @@ impl PrivetEngine {
                 .collect(),
             peer_name: peer_device_name.clone(),
             peer_fingerprint: peer_fingerprint.clone(),
+            files: file_records.clone(),
+            total_bytes,
+            started_at: send_started_at,
         });
 
         // Log
         self.log_transfer(
             session_id, TransferDirection::Sending, &peer_fingerprint, &peer_device_name,
-            file_records, total_bytes, total_bytes, TransferRecordState::Completed, None,
+            file_records, total_bytes, total_bytes, send_started_at,
+            TransferRecordState::Completed, None,
         ).await;
 
         // Auto-record to known device store
@@ -737,6 +814,8 @@ impl PrivetEngine {
         paths: &[PathBuf],
         trusted: &[String],
         security_mode: &crate::config::SecurityMode,
+        file_records: &[crate::storage::records::TransferFileRecord],
+        total_bytes: u64,
     ) -> Result<(SessionId, String, String)> {
         let client_config = tls::build_client_config(&self.identity, trusted)?;
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -767,6 +846,12 @@ impl PrivetEngine {
                 .collect(),
             peer_name: String::new(),
             peer_fingerprint: String::new(),
+            files: file_records.to_vec(),
+            total_bytes,
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .ok(),
         });
 
         let mut sender = crate::transfer::sender::Sender::new(
@@ -796,6 +881,7 @@ impl PrivetEngine {
         files: Vec<TransferFileRecord>,
         total_bytes: u64,
         bytes_transferred: u64,
+        started_at: Option<u64>,
         state: TransferRecordState,
         error: Option<String>,
     ) {
@@ -812,7 +898,7 @@ impl PrivetEngine {
                 files,
                 total_bytes,
                 bytes_transferred,
-                started_at: None,
+                started_at,
                 completed_at: now,
                 state,
                 error,
@@ -1008,14 +1094,21 @@ impl PrivetEngine {
             direction: dir,
         });
 
-        // 6. Log to transfer log (with peer info from session_meta)
-        let (peer_fp, peer_name) = meta.as_ref()
-            .map(|m| (m.peer_fingerprint.as_str(), m.peer_name.as_str()))
-            .unwrap_or(("", ""));
+        // 6. Log to transfer log (with peer info and file records from session_meta)
+        let (peer_fp, peer_name, record_files, record_total, record_started) = meta.as_ref()
+            .map(|m| (
+                m.peer_fingerprint.as_str(),
+                m.peer_name.as_str(),
+                m.files.clone(),
+                m.total_bytes,
+                m.started_at,
+            ))
+            .unwrap_or(("", "", Vec::new(), 0, None));
         self.log_transfer(
             *session_id,
             dir, peer_fp, peer_name,
-            Vec::new(), 0, 0,
+            record_files, record_total, 0,
+            record_started,
             crate::storage::records::TransferRecordState::Cancelled,
             Some("cancelled by user".into()),
         ).await;

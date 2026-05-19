@@ -242,3 +242,198 @@ impl rustls::client::danger::ServerCertVerifier for PrivetServerVerifier {
             .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use tokio::io::duplex;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    use crate::security::identity::DeviceIdentity;
+
+    #[tokio::test]
+    async fn test_tls_handshake_over_duplex() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let client_id = DeviceIdentity::generate(
+            "tls-test-client".into(),
+            dir.path().join("client-id"),
+            10,
+        )
+        .expect("client identity");
+        let server_id = DeviceIdentity::generate(
+            "tls-test-server".into(),
+            dir.path().join("server-id"),
+            10,
+        )
+        .expect("server identity");
+
+        let server_cfg = super::build_tcp_server_config(&server_id).expect("server config");
+        let client_cfg = super::build_client_config(&client_id, &[]).expect("client config");
+
+        let (client_stream, server_stream) = duplex(64 * 1024);
+
+        let acceptor = TlsAcceptor::from(server_cfg);
+        let connector = TlsConnector::from(client_cfg);
+
+        let server_name = rustls::pki_types::ServerName::try_from("privet")
+            .expect("server name");
+
+        let server_handle = tokio::spawn(async move {
+            acceptor.accept(server_stream).await
+        });
+
+        let start = std::time::Instant::now();
+        let client_result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connector.connect(server_name, client_stream),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+
+        match client_result {
+            Ok(Ok(_tls_stream)) => {
+                eprintln!(
+                    "TLS duplex handshake completed in {}ms",
+                    elapsed.as_millis()
+                );
+            }
+            Ok(Err(e)) => {
+                panic!("TLS client handshake failed: {e}");
+            }
+            Err(_) => {
+                panic!(
+                    "TLS client handshake timed out after {}ms",
+                    elapsed.as_millis()
+                );
+            }
+        }
+
+        let _ = server_handle.await.expect("server task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tls_handshake_over_tcp() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let client_id = DeviceIdentity::generate(
+            "tcp-tls-client".into(),
+            dir.path().join("tcp-tls-client-id"),
+            10,
+        )
+        .expect("client identity");
+        let server_id = DeviceIdentity::generate(
+            "tcp-tls-server".into(),
+            dir.path().join("tcp-tls-server-id"),
+            10,
+        )
+        .expect("server identity");
+
+        let server_cfg = super::build_tcp_server_config(&server_id).expect("server config");
+        let client_cfg = super::build_client_config(&client_id, &[]).expect("client config");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let acceptor = TlsAcceptor::from(server_cfg);
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            acceptor.accept(stream).await
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+
+        let connector = TlsConnector::from(client_cfg);
+        let server_name = rustls::pki_types::ServerName::try_from("privet")
+            .expect("server name");
+
+        let start = std::time::Instant::now();
+        let client_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connector.connect(server_name, stream),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+
+        match client_result {
+            Ok(Ok(_tls_stream)) => {
+                eprintln!(
+                    "TLS TCP loopback handshake completed in {}ms",
+                    elapsed.as_millis()
+                );
+            }
+            Ok(Err(e)) => {
+                panic!("TLS TCP handshake failed: {e}");
+            }
+            Err(_) => {
+                panic!(
+                    "TLS TCP handshake timed out after {}ms",
+                    elapsed.as_millis()
+                );
+            }
+        }
+
+        let _ = server_handle.await.expect("server task panicked");
+    }
+
+    /// Test: TCP connect → wait N seconds → TLS handshake.
+    /// If this fails with os error 10053, the delay triggers Windows security software.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tls_handshake_with_delays() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let client_id = DeviceIdentity::generate(
+            "delay-client".into(), dir.path().join("dc"), 10,
+        ).unwrap();
+        let server_id = DeviceIdentity::generate(
+            "delay-server".into(), dir.path().join("ds"), 10,
+        ).unwrap();
+
+        let server_cfg = super::build_tcp_server_config(&server_id).unwrap();
+        let client_cfg = super::build_client_config(&client_id, &[]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let acceptor = TlsAcceptor::from(server_cfg);
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Server also delays before TLS
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            acceptor.accept(stream).await
+        });
+
+        let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        eprintln!("TCP connected, waiting 2s before TLS...");
+
+        // Wait before starting TLS handshake — simulates the engine path delay
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        eprintln!("Starting TLS handshake...");
+
+        let start = std::time::Instant::now();
+        let client_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TlsConnector::from(client_cfg).connect(
+                rustls::pki_types::ServerName::try_from("privet").unwrap(),
+                tcp_stream,
+            ),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+
+        match client_result {
+            Ok(Ok(_)) => eprintln!("TLS with delay succeeded in {}ms", elapsed.as_millis()),
+            Ok(Err(e)) => panic!("TLS with delay FAILED after {}ms: {e}", elapsed.as_millis()),
+            Err(_) => panic!("TLS with delay TIMED OUT after {}ms", elapsed.as_millis()),
+        }
+
+        server_handle.await.unwrap().unwrap();
+    }
+}

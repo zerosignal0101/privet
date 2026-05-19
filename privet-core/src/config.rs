@@ -78,6 +78,8 @@ pub struct TransportConfig {
     pub enable_mtu_discovery: bool,
     pub handshake_timeout: Duration,
     pub enable_tcp_fallback: bool,
+    /// If true, skip QUIC and force TCP fallback. Used for testing.
+    pub force_tcp_fallback: bool,
 }
 
 impl Default for TransportConfig {
@@ -96,6 +98,7 @@ impl Default for TransportConfig {
             enable_mtu_discovery: true,
             handshake_timeout: Duration::from_secs(5),
             enable_tcp_fallback: true,
+            force_tcp_fallback: false,
         }
     }
 }

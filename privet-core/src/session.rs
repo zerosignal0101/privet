@@ -21,6 +21,13 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+impl std::str::FromStr for SessionId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     Negotiating,

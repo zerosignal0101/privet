@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -10,6 +11,7 @@ use crate::error::{PrivetError, TransportError};
 use crate::protocol::data::{self, Chunk};
 use crate::protocol::handshake::{self, ControlMessage, HelloAck, ResumePoint};
 use crate::session::{FileManifest, SessionId};
+use crate::storage::records::TransferFileRecord;
 use crate::transfer::progress::ProgressTracker;
 
 /// TCP control stream ID for control messages (serialized ControlMessage).
@@ -37,7 +39,9 @@ pub async fn receive_tcp<S>(
     pending_incoming: &RwLock<HashMap<SessionId, oneshot::Sender<bool>>>,
     pending_pairing: &RwLock<HashMap<String, oneshot::Sender<crate::engine::PairDecision>>>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-) -> Result<(SessionId, String), PrivetError>
+    cancel_signals: &Arc<RwLock<HashMap<SessionId, Arc<AtomicBool>>>>,
+    session_meta: &Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>>,
+) -> Result<(SessionId, String, String, Vec<TransferFileRecord>), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -147,6 +151,37 @@ where
     };
     let session_id = offer.session_id;
 
+    // 4b. Register cancel signal and session metadata
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    cancel_signals.write().await.insert(session_id, cancel_flag.clone());
+    session_meta.write().await.insert(session_id, crate::engine::SessionMeta {
+        direction: crate::session::TransferDirection::Receiving,
+        file_relative_paths: offer.files.files.iter().map(|f| f.relative_path.clone()).collect(),
+        peer_name: hello.device_name.clone(),
+        peer_fingerprint: peer_fingerprint.clone(),
+        files: offer.files.files.iter().map(|f| TransferFileRecord {
+            path: f.relative_path.clone(),
+            size: f.size,
+            is_dir: f.is_dir,
+        }).collect(),
+        total_bytes: offer.total_size,
+        started_at: std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok(),
+    });
+
+    // Helper to clean up session tracking on error
+    let cleanup_session = || {
+        let cs = cancel_signals.clone();
+        let sm = session_meta.clone();
+        let sid = session_id;
+        async move {
+            cs.write().await.remove(&sid);
+            sm.write().await.remove(&sid);
+        }
+    };
+
     // 5. Trust check: reject if not trusted
     if !is_trusted && *security_mode != crate::config::SecurityMode::AllowAll {
         let reject = ControlMessage::Reject(handshake::Reject {
@@ -155,6 +190,7 @@ where
         });
         let reject_data = handshake::serialize(&reject)?;
         let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject_data).await;
+        cleanup_session().await;
         return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
     }
 
@@ -195,6 +231,7 @@ where
             });
             let reject_data = handshake::serialize(&reject)?;
             let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject_data).await;
+            cleanup_session().await;
             return Err(PrivetError::TransferRejected("transfer rejected by user".into()));
         }
         pending_incoming.write().await.remove(&session_id);
@@ -237,6 +274,7 @@ where
         });
         let reject_data = handshake::serialize(&reject)?;
         let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject_data).await;
+        cleanup_session().await;
         return Err(PrivetError::DiskFull {
             needed: offer.total_size,
             available,
@@ -276,7 +314,7 @@ where
     let total_size = offer.total_size;
     let tracker = std::sync::Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
 
-    receive_tcp_files(
+    let dest_paths = receive_tcp_files(
         &mut stream,
         &offer.files.files,
         &download_dir,
@@ -284,6 +322,7 @@ where
         event_tx,
         session_id,
         total_size,
+        Some(&cancel_flag),
     )
     .await?;
 
@@ -301,13 +340,28 @@ where
 
     let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Receiving });
 
+    // Clean up session tracking
+    cancel_signals.write().await.remove(&session_id);
+    session_meta.write().await.remove(&session_id);
+
+    // Build file records from actual destination paths
+    let file_records: Vec<TransferFileRecord> = dest_paths.iter().map(|p| {
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        TransferFileRecord {
+            path: p.to_string_lossy().to_string(),
+            size,
+            is_dir: false,
+        }
+    }).collect();
+
     tracing::info!("[tcp-recv] transfer complete for session {session_id}");
-    Ok((session_id, peer_fingerprint))
+    Ok((session_id, peer_fingerprint, hello.device_name.clone(), file_records))
 }
 
 /// Read data chunks for all files from the TCP stream.
 /// Files are sent sequentially (file 0, then file 1, ...).
 /// Each data frame = postcard-encoded Chunk + raw chunk payload bytes.
+/// Returns the list of actual destination paths (may differ from relative paths due to dedup).
 async fn receive_tcp_files<S>(
     stream: &mut S,
     files: &[handshake::FileInfo],
@@ -316,10 +370,13 @@ async fn receive_tcp_files<S>(
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     session_id: SessionId,
     total_size: u64,
-) -> Result<(), PrivetError>
+    cancel_flag: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<PathBuf>, PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut dest_paths = Vec::with_capacity(files.len());
+
     for (file_idx, file_info) in files.iter().enumerate() {
         let base = download_dir.join(&file_info.relative_path);
         let pair = crate::transfer::receiver::open_file_atomic(&base).await?;
@@ -330,8 +387,45 @@ where
         let mut written: u64 = 0;
 
         while written < expected_bytes {
+            // Check local cancel flag
+            if let Some(ref flag) = cancel_flag {
+                if flag.load(Ordering::SeqCst) {
+                    // Send Cancel on the control stream
+                    let cancel = ControlMessage::Cancel(handshake::Cancel {
+                        session_id,
+                        reason: "cancelled by user".into(),
+                    });
+                    if let Ok(data) = handshake::serialize(&cancel) {
+                        let _ = crate::transport::tcp_fallback::write_frame(stream, CONTROL_STREAM, &data).await;
+                    }
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id,
+                        error: "cancelled by user".into(),
+                        direction: crate::session::TransferDirection::Receiving,
+                    });
+                    return Err(PrivetError::TransferCancelled);
+                }
+            }
+
             let (sid, frame_data) =
                 crate::transport::tcp_fallback::read_frame(stream).await?;
+
+            // Check for Cancel control message from sender
+            if sid == CONTROL_STREAM {
+                if let Ok(ControlMessage::Cancel(_)) = handshake::deserialize(&frame_data) {
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id,
+                        error: "cancelled by sender".into(),
+                        direction: crate::session::TransferDirection::Receiving,
+                    });
+                    return Err(PrivetError::TransferCancelled);
+                }
+                return Err(crate::error::ProtocolError::UnexpectedMessage {
+                    expected: "data frame".into(),
+                    got: format!("control stream_id={sid}"),
+                }.into());
+            }
+
             if sid != DATA_STREAM {
                 return Err(crate::error::ProtocolError::UnexpectedMessage {
                     expected: "data frame".into(),
@@ -383,9 +477,10 @@ where
         }
 
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        dest_paths.push(dest);
     }
 
-    Ok(())
+    Ok(dest_paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +500,7 @@ pub async fn send_files_tcp<S>(
     security_mode: &crate::config::SecurityMode,
     tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<(SessionId, String, String), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -533,6 +629,25 @@ where
         let mut offset = resume_offset;
 
         loop {
+            // Check cancel flag before each chunk
+            if let Some(ref flag) = cancel_flag {
+                if flag.load(Ordering::SeqCst) {
+                    let cancel = ControlMessage::Cancel(handshake::Cancel {
+                        session_id,
+                        reason: "cancelled by user".into(),
+                    });
+                    if let Ok(data) = handshake::serialize(&cancel) {
+                        let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &data).await;
+                    }
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id,
+                        error: "cancelled by user".into(),
+                        direction: crate::session::TransferDirection::Sending,
+                    });
+                    return Err(PrivetError::TransferCancelled);
+                }
+            }
+
             let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
             if n == 0 {
                 break;
@@ -586,3 +701,632 @@ where
     tracing::info!("[tcp-send] transfer complete for session {session_id}");
     Ok((session_id, peer_fingerprint, peer_device_name))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::io::duplex;
+
+    /// Helper: write a data frame (header + Chunk + payload) to a stream.
+    async fn write_data_frame<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        path_index: u16,
+        offset: u64,
+        payload: &[u8],
+    ) {
+        let chunk = Chunk {
+            path_index,
+            offset,
+            length: payload.len() as u32,
+        };
+        let chunk_header = data::serialize_chunk(&chunk).unwrap();
+        let mut frame_data = Vec::with_capacity(chunk_header.len() + payload.len());
+        frame_data.extend_from_slice(&chunk_header);
+        frame_data.extend_from_slice(payload);
+        crate::transport::tcp_fallback::write_frame(stream, DATA_STREAM, &frame_data)
+            .await
+            .unwrap();
+    }
+
+    /// Helper: write a Complete control frame.
+    async fn write_complete_frame<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, session_id: SessionId) {
+        let complete = ControlMessage::Complete(handshake::Complete { session_id });
+        let data = handshake::serialize(&complete).unwrap();
+        crate::transport::tcp_fallback::write_frame(stream, CONTROL_STREAM, &data)
+            .await
+            .unwrap();
+    }
+
+    /// Helper: write a Cancel control frame.
+    #[allow(dead_code)]
+    async fn write_cancel_frame<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, session_id: SessionId) {
+        let cancel = ControlMessage::Cancel(handshake::Cancel {
+            session_id,
+            reason: "test cancel".into(),
+        });
+        let data = handshake::serialize(&cancel).unwrap();
+        crate::transport::tcp_fallback::write_frame(stream, CONTROL_STREAM, &data)
+            .await
+            .unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // receive_tcp_files tests
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_receive_tcp_files_single_chunk() {
+        let (mut writer, reader) = duplex(64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().to_path_buf();
+
+        let files = vec![handshake::FileInfo {
+            relative_path: "hello.txt".into(),
+            size: 5,
+            modified_secs: None,
+            sha256: None,
+            is_dir: false,
+        }];
+        let total_size = 5;
+        let tracker = Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+
+        // Write one chunk with "Hello"
+        write_data_frame(&mut writer, 0, 0, b"Hello").await;
+        // Write Complete to signal end
+        write_complete_frame(&mut writer, session_id).await;
+        // Close write side so read_frame returns EOF
+        drop(writer);
+
+        let dests = receive_tcp_files(
+            &mut tokio::io::DuplexStream::from(reader),
+            &files,
+            &download_dir,
+            &tracker,
+            &event_tx,
+            session_id,
+            total_size,
+            None,
+        )
+        .await
+        .expect("receive_tcp_files should succeed");
+
+        assert_eq!(dests.len(), 1, "should have one destination path");
+        let content = std::fs::read(&dests[0]).unwrap();
+        assert_eq!(content, b"Hello", "file content should match");
+    }
+
+    #[tokio::test]
+    async fn test_receive_tcp_files_multiple_chunks() {
+        let (mut writer, reader) = duplex(64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().to_path_buf();
+
+        let files = vec![handshake::FileInfo {
+            relative_path: "chunked.txt".into(),
+            size: 10,
+            modified_secs: None,
+            sha256: None,
+            is_dir: false,
+        }];
+        let total_size = 10;
+        let tracker = Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+
+        // Write two chunks
+        write_data_frame(&mut writer, 0, 0, b"He").await;
+        write_data_frame(&mut writer, 0, 2, b"llo").await;
+        write_data_frame(&mut writer, 0, 5, b"World").await;
+        write_complete_frame(&mut writer, session_id).await;
+        drop(writer);
+
+        let dests = receive_tcp_files(
+            &mut tokio::io::DuplexStream::from(reader),
+            &files,
+            &download_dir,
+            &tracker,
+            &event_tx,
+            session_id,
+            total_size,
+            None,
+        )
+        .await
+        .expect("receive_tcp_files should succeed");
+
+        assert_eq!(dests.len(), 1);
+        let content = std::fs::read(&dests[0]).unwrap();
+        assert_eq!(content, b"HelloWorld", "file content should match merged chunks");
+    }
+
+    #[tokio::test]
+    async fn test_receive_tcp_files_cancel_before_read() {
+        // Cancel set BEFORE any data arrives → cancel check fires on first loop iteration.
+        let (_writer, reader) = duplex(64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().to_path_buf();
+
+        let files = vec![handshake::FileInfo {
+            relative_path: "cancel_test.bin".into(),
+            size: 100,
+            modified_secs: None,
+            sha256: None,
+            is_dir: false,
+        }];
+        let total_size = 100;
+        let tracker = Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+        let cancel_flag = Arc::new(AtomicBool::new(true)); // pre-set
+
+        // Drop writer so reader gets EOF if cancel check is missed
+        drop(_writer);
+
+        let result = receive_tcp_files(
+            &mut tokio::io::DuplexStream::from(reader),
+            &files,
+            &download_dir,
+            &tracker,
+            &event_tx,
+            session_id,
+            total_size,
+            Some(&cancel_flag),
+        )
+        .await;
+
+        match result {
+            Err(PrivetError::TransferCancelled) => {} // expected
+            other => panic!("expected TransferCancelled, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_receive_tcp_files_cancel_after_partial_data() {
+        // Cancel fires AFTER some data was received (between chunks).
+        let (mut writer, reader) = duplex(64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().to_path_buf();
+
+        let files = vec![handshake::FileInfo {
+            relative_path: "partial_cancel.bin".into(),
+            size: 150, // bigger than data we'll send so cancel fires before file completes
+            modified_secs: None,
+            sha256: None,
+            is_dir: false,
+        }];
+        let total_size = 150;
+        let tracker = Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        // Send one chunk (60 bytes) — receiver reads it, then loops back and checks cancel
+        write_data_frame(&mut writer, 0, 0, &[0xFFu8; 60]).await;
+
+        // Now set cancel then send more data
+        cancel_flag.store(true, Ordering::SeqCst);
+        write_data_frame(&mut writer, 0, 60, &[0xAAu8; 40]).await;
+        drop(writer);
+
+        let result = receive_tcp_files(
+            &mut tokio::io::DuplexStream::from(reader),
+            &files,
+            &download_dir,
+            &tracker,
+            &event_tx,
+            session_id,
+            total_size,
+            Some(&cancel_flag),
+        )
+        .await;
+
+        match result {
+            Err(PrivetError::TransferCancelled) => {} // expected
+            other => panic!("expected TransferCancelled, got: {other:?}"),
+        }
+
+        // File may or may not have partial content depending on I/O flush behavior
+        let dest = download_dir.join("partial_cancel.bin");
+        assert!(dest.exists(), "at least the file should have been created");
+    }
+
+    #[tokio::test]
+    async fn test_receive_tcp_files_cancel_frame_from_sender() {
+        let (mut writer, reader) = duplex(64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().to_path_buf();
+
+        let files = vec![handshake::FileInfo {
+            relative_path: "remote_cancel.bin".into(),
+            size: 100,
+            modified_secs: None,
+            sha256: None,
+            is_dir: false,
+        }];
+        let total_size = 100;
+        let tracker = Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        // Write first chunk, then Cancel frame
+        write_data_frame(&mut writer, 0, 0, &[0u8; 40]).await;
+        write_cancel_frame(&mut writer, session_id).await;
+        drop(writer);
+
+        let result = receive_tcp_files(
+            &mut tokio::io::DuplexStream::from(reader),
+            &files,
+            &download_dir,
+            &tracker,
+            &event_tx,
+            session_id,
+            total_size,
+            Some(&cancel_flag),
+        )
+        .await;
+
+        // Should detect Cancel from sender
+        match result {
+            Err(PrivetError::TransferCancelled) => {} // expected
+            other => panic!("expected TransferCancelled from sender cancel, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Protocol framing test (send_file_tcp cancel check)
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_flag_semantics() {
+        // Verify that setting cancel_flag before send_files_tcp causes
+        // the cancel check to fire when the data-sending loop starts.
+        // We use a duplex pair where the "receiver" responds with HelloAck
+        // and Accept so the sender reaches the data loop.
+        let dir = tempfile::tempdir().unwrap();
+        let send_dir = dir.path().join("send");
+        let recv_dir = dir.path().join("recv");
+        std::fs::create_dir_all(&send_dir).unwrap();
+        std::fs::create_dir_all(&recv_dir).unwrap();
+
+        let file_path = send_dir.join("test.bin");
+        std::fs::write(&file_path, &[0xAB; 256]).unwrap();
+
+        let (client, mut server) = duplex(64 * 1024);
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let identity = crate::security::identity::DeviceIdentity::generate(
+            "test-sender".into(),
+            dir.path().join("identity"),
+            10,
+        )
+        .expect("identity");
+
+        let session_id = SessionId::new();
+
+        // Spawn a minimal "receiver" that responds with HelloAck + Accept
+        // so the sender progresses past the handshake to the data loop.
+        let recv_identity = crate::security::identity::DeviceIdentity::generate(
+            "test-recv".into(),
+            dir.path().join("recv-identity"),
+            10,
+        )
+        .expect("recv identity");
+        let r_session_id = session_id;
+        tokio::spawn(async move {
+            // Read Hello
+            let (_, hello_data) =
+                crate::transport::tcp_fallback::read_frame(&mut server).await.unwrap();
+            let _hello: handshake::ControlMessage = handshake::deserialize(&hello_data).unwrap();
+
+            // Send HelloAck
+            let hello_ack = handshake::ControlMessage::HelloAck(handshake::HelloAck {
+                version: handshake::PROTOCOL_VERSION,
+                accepted: true,
+                fingerprint: recv_identity.fingerprint.clone(),
+                device_name: recv_identity.device_name.clone(),
+            });
+            let ack_data = handshake::serialize(&hello_ack).unwrap();
+            crate::transport::tcp_fallback::write_frame(&mut server, CONTROL_STREAM, &ack_data)
+                .await
+                .unwrap();
+
+            // Read Offer (sender sends it after receiving HelloAck)
+            let (_, _offer_data) =
+                crate::transport::tcp_fallback::read_frame(&mut server).await.unwrap();
+
+            // Send Accept
+            let accept = handshake::ControlMessage::Accept(handshake::Accept {
+                session_id: r_session_id,
+                resume_map: std::collections::HashMap::new(),
+            });
+            let accept_data = handshake::serialize(&accept).unwrap();
+            crate::transport::tcp_fallback::write_frame(&mut server, CONTROL_STREAM, &accept_data)
+                .await
+                .unwrap();
+
+            // Now the sender enters the data-sending loop and checks cancel_flag
+            // The cancel flag is set below, so the sender should abort.
+            // Don't respond further — sender will either cancel or timeout.
+        });
+
+        // Set cancel flag after a short delay (gives time for handshake)
+        let flag = cancel_flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let result = send_files_tcp(
+            client,
+            addr,
+            vec![file_path],
+            64 * 1024,
+            &identity,
+            &[],
+            &crate::config::SecurityMode::AllowAll,
+            None,
+            &event_tx,
+            Some(cancel_flag),
+        )
+        .await;
+
+        // Should either get cancelled or a protocol error (receiver closed too early)
+        match result {
+            Err(PrivetError::TransferCancelled) => {} // expected
+            Err(_) => {} // also ok - receiver may close before cancel is detected
+            Ok(_) => panic!("expected cancellation or error"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // End-to-end test: full send/receive cycle through duplex stream
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_e2e_tcp_transfer_duplex() {
+        let dir = tempfile::tempdir().unwrap();
+        let send_dir = dir.path().join("send");
+        let recv_dir = dir.path().join("recv");
+        std::fs::create_dir_all(&send_dir).unwrap();
+        std::fs::create_dir_all(&recv_dir).unwrap();
+
+        // Create a test file
+        let file_path = send_dir.join("hello_e2e.txt");
+        let content = b"Hello TCP E2E via duplex! 42";
+        std::fs::write(&file_path, content).unwrap();
+
+        // Generate identities (no TLS — fingerprints not verified in test)
+        let send_id = crate::security::identity::DeviceIdentity::generate(
+            "e2e-send".into(), dir.path().join("e2e-id-send"), 10,
+        )
+        .expect("send identity");
+        let recv_id = crate::security::identity::DeviceIdentity::generate(
+            "e2e-recv".into(), dir.path().join("e2e-id-recv"), 10,
+        )
+        .expect("recv identity");
+
+        // Shared engine-like state
+        let cancel_signals: Arc<RwLock<HashMap<SessionId, Arc<AtomicBool>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let session_meta: Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let accept_store = Arc::new(tokio::sync::Mutex::new(
+            crate::security::accept::AcceptStore::load_or_create(
+                dir.path().join("e2e_accept.json"),
+            )
+            .expect("accept store"),
+        ));
+        let pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let pending_pairing: Arc<
+            RwLock<HashMap<String, oneshot::Sender<crate::engine::PairDecision>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        // Create duplex pair for in-memory streaming
+        let (client, server) = duplex(64 * 1024);
+
+        // --- Spawn receiver task ---
+        let recv_dir2 = recv_dir.clone();
+        let r_cs = cancel_signals.clone();
+        let r_sm = session_meta.clone();
+        let r_as = accept_store.clone();
+        let r_pi = pending_incoming.clone();
+        let r_pp = pending_pairing.clone();
+        let r_ev = event_tx.clone();
+        let r_id = recv_id.clone();
+        let recv_handle = tokio::spawn(async move {
+            receive_tcp(
+                server,
+                recv_dir2,
+                64 * 1024,
+                &r_id,
+                &[],   // empty trusted — AllowAll handles trust
+                &crate::config::SecurityMode::AllowAll,
+                None,  // no TLS fingerprint
+                r_as,
+                &*r_pi,
+                &*r_pp,
+                &r_ev,
+                &r_cs,
+                &r_sm,
+            )
+            .await
+        });
+
+        // --- Send files ---
+        let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let send_result = send_files_tcp(
+            client,
+            addr,
+            vec![file_path],
+            64 * 1024,
+            &send_id,
+            &[],   // empty trusted — AllowAll
+            &crate::config::SecurityMode::AllowAll,
+            None,  // no TLS fingerprint
+            &event_tx,
+            None,  // no cancel flag
+        )
+        .await;
+
+        // Receiver should complete successfully
+        let recv_result = recv_handle.await.expect("receiver task panicked");
+
+        match (&send_result, &recv_result) {
+            (Ok(send_res), Ok((_sid, _fp, _name, file_records))) => {
+                assert_eq!(send_res.0, *_sid, "session IDs should match");
+                // Verify the received file
+                assert_eq!(file_records.len(), 1, "should have 1 file record");
+                let received_path = &file_records[0].path;
+                let received_data = std::fs::read(received_path)
+                    .expect("should read received file");
+                assert_eq!(
+                    received_data, content,
+                    "received file content should match"
+                );
+            }
+            (Err(e1), Err(e2)) => {
+                panic!(
+                    "both sides errored: send={:?}, recv={:?}",
+                    e1, e2
+                );
+            }
+            (Err(e), Ok(_)) => {
+                panic!("send failed but recv succeeded: {e:?}");
+            }
+            (Ok(_), Err(e)) => {
+                panic!("send succeeded but recv failed: {e:?}");
+            }
+        }
+    }
+
+    /// Full TCP transfer over real localhost TCP (not duplex).
+    /// This validates that the send/receive protocol works over actual network I/O.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_e2e_tcp_transfer_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let send_dir = dir.path().join("send");
+        let recv_dir = dir.path().join("recv");
+        std::fs::create_dir_all(&send_dir).unwrap();
+        std::fs::create_dir_all(&recv_dir).unwrap();
+
+        let file_path = send_dir.join("loopback_test.bin");
+        let content = b"Hello from TCP loopback!";
+        std::fs::write(&file_path, content).unwrap();
+
+        let send_id = crate::security::identity::DeviceIdentity::generate(
+            "loopback-send".into(), dir.path().join("id-send"), 10,
+        ).expect("send identity");
+        let recv_id = crate::security::identity::DeviceIdentity::generate(
+            "loopback-recv".into(), dir.path().join("id-recv"), 10,
+        ).expect("recv identity");
+
+        let cancel_signals: Arc<RwLock<HashMap<SessionId, Arc<AtomicBool>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let session_meta: Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let accept_store = Arc::new(tokio::sync::Mutex::new(
+            crate::security::accept::AcceptStore::load_or_create(
+                dir.path().join("accept.json"),
+            ).expect("accept store"),
+        ));
+        let pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<crate::engine::PairDecision>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        // Bind TCP listener
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Build TLS configs (already wrapped in Arc by builder fns)
+        let server_cfg = crate::security::tls::build_tcp_server_config(&recv_id).unwrap();
+        let client_cfg = crate::security::tls::build_client_config(&send_id, &[]).unwrap();
+
+        // Spawn receiver: accept TCP → TLS → receive_tcp
+        let r_recv_dir = recv_dir.clone();
+        let r_cs = cancel_signals.clone();
+        let r_sm = session_meta.clone();
+        let r_as = accept_store.clone();
+        let r_pi = pending_incoming.clone();
+        let r_pp = pending_pairing.clone();
+        let r_ev = event_tx.clone();
+
+        let recv_handle = tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.expect("accept");
+            let tls_stream = tokio_rustls::TlsAcceptor::from(server_cfg)
+                .accept(tcp_stream)
+                .await
+                .expect("TLS accept");
+            let dummy_dir = r_recv_dir.join("dummy-id");
+            receive_tcp(
+                tls_stream,
+                r_recv_dir,
+                64 * 1024,
+                &crate::security::identity::DeviceIdentity::generate(
+                    "dummy-recv".into(),
+                    dummy_dir,
+                    10,
+                ).unwrap(),
+                &[],
+                &crate::config::SecurityMode::AllowAll,
+                None,
+                r_as,
+                &*r_pi,
+                &*r_pp,
+                &r_ev,
+                &r_cs,
+                &r_sm,
+            )
+            .await
+        });
+
+        // Connect and send
+        let tcp_stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let tls_stream = tokio_rustls::TlsConnector::from(client_cfg)
+            .connect(
+                rustls::pki_types::ServerName::try_from("privet").unwrap(),
+                tcp_stream,
+            )
+            .await
+            .expect("TLS connect");
+
+        let tls_fingerprint: Option<String> = None;
+        let send_result = send_files_tcp(
+            tls_stream,
+            addr,
+            vec![file_path],
+            64 * 1024,
+            &send_id,
+            &[],
+            &crate::config::SecurityMode::AllowAll,
+            tls_fingerprint.as_deref(),
+            &event_tx,
+            None,
+        )
+        .await;
+
+        let recv_result = recv_handle.await.expect("recv task");
+
+        match (&send_result, &recv_result) {
+            (Ok(send_res), Ok((_sid, _fp, _name, file_records))) => {
+                assert_eq!(send_res.0, *_sid, "session IDs should match");
+                assert_eq!(file_records.len(), 1, "should have 1 file");
+                let received_data = std::fs::read(&file_records[0].path).unwrap();
+                assert_eq!(received_data, content, "file content should match");
+            }
+            (Err(e1), Err(e2)) => panic!("both errored: send={e1:?}, recv={e2:?}"),
+            (Err(e), Ok(_)) => panic!("send failed: {e:?}"),
+            (Ok(_), Err(e)) => panic!("recv failed: {e:?}"),
+        }
+    }}

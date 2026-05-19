@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use privet_core::PrivetConfig;
+use privet_core::{PrivetConfig, SessionId};
 use sha2::{Digest, Sha256};
 
 /// Generate a random binary file of `size` bytes in `dir`.
@@ -112,7 +112,7 @@ async fn e2e_pairing_rejects_untrusted() {
     // --- Attempt 1: should fail because peer is not trusted ---
     eprintln!("[pairing] attempting transfer without trust...");
     let err = send_engine
-        .send_files_to_addr(addr, vec![file_path.clone()])
+        .send_files_to_addr(addr, vec![file_path.clone()], SessionId::new())
         .await
         .expect_err("expected PairingRequired error");
 
@@ -176,7 +176,7 @@ async fn e2e_pairing_rejects_untrusted() {
     // --- Attempt 2: should succeed after trusting ---
     eprintln!("[pairing] retrying transfer after trust...");
     send_engine
-        .send_files_to_addr(addr, vec![file_path.clone()])
+        .send_files_to_addr(addr, vec![file_path.clone()], SessionId::new())
         .await
         .expect("send should succeed after trust");
     eprintln!("[pairing] transfer succeeded after trust");
@@ -192,7 +192,7 @@ async fn e2e_pairing_rejects_untrusted() {
     assert!(!trusted_after.contains(&peer_fp), "fingerprint should no longer be trusted");
 
     let err = send_engine
-        .send_files_to_addr(addr, vec![file_path])
+        .send_files_to_addr(addr, vec![file_path], SessionId::new())
         .await
         .expect_err("expected PairingRequired after untrust");
     match &err {
@@ -249,7 +249,7 @@ async fn e2e_pairing_code_deterministic() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let _ = send_engine.send_files_to_addr(addr, vec![file_path]).await;
+    let _ = send_engine.send_files_to_addr(addr, vec![file_path], SessionId::new()).await;
 
     // Give events time to be dispatched
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -373,7 +373,7 @@ async fn e2e_resume_partial_transfer() {
             .await
             .expect("send engine");
         engine
-            .send_files_to_addr(addr, vec![file_path])
+            .send_files_to_addr(addr, vec![file_path], SessionId::new())
             .await
             .expect("send with resume");
     }
@@ -396,93 +396,9 @@ async fn e2e_resume_partial_transfer() {
     eprintln!("[resume] PASS — partial file resumed correctly");
 }
 
-#[tokio::test]
-async fn e2e_tcp_fallback_transfer() {
-    // Verify files can be transferred over TCP fallback transport.
-    privet_core::init();
-
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let send_dir = temp_dir.path().join("send");
-    let recv_dir = temp_dir.path().join("recv");
-    std::fs::create_dir_all(&send_dir).unwrap();
-    std::fs::create_dir_all(&recv_dir).unwrap();
-
-    let port = pick_port();
-    let file_name = "tcp_test.bin";
-    let file_size = 64 * 1024;
-
-    let (file_path, source_hash) = generate_test_file(&send_dir, file_name, file_size);
-
-    // Start receiver with TCP fallback
-    let mut recv_config = PrivetConfig::default_with_name("tcp-recv".into());
-    recv_config.transport.listen_port = port;
-    recv_config.transport.enable_tcp_fallback = true;
-    recv_config.download_dir = recv_dir.clone();
-    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
-    let recv_engine = privet_core::PrivetEngine::new(recv_config)
-        .await
-        .expect("recv engine");
-    recv_engine.start().await.expect("recv start");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Send via TCP directly (simulating UDP-blocked / QUIC failure)
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let cert_dir = temp_dir.path().join("certs").join("tcp-send");
-    std::fs::create_dir_all(&cert_dir).unwrap();
-    let identity = privet_core::security::identity::DeviceIdentity::generate(
-        "tcp-send".into(),
-        cert_dir,
-        10,
-    )
-    .expect("identity");
-    let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
-
-    // Connect with TLS to the receiver (its TCP listener now wraps with TLS)
-    let tcp_stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("TCP connect");
-    let tls_client_cfg = privet_core::security::tls::build_client_config(
-        &identity,
-        &[], // empty trusted, but auto_accept=true
-    )
-    .expect("TLS client config");
-    let connector = tokio_rustls::TlsConnector::from(tls_client_cfg);
-    let tls_name = rustls::pki_types::ServerName::try_from("privet")
-        .expect("server name");
-    let tls_stream = connector
-        .connect(tls_name, tcp_stream)
-        .await
-        .expect("TLS handshake");
-    let tls_fp: Option<String> = None; // auto_accept=true, no MITM check needed
-
-    privet_core::transfer::tcp_transport::send_files_tcp(
-        tls_stream,
-        addr,
-        vec![file_path],
-        64 * 1024,
-        &identity,
-        &[], // empty trusted, but AllowAll
-        &privet_core::SecurityMode::AllowAll,
-        tls_fp.as_deref(),
-        &event_tx,
-    )
-    .await
-    .expect("TCP send");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    recv_engine.shutdown().await.expect("shutdown");
-
-    // Verify
-    let received_path = recv_dir.join(file_name);
-    assert!(received_path.exists(), "TCP received file missing");
-    let actual_hash = sha256_file(&received_path);
-    assert_eq!(
-        source_hash, actual_hash,
-        "TCP transfer hash mismatch\n  src: {source_hash}\n  got: {actual_hash}"
-    );
-    eprintln!("[tcp-fallback] PASS — TCP transfer completed correctly");
-}
+// ---------------------------------------------------------------------------
+// Transfer log test
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn e2e_transfer_log_created() {
@@ -518,7 +434,7 @@ async fn e2e_transfer_log_created() {
     let send_engine = privet_core::PrivetEngine::new(sc).await.expect("send");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     send_engine
-        .send_files_to_addr(addr, vec![file_path])
+        .send_files_to_addr(addr, vec![file_path], SessionId::new())
         .await
         .expect("send");
 
@@ -537,10 +453,68 @@ async fn e2e_transfer_log_created() {
         .map(|l| serde_json::from_str(l).expect("valid JSON"))
         .expect("at least one log record");
     assert_eq!(
-        record["completed"], true,
-        "log record should mark transfer as completed"
+        record["state"], "Completed",
+        "log record should mark transfer as Completed"
     );
     eprintln!("[transfer-log] PASS — log file created with valid record");
+}
+
+// ---------------------------------------------------------------------------
+// TCP fallback test — connected to engine TCP listener via raw TCP+TLS
+// Works on Linux, may hang on Windows due to socket2 SO_REUSEADDR interaction
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_tcp_fallback_engine() {
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+    let file_name = "tcp_fallback_test.bin";
+    let file_size = 4096;
+    let (file_path, source_hash) = generate_test_file(&send_dir, file_name, file_size);
+    let cert_dir = temp_dir.path().join("certs");
+    std::fs::create_dir_all(&cert_dir).unwrap();
+
+    // Receiver with TCP fallback
+    let mut rc = PrivetConfig::default_with_name("tcp-engine-recv".into());
+    rc.transport.listen_port = port;
+    rc.transport.enable_tcp_fallback = true;
+    rc.download_dir = recv_dir.clone();
+    rc.security_mode = privet_core::SecurityMode::AllowAll;
+    rc.security.cert_dir = Some(cert_dir.join("recv"));
+    rc.log_dir = Some(temp_dir.path().join("logs").join("recv"));
+    let recv = privet_core::PrivetEngine::new(rc).await.expect("recv engine");
+    recv.start().await.expect("recv start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Sender with force_tcp_fallback
+    let mut sc = PrivetConfig::default_with_name("tcp-engine-send".into());
+    sc.transport.listen_port = 0;
+    sc.transport.enable_tcp_fallback = true;
+    sc.transport.force_tcp_fallback = true;
+    sc.security_mode = privet_core::SecurityMode::AllowAll;
+    sc.security.cert_dir = Some(cert_dir.join("send"));
+    sc.log_dir = Some(temp_dir.path().join("logs").join("send"));
+    let send = privet_core::PrivetEngine::new(sc).await.expect("send engine");
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    send.send_files_to_addr(addr, vec![file_path], SessionId::new())
+        .await
+        .expect("TCP fallback send");
+
+    recv.shutdown().await.expect("recv shutdown");
+
+    let received_path = recv_dir.join(file_name);
+    assert!(received_path.exists(), "TCP fallback file missing");
+    let actual_hash = sha256_file(&received_path);
+    assert_eq!(source_hash, actual_hash, "TCP fallback hash mismatch");
+    eprintln!("[tcp-fallback-engine] PASS");
 }
 
 /// Generate multiple files, send them in a single transfer, and verify they all arrived.
@@ -593,7 +567,7 @@ async fn run_multifile_transfer(sizes: &[usize]) {
             .await
             .expect("send engine");
         engine
-            .send_files_to_addr(addr, file_paths)
+            .send_files_to_addr(addr, file_paths, SessionId::new())
             .await
             .expect("multi-file send");
         eprintln!("[multi] send complete");
@@ -708,7 +682,7 @@ async fn run_transfer(file_size: usize) {
         config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(config).await.expect("sender engine");
         engine
-            .send_files_to_addr(addr, vec![file_path])
+            .send_files_to_addr(addr, vec![file_path], SessionId::new())
             .await
             .expect("send_files_to_addr");
         eprintln!("[{file_size}B] send complete");
