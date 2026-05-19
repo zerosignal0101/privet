@@ -34,6 +34,15 @@ class SendPreparationPage extends ConsumerStatefulWidget {
 class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   bool _initialised = false;
 
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _initFromParams();
+    });
+  }
+
   void _initFromParams() {
     if (_initialised) return;
     _initialised = true;
@@ -84,12 +93,15 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(sendPreparationProvider);
-    _initFromParams();
 
-    // Resolve pending pairing to keep state fresh
+    // Resolve pending pairing to keep state fresh (deferred after build)
     final pairing = ref.watch(pairingProvider);
     if (state.pairingRequest != null && pairing.isEmpty) {
-      ref.read(sendPreparationProvider.notifier).clearPairing();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          ref.read(sendPreparationProvider.notifier).clearPairing();
+        }
+      });
     }
 
     final body = Column(
