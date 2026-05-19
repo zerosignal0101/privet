@@ -67,13 +67,15 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
             let mut events = engine.subscribe_events().await;
             println!("Sending {} file(s) to {addr}...", args.files.len());
 
-            let session_id = match engine.send_files_to_addr(addr, args.files.clone()).await {
+            let sid = privet_core::SessionId::new();
+            let session_id = match engine.send_files_to_addr(addr, args.files.clone(), sid).await {
                 Ok(id) => id,
                 Err(privet_core::PrivetError::Security(
                     privet_core::error::SecurityError::PairingRequired,
                 )) => {
                     handle_pairing_required(&engine, &mut events, args.non_interactive).await?;
-                    engine.send_files_to_addr(addr, args.files).await?
+                    let sid2 = privet_core::SessionId::new();
+                    engine.send_files_to_addr(addr, args.files, sid2).await?
                 }
                 Err(e) => return Err(e),
             };

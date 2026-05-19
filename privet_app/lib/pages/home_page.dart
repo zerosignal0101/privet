@@ -91,7 +91,14 @@ class _HomePageState extends ConsumerState<HomePage> {
         t.state == TransferState.completing).toList();
     final completed = activeList.where((t) => t.isCompleted || t.isFailed).toList();
     final otherIncoming = activeList
-        .where((t) => t.direction == TransferDirection.receiving && !t.isAwaitingAccept && !t.isCompleted && !t.isFailed)
+        .where((t) => t.direction == TransferDirection.receiving
+            && !t.isAwaitingAccept
+            && !t.isCompleted
+            && !t.isFailed
+            && t.state != TransferState.transferring
+            && t.state != TransferState.negotiating
+            && t.state != TransferState.paused
+            && t.state != TransferState.completing)
         .toList();
 
     return Scaffold(

@@ -82,6 +82,7 @@ pub fn build_transport_config(config: &PrivetTransportConfig) -> Arc<TransportCo
             IdleTimeout::try_from(config.idle_timeout)
                 .unwrap_or_else(|_| IdleTimeout::try_from(Duration::from_secs(30)).unwrap()),
         ))
+        .keep_alive_interval(Some(Duration::from_secs(5)))
         .enable_segmentation_offload(config.enable_gso)
         .mtu_discovery_config(if config.enable_mtu_discovery {
             Some(Default::default())

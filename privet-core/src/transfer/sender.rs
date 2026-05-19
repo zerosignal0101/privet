@@ -19,6 +19,7 @@ pub struct Sender {
     chunk_size: u32,
     fingerprint: String,
     device_name: String,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Sender {
@@ -33,19 +34,35 @@ impl Sender {
             chunk_size,
             fingerprint,
             device_name,
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Set the cancel flag and return a shared reference for external signaling.
+    pub fn set_cancel_flag(
+        &mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.cancel_flag = flag;
     }
 
     /// Execute the full send flow: handshake → trust check → offer → send data (parallel streams).
     /// Returns (session_id, peer_fingerprint, peer_device_name) on success.
     pub async fn send(
         &self,
+        session_id: SessionId,
         files: &[PathBuf],
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         trusted_fingerprints: &[String],
         security_mode: &crate::config::SecurityMode,
     ) -> Result<(SessionId, String, String), PrivetError> {
-        let session_id = SessionId::new();
+        if self.is_cancelled() {
+            return Err(PrivetError::TransferCancelled);
+        }
 
         // 1. Open control stream
         tracing::debug!("[sender] opening control stream");
@@ -195,7 +212,7 @@ impl Sender {
             }
         };
 
-        // 6. Send files as parallel data streams (batched)
+        // 7. Send files as parallel data streams (batched)
         tracing::debug!(
             "[sender] sending {} file(s) in parallel batches",
             manifest.files.len()
@@ -221,6 +238,7 @@ impl Sender {
             let resume_map = accept.resume_map.clone();
             let tracker = std::sync::Arc::clone(&tracker);
             let event_tx = event_tx.clone();
+            let batch_cancel = self.cancel_flag.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = permit; // holds capacity for the batch duration
@@ -234,40 +252,117 @@ impl Sender {
                     session_id,
                     &event_tx,
                     &tracker,
+                    Some(batch_cancel),
                 )
                 .await
             }));
         }
 
-        // Wait for all batches to complete
-        for handle in handles {
-            handle
-                .await
-                .map_err(|e| {
-                    PrivetError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                })
-                .and_then(|inner| inner)?;
+        // Wait for batches while monitoring the control stream for Cancel
+        // (pairing-reject-style: sender reads Cancel from ctrl_recv)
+        let mut batch_index = 0;
+        while batch_index < handles.len() {
+            // peek at cancel flag first (fast path)
+            if self.is_cancelled() {
+                // Send Cancel on the control stream and wait for the receiver
+                // to acknowledge — keeps connection alive so Cancel is delivered.
+                let cancel = ControlMessage::Cancel(handshake::Cancel {
+                    session_id, reason: "cancelled by user".into(),
+                });
+                if let Ok(data) = handshake::serialize(&cancel) {
+                    if control::write_control_frame(&mut ctrl_send, &data).await.is_ok() {
+                        let _ = ctrl_send.finish();
+                    }
+                }
+                let mut buf = [0u8; 1];
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    ctrl_recv.read(&mut buf),
+                ).await;
+                let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                    session_id,
+                    error: "cancelled by remote peer".into(),
+                    direction: crate::session::TransferDirection::Sending,
+                });
+                return Err(PrivetError::TransferCancelled);
+            }
+
+            tokio::select! {
+                result = &mut handles[batch_index] => {
+                    match result {
+                        Ok(Ok(())) => batch_index += 1,
+                        Ok(Err(PrivetError::TransferCancelled)) => {
+                            // Batch was cancelled — notify receiver on control stream
+                            let cancel = ControlMessage::Cancel(handshake::Cancel {
+                                session_id, reason: "cancelled by user".into(),
+                            });
+                            if let Ok(data) = handshake::serialize(&cancel) {
+                                if control::write_control_frame(&mut ctrl_send, &data).await.is_ok() {
+                                    let _ = ctrl_send.finish();
+                                }
+                            }
+                            let mut buf = [0u8; 1];
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                ctrl_recv.read(&mut buf),
+                            ).await;
+                            let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                                session_id,
+                                error: "cancelled by remote peer".into(),
+                                direction: crate::session::TransferDirection::Sending,
+                            });
+                            return Err(PrivetError::TransferCancelled);
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(PrivetError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other, e.to_string(),
+                        ))),
+                    }
+                }
+                msg = control::read_control_frame(&mut ctrl_recv) => {
+                    match msg {
+                        Ok(data) => {
+                            if let Ok(ControlMessage::Cancel(_)) = handshake::deserialize(&data) {
+                                // Receiver cancelled — acknowledge by finishing our send side
+                                let _ = ctrl_send.finish();
+                                self.cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                tracing::info!("[sender] cancelled by receiver for session {session_id}");
+                                let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                                    session_id,
+                                    error: "cancelled by remote peer".into(),
+                                    direction: crate::session::TransferDirection::Sending,
+                                });
+                                return Err(PrivetError::TransferCancelled);
+                            }
+                        }
+                        Err(e) => {
+                            // Control stream error (network issue, not a clean Cancel)
+                            return Err(PrivetError::Transport(e));
+                        }
+                    }
+                }
+            }
         }
 
-        // 7. Send Complete
+        // 8. Send Complete
         tracing::debug!("[sender] sending Complete");
         let complete = ControlMessage::Complete(handshake::Complete { session_id });
         let complete_data = handshake::serialize(&complete)?;
         control::write_control_frame(&mut ctrl_send, &complete_data)
             .await
-            .map_err(|e| TransportError::ConnectionLost(format!("step7: {e}")))?;
+            .map_err(|e| TransportError::ConnectionLost(format!("step8: {e}")))?;
 
-        // 8. Receive Verified
+        // 9. Receive Verified
         tracing::debug!("[sender] reading Verified");
         let verified_data = control::read_control_frame(&mut ctrl_recv)
             .await
-            .map_err(|e| TransportError::ConnectionLost(format!("step8: {e}")))?;
+            .map_err(|e| TransportError::ConnectionLost(format!("step9: {e}")))?;
         let _verified = handshake::deserialize(&verified_data)?;
 
-        // 9. Graceful close: finish control stream then close the connection.
+        // 10. Graceful close: finish control stream then close the connection.
         ctrl_send
             .finish()
-            .map_err(|e| TransportError::ConnectionLost(format!("step9-finish: {e}")))?;
+            .map_err(|e| TransportError::ConnectionLost(format!("step10-finish: {e}")))?;
         self.conn.close(0u32.into(), b"done");
 
         tracing::info!("[sender] transfer complete for session {session_id}");
@@ -317,6 +412,7 @@ async fn send_file_batch(
     session_id: SessionId,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     tracker: &std::sync::Arc<std::sync::Mutex<ProgressTracker>>,
+    cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), PrivetError> {
     let stream_header = StreamHeader {
         file_count: batch_indices.len() as u16,
@@ -367,6 +463,11 @@ async fn send_file_batch(
         let mut offset = resume_offset;
 
         loop {
+            if let Some(ref flag) = cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PrivetError::TransferCancelled);
+                }
+            }
             let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
             if n == 0 {
                 break;

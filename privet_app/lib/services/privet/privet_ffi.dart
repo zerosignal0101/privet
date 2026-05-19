@@ -67,10 +67,10 @@ typedef PrivetRegisterEventCallbackNative = Void Function(
 typedef PrivetRegisterEventCallbackDart = void Function(
     Pointer<NativeFunction<Void Function(Pointer<CEvent>)>>);
 
-typedef PrivetSendFilesToAddrNative = Int32 Function(
-    Pointer<Utf8> addr, Pointer<Utf8> pathsJson, Pointer<Utf8> outSessionId);
-typedef PrivetSendFilesToAddrDart = int Function(
-    Pointer<Utf8> addr, Pointer<Utf8> pathsJson, Pointer<Utf8> outSessionId);
+typedef PrivetSendFilesStartNative = Int32 Function(
+    Pointer<Utf8> sessionId, Pointer<Utf8> addr, Pointer<Utf8> pathsJson);
+typedef PrivetSendFilesStartDart = int Function(
+    Pointer<Utf8> sessionId, Pointer<Utf8> addr, Pointer<Utf8> pathsJson);
 
 typedef PrivetSendFilesToNameNative = Int32 Function(
     Pointer<Utf8> name, Pointer<Utf8> pathsJson, Pointer<Utf8> outSessionId);
@@ -166,7 +166,7 @@ class PrivetFfi {
   late PrivetStartDart _start;
   late PrivetStopDart _stop;
   late PrivetPollEventDart _pollEvent;
-  late PrivetSendFilesToAddrDart _sendFilesToAddr;
+  late PrivetSendFilesStartDart _sendFilesStart;
   late PrivetSendFilesToNameDart _sendFilesToName;
   late PrivetAcceptTransferDart _acceptTransfer;
   late PrivetRejectTransferDart _rejectTransfer;
@@ -210,8 +210,8 @@ class PrivetFfi {
         _lib!.lookupFunction<PrivetStopNative, PrivetStopDart>('privet_stop');
     _pollEvent = _lib!.lookupFunction<PrivetPollEventNative,
         PrivetPollEventDart>('privet_poll_event');
-    _sendFilesToAddr = _lib!.lookupFunction<PrivetSendFilesToAddrNative,
-        PrivetSendFilesToAddrDart>('privet_send_files_to_addr');
+    _sendFilesStart = _lib!.lookupFunction<PrivetSendFilesStartNative,
+        PrivetSendFilesStartDart>('privet_send_files_start');
     _sendFilesToName = _lib!.lookupFunction<PrivetSendFilesToNameNative,
         PrivetSendFilesToNameDart>('privet_send_files_to_name');
     _acceptTransfer = _lib!.lookupFunction<PrivetAcceptTransferNative,
@@ -315,8 +315,8 @@ class PrivetFfi {
 
   Pointer<Utf8> pollEvent() => _pollEvent();
 
-  int sendFilesToAddr(Pointer<Utf8> addr, Pointer<Utf8> pathsJson, Pointer<Utf8> outSessionId) =>
-      _sendFilesToAddr(addr, pathsJson, outSessionId);
+  int sendFilesStart(Pointer<Utf8> sessionId, Pointer<Utf8> addr, Pointer<Utf8> pathsJson) =>
+      _sendFilesStart(sessionId, addr, pathsJson);
 
   int sendFilesToName(Pointer<Utf8> name, Pointer<Utf8> pathsJson, Pointer<Utf8> outSessionId) =>
       _sendFilesToName(name, pathsJson, outSessionId);

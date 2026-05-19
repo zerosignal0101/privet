@@ -76,6 +76,18 @@ macro_rules! tls_peer_fingerprint {
 }
 
 
+/// Metadata about an active session, used for cancellation cleanup.
+#[derive(Clone, Debug)]
+pub struct SessionMeta {
+    pub direction: TransferDirection,
+    /// Relative file paths (from Offer or send paths).
+    pub file_relative_paths: Vec<String>,
+    /// Peer display name (for history records on cancel).
+    pub peer_name: String,
+    /// Peer fingerprint (for history records on cancel).
+    pub peer_fingerprint: String,
+}
+
 /// The top-level engine that orchestrates all subsystems.
 pub struct PrivetEngine {
     config: PrivetConfig,
@@ -99,6 +111,12 @@ pub struct PrivetEngine {
     discovery_handles: RwLock<Vec<JoinHandle<()>>>,
     transfer_log: Option<TransferLog>,
     tcp_listener_handle: RwLock<Option<JoinHandle<()>>>,
+    /// Cancel signals: session_id → atomic bool set to true when cancel is requested.
+    cancel_signals:
+        Arc<RwLock<HashMap<SessionId, std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Per-session metadata (direction + file paths) for cleanup on cancel.
+    session_meta:
+        Arc<RwLock<HashMap<SessionId, SessionMeta>>>,
 }
 
 impl PrivetEngine {
@@ -179,6 +197,8 @@ impl PrivetEngine {
             known_device_store: Arc::new(tokio::sync::Mutex::new(known_device_store)),
             pending_incoming: Arc::new(RwLock::new(HashMap::new())),
             pending_pairing: Arc::new(RwLock::new(HashMap::new())),
+            cancel_signals: Arc::new(RwLock::new(HashMap::new())),
+            session_meta: Arc::new(RwLock::new(HashMap::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             sessions: RwLock::new(HashMap::new()),
             event_tx,
@@ -223,6 +243,8 @@ impl PrivetEngine {
         let known_device_store = self.known_device_store.clone();
         let pending_incoming = self.pending_incoming.clone();
         let pending_pairing = self.pending_pairing.clone();
+        let cancel_signals = self.cancel_signals.clone();
+        let session_meta = self.session_meta.clone();
         let accept_store_tcp = accept_store.clone();
         let pending_incoming_tcp = pending_incoming.clone();
         let pending_pairing_tcp = pending_pairing.clone();
@@ -242,6 +264,8 @@ impl PrivetEngine {
                                 let known_device_store = known_device_store.clone();
                                 let pending_incoming = pending_incoming.clone();
                                 let pending_pairing = pending_pairing.clone();
+                                let cancel_signals = cancel_signals.clone();
+                                let session_meta = session_meta.clone();
                                 let transfer_log = transfer_log.clone();
                                 tokio::spawn(async move {
                                     let receiver = crate::transfer::receiver::Receiver::new(
@@ -256,6 +280,8 @@ impl PrivetEngine {
                                         known_device_store,
                                         pending_incoming,
                                         pending_pairing,
+                                        cancel_signals,
+                                        session_meta,
                                     );
                                     match receiver.receive(&event_tx).await {
                                         Ok((session_id, _fp, peer_name, file_records)) => {
@@ -278,6 +304,9 @@ impl PrivetEngine {
                                                     error: None,
                                                 });
                                             }
+                                        }
+                                        Err(PrivetError::TransferCancelled) => {
+                                            tracing::info!("receiver cancelled");
                                         }
                                         Err(e) => {
                                             tracing::warn!("receive finished: {e}");
@@ -497,15 +526,19 @@ impl PrivetEngine {
             .primary_address()
             .ok_or_else(|| PrivetError::PeerNotFound(peer_id.to_string()))?;
 
-        self.send_files_to_addr(addr, paths).await
+        let session_id = SessionId::new();
+        self.send_files_to_addr(addr, paths, session_id).await
     }
 
     /// Send files to a peer by address (IP:port), bypassing discovery.
     /// Tries QUIC first, then TCP fallback if configured.
+    /// `session_id` is pre-generated so the caller can register it before
+    /// the transfer starts; all TransferFailed events use this id.
     pub async fn send_files_to_addr(
         &self,
         addr: SocketAddr,
         paths: Vec<PathBuf>,
+        session_id: SessionId,
     ) -> Result<SessionId> {
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
 
@@ -543,7 +576,7 @@ impl PrivetEngine {
         };
 
         // Try QUIC first
-        let quic_result = self.try_send_quic(addr, &paths, &trusted, &self.config.security_mode).await;
+        let quic_result = self.try_send_quic(session_id, addr, &paths, &trusted, &self.config.security_mode).await;
 
         let (session_id, peer_fingerprint, peer_device_name) = match quic_result {
             Ok(r) => r,
@@ -560,9 +593,9 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TCP connect failed: {e}");
-                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                                session_id: SessionId::new(),
+                                session_id,
                                 error: msg.clone(),
                                 direction: TransferDirection::Sending,
                             });
@@ -576,9 +609,9 @@ impl PrivetEngine {
                         Ok(c) => c,
                         Err(e) => {
                             let msg = format!("TLS client config error: {e}");
-                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                                session_id: SessionId::new(),
+                                session_id,
                                 error: msg.clone(),
                                 direction: TransferDirection::Sending,
                             });
@@ -590,9 +623,9 @@ impl PrivetEngine {
                         Ok(n) => n,
                         Err(_) => {
                             let msg: String = "invalid TLS server name".into();
-                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                                session_id: SessionId::new(),
+                                session_id,
                                 error: msg.clone(),
                                 direction: TransferDirection::Sending,
                             });
@@ -605,9 +638,9 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TLS handshake failed: {e}");
-                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                                session_id: SessionId::new(),
+                                session_id,
                                 error: msg.clone(),
                                 direction: TransferDirection::Sending,
                             });
@@ -646,9 +679,9 @@ impl PrivetEngine {
                         }
                         Err(tcp_err) => {
                             let err_msg = tcp_err.to_string();
-                            log_fail(self.transfer_log.as_ref(), SessionId::new(), &err_msg);
+                            log_fail(self.transfer_log.as_ref(), session_id, &err_msg);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                                session_id: SessionId::new(),
+                                session_id: session_id,
                                 error: err_msg,
                                 direction: TransferDirection::Sending,
                             });
@@ -658,15 +691,25 @@ impl PrivetEngine {
                 }
 
                 let err_msg = quic_err.to_string();
-                log_fail(self.transfer_log.as_ref(), SessionId::new(), &err_msg);
+                log_fail(self.transfer_log.as_ref(), session_id, &err_msg);
                 let _ = self.event_tx.send(PrivetEvent::TransferFailed {
-                    session_id: SessionId::new(),
+                    session_id: session_id,
                     error: err_msg,
                     direction: TransferDirection::Sending,
                 });
                 return Err(quic_err);
             }
         };
+
+        // Update session_meta with peer info (needed for cancel_transfer logging)
+        self.session_meta.write().await.insert(session_id, SessionMeta {
+            direction: TransferDirection::Sending,
+            file_relative_paths: paths.iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .collect(),
+            peer_name: peer_device_name.clone(),
+            peer_fingerprint: peer_fingerprint.clone(),
+        });
 
         // Log
         self.log_transfer(
@@ -689,6 +732,7 @@ impl PrivetEngine {
     /// Try QUIC transport: connect and send. Returns (session_id, peer_fingerprint, peer_device_name).
     async fn try_send_quic(
         &self,
+        session_id: SessionId,
         addr: SocketAddr,
         paths: &[PathBuf],
         trusted: &[String],
@@ -709,14 +753,37 @@ impl PrivetEngine {
             .await
             .map_err(|e| crate::error::TransportError::Quic(format!("handshake: {e}")))?;
 
-        let sender = crate::transfer::sender::Sender::new(
+
+        // Register cancel signal and metadata for this send session
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancel_signals
+            .write()
+            .await
+            .insert(session_id, cancel_flag.clone());
+        self.session_meta.write().await.insert(session_id, SessionMeta {
+            direction: TransferDirection::Sending,
+            file_relative_paths: paths.iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .collect(),
+            peer_name: String::new(),
+            peer_fingerprint: String::new(),
+        });
+
+        let mut sender = crate::transfer::sender::Sender::new(
             conn,
             self.config.transport.chunk_size,
             self.identity.fingerprint.clone(),
             self.identity.device_name.clone(),
         );
+        sender.set_cancel_flag(cancel_flag);
 
-        sender.send(paths, &self.event_tx, trusted, security_mode).await
+        let result = sender.send(session_id, paths, &self.event_tx, trusted, security_mode).await;
+
+        // Clean up session tracking
+        self.cancel_signals.write().await.remove(&session_id);
+        self.session_meta.write().await.remove(&session_id);
+
+        result
     }
 
     /// Log a transfer to the JSONL transfer log.
@@ -851,7 +918,8 @@ impl PrivetEngine {
                     if let Some(addr_str) = entry.addresses.first() {
                         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                             drop(store);
-                            return self.send_files_to_addr(addr, paths).await;
+                            let sid = SessionId::new();
+                            return self.send_files_to_addr(addr, paths, sid).await;
                         }
                     }
                 }
@@ -898,7 +966,61 @@ impl PrivetEngine {
     }
 
     /// Cancel an active transfer.
-    pub async fn cancel_transfer(&self, _session_id: &SessionId) -> Result<()> {
+    /// For receiving transfers, clean up incomplete files.
+    pub async fn cancel_transfer(&self, session_id: &SessionId) -> Result<()> {
+        tracing::info!("[engine] cancel_transfer: session {}", session_id.0);
+
+        // 1. Signal cancellation to any in-progress task
+        if let Some(flag) = self
+            .cancel_signals
+            .write()
+            .await
+            .remove(session_id)
+        {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // 2. Reject if still pending acceptance
+        if let Some(tx) = self.pending_incoming.write().await.remove(session_id) {
+            let _ = tx.send(false);
+        }
+
+        // 3. Read session metadata for direction and file cleanup
+        let meta = self.session_meta.write().await.remove(session_id);
+
+        // 4. Clean up partial files for receiving transfers
+        if let Some(ref meta) = meta {
+            if meta.direction == TransferDirection::Receiving {
+                let download_dir = &self.config.download_dir;
+                for rel_path in &meta.file_relative_paths {
+                    let file_path = download_dir.join(rel_path);
+                    tracing::debug!("[engine] cancel: removing partial file {:?}", file_path);
+                    let _ = tokio::fs::remove_file(&file_path).await;
+                }
+            }
+        }
+
+        // 5. Emit event
+        let dir = meta.as_ref().map(|m| m.direction).unwrap_or(TransferDirection::Sending);
+        let _ = self.event_tx.send(PrivetEvent::TransferFailed {
+            session_id: *session_id,
+            error: "cancelled by user".into(),
+            direction: dir,
+        });
+
+        // 6. Log to transfer log (with peer info from session_meta)
+        let (peer_fp, peer_name) = meta.as_ref()
+            .map(|m| (m.peer_fingerprint.as_str(), m.peer_name.as_str()))
+            .unwrap_or(("", ""));
+        self.log_transfer(
+            *session_id,
+            dir, peer_fp, peer_name,
+            Vec::new(), 0, 0,
+            crate::storage::records::TransferRecordState::Cancelled,
+            Some("cancelled by user".into()),
+        ).await;
+
+        tracing::info!("[engine] cancel_transfer: done for session {}", session_id.0);
         Ok(())
     }
 

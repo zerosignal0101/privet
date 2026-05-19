@@ -16,6 +16,28 @@ use crate::protocol::handshake::{self, Accept, ControlMessage, HelloAck, ResumeP
 use crate::session::SessionId;
 use crate::transfer::progress::ProgressTracker;
 
+/// Send Cancel on the control stream and wait for the sender to acknowledge
+/// (keeps the connection alive so the Cancel message is delivered before close).
+async fn send_cancel_and_wait(
+    ctrl_send: &mut quinn::SendStream,
+    ctrl_recv: &mut quinn::RecvStream,
+    session_id: SessionId,
+    reason: &str,
+) {
+    let cancel = ControlMessage::Cancel(handshake::Cancel {
+        session_id,
+        reason: reason.to_owned(),
+    });
+    if let Ok(data) = handshake::serialize(&cancel) {
+        if control::write_control_frame(ctrl_send, &data).await.is_ok() {
+            let _ = ctrl_send.finish();
+        }
+    }
+    // Wait for sender to close after reading Cancel (timeout to avoid blocking forever)
+    let mut buf = [0u8; 1];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), ctrl_recv.read(&mut buf)).await;
+}
+
 /// Receive files from a peer over an accepted QUIC connection.
 pub struct Receiver {
     conn: quinn::Connection,
@@ -30,6 +52,9 @@ pub struct Receiver {
     known_device_store: Arc<tokio::sync::Mutex<KnownDeviceStore>>,
     pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>>,
     pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<PairDecision>>>>,
+    cancel_signals:
+        Arc<RwLock<HashMap<SessionId, std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+    session_meta: Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>>,
 }
 
 impl Receiver {
@@ -45,10 +70,28 @@ impl Receiver {
         known_device_store: Arc<tokio::sync::Mutex<KnownDeviceStore>>,
         pending_incoming: Arc<RwLock<HashMap<SessionId, oneshot::Sender<bool>>>>,
         pending_pairing: Arc<RwLock<HashMap<String, oneshot::Sender<PairDecision>>>>,
+        cancel_signals: Arc<
+            RwLock<HashMap<SessionId, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+        >,
+        session_meta: Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>>,
     ) -> Self {
         let remote_addr = conn.remote_address();
-        Self { conn, remote_addr, download_dir, chunk_size, fingerprint, device_name,
-            trust_store, security_mode, accept_store, known_device_store, pending_incoming, pending_pairing }
+        Self {
+            conn,
+            remote_addr,
+            download_dir,
+            chunk_size,
+            fingerprint,
+            device_name,
+            trust_store,
+            security_mode,
+            accept_store,
+            known_device_store,
+            pending_incoming,
+            pending_pairing,
+            cancel_signals,
+            session_meta,
+        }
     }
 
     /// Record the peer as a known device after trust is established.
@@ -257,6 +300,24 @@ impl Receiver {
         };
         let session_id = offer.session_id;
 
+        // Register cancel signal and metadata so cancel_transfer can interrupt and clean up
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancel_signals
+            .write()
+            .await
+            .insert(session_id, cancel_flag.clone());
+        self.session_meta.write().await.insert(
+            session_id,
+            crate::engine::SessionMeta {
+                direction: crate::session::TransferDirection::Receiving,
+                file_relative_paths: offer.files.files.iter()
+                    .map(|f| f.relative_path.clone())
+                    .collect(),
+                peer_name: hello.device_name.clone(),
+                peer_fingerprint: peer_fingerprint.to_owned(),
+            },
+        );
+
         // Trust check: reject untrusted unless AllowAll
         let is_trusted = self.trust_store.lock().await.trusted_fingerprints().iter().any(|fp| fp == peer_fingerprint);
         if !is_trusted && self.security_mode != SecurityMode::AllowAll {
@@ -365,14 +426,101 @@ impl Receiver {
         let mut files_received = 0usize;
         let mut actual_dests: Vec<PathBuf> = Vec::new();
         while files_received < file_count {
-            let mut data_stream = self.conn.accept_uni().await
-                .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
-            let header_data = control::read_control_frame(&mut data_stream).await?;
+            // Check local cancel flag first
+            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                send_cancel_and_wait(&mut ctrl_send, &mut ctrl_recv, session_id, "cancelled by user").await;
+                let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                    session_id, error: "cancelled by user".into(),
+                    direction: crate::session::TransferDirection::Receiving,
+                });
+                return Err(PrivetError::TransferCancelled);
+            }
+
+            // Wait for the next data stream from the sender.
+            // If accept_uni() fails, check if we have a Cancel message on the
+            // control stream (intentional cancel) or just a dropped connection.
+            let mut data_stream = match self.conn.accept_uni().await {
+                Ok(stream) => stream,
+                Err(_) => {
+                    if let Ok(data) = control::read_control_frame(&mut ctrl_recv).await {
+                        if let Ok(ControlMessage::Cancel(_)) = handshake::deserialize(&data) {
+                            // Acknowledge by finishing our send half
+                            let _ = ctrl_send.finish();
+                            let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                                session_id, error: "sender cancelled the transfer".into(),
+                                direction: crate::session::TransferDirection::Receiving,
+                            });
+                            return Err(PrivetError::TransferCancelled);
+                        }
+                    }
+                    // No Cancel message — sender disconnected or network error
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id, error: "sender disconnected".into(),
+                        direction: crate::session::TransferDirection::Receiving,
+                    });
+                    return Err(PrivetError::Transport(TransportError::ConnectionLost(
+                        "sender disconnected".into(),
+                    )));
+                }
+            };
+
+            let header_data = match control::read_control_frame(&mut data_stream).await {
+                Ok(d) => d,
+                Err(_) => {
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id, error: "sender disconnected".into(),
+                        direction: crate::session::TransferDirection::Receiving,
+                    });
+                    return Err(PrivetError::Transport(TransportError::ConnectionLost(
+                        "sender disconnected".into(),
+                    )));
+                }
+            };
             let stream_header: StreamHeader = data::deserialize_stream_header(&header_data)?;
             files_received += stream_header.files.len();
-            let dests = receive_stream_files(&mut data_stream, &stream_header, &self.download_dir, &tracker, event_tx, session_id, total_size).await?;
+            let dests = receive_stream_files(
+                &mut data_stream, &stream_header, &self.download_dir,
+                &tracker, event_tx, session_id, total_size,
+                Some(&cancel_flag),
+            ).await;
+            let dests = match dests {
+                Ok(d) => d,
+                Err(PrivetError::TransferCancelled) => {
+                    send_cancel_and_wait(&mut ctrl_send, &mut ctrl_recv, session_id, "cancelled by user").await;
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id, error: "cancelled by user".into(),
+                        direction: crate::session::TransferDirection::Receiving,
+                    });
+                    return Err(PrivetError::TransferCancelled);
+                }
+                Err(e) => {
+                    // Before propagating a transport error, check if a Cancel
+                    // message arrived on the control stream (sender cancelled
+                    // while we were in the middle of receiving chunk data).
+                    if let Ok(data) = control::read_control_frame(&mut ctrl_recv).await {
+                        if let Ok(ControlMessage::Cancel(_)) = handshake::deserialize(&data) {
+                            let _ = ctrl_send.finish();
+                            let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                                session_id, error: "sender cancelled the transfer".into(),
+                                direction: crate::session::TransferDirection::Receiving,
+                            });
+                            return Err(PrivetError::TransferCancelled);
+                        }
+                    }
+                    // Network error — notify the UI so the tile doesn't stay stuck
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id, error: "sender disconnected".into(),
+                        direction: crate::session::TransferDirection::Receiving,
+                    });
+                    return Err(e);
+                }
+            };
             actual_dests.extend(dests);
         }
+
+        // Clean up session tracking (transfer completed normally)
+        self.cancel_signals.write().await.remove(&session_id);
+        self.session_meta.write().await.remove(&session_id);
 
         // Build file_records from the actual paths (handles duplicate filenames)
         let actual_file_records: Vec<crate::storage::records::TransferFileRecord> = actual_dests.iter().map(|p| {
@@ -404,6 +552,7 @@ async fn receive_stream_files(
     download_dir: &PathBuf, tracker: &std::sync::Arc<std::sync::Mutex<ProgressTracker>>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     session_id: SessionId, total_size: u64,
+    cancel_flag: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<PathBuf>, PrivetError> {
     let mut actual_dests = Vec::new();
     for file_entry in &stream_header.files {
@@ -430,11 +579,21 @@ async fn receive_stream_files(
         let expected_bytes = file_entry.total_size.saturating_sub(file_entry.start_offset);
         let mut written: u64 = 0;
         while written < expected_bytes {
+            if let Some(flag) = cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PrivetError::TransferCancelled);
+                }
+            }
             let chunk_header_data = control::read_control_frame(data_stream).await
-                .map_err(|_| PrivetError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended early")))?;
+                .map_err(|_| PrivetError::Transport(TransportError::ConnectionLost(
+                    "sender disconnected".into(),
+                )))?;
             let chunk: Chunk = data::deserialize_chunk(&chunk_header_data)?;
             let mut buf = vec![0u8; chunk.length as usize];
-            data_stream.read_exact(&mut buf).await.map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
+            data_stream.read_exact(&mut buf).await
+                .map_err(|_| PrivetError::Transport(TransportError::ConnectionLost(
+                    "sender disconnected".into(),
+                )))?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &buf).await?;
             written += chunk.length as u64;
             let (tx, sp) = { let mut t = tracker.lock().unwrap(); t.record(chunk.length as u64); (t.bytes_transferred(), t.speed_bps()) };

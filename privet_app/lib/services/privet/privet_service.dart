@@ -183,8 +183,8 @@ class PrivetService {
   // File transfer
   // -----------------------------------------------------------------------
 
-  Future<String?> sendFilesToAddr(String addr, List<String> paths) =>
-      _ffiIsolate.sendFilesToAddr(addr, paths);
+  Future<bool> sendFilesStart(String sessionId, String addr, List<String> paths) =>
+      _ffiIsolate.sendFilesStart(sessionId, addr, paths);
 
   Future<String?> sendFilesToName(String name, List<String> paths) =>
       _ffiIsolate.sendFilesToName(name, paths);

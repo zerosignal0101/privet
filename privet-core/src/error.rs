@@ -26,6 +26,9 @@ pub enum PrivetError {
     #[error("transfer rejected: {0}")]
     TransferRejected(String),
 
+    #[error("transfer cancelled")]
+    TransferCancelled,
+
     #[error("disk full: need {needed} bytes, have {available} available")]
     DiskFull { needed: u64, available: u64 },
 

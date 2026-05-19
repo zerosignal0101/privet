@@ -4,6 +4,16 @@ use std::os::raw::{c_char, c_int};
 
 use crate::runtime;
 
+/// Helper macro: unwrap the engine or return an error value.
+macro_rules! engine_or {
+    ($ret:expr) => {
+        match runtime::get_engine() {
+            Some(e) => e,
+            None => return $ret,
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -42,10 +52,7 @@ pub extern "C" fn privet_init(config_json: *const c_char) -> c_int {
         }
     };
 
-    {
-        let mut guard = runtime::get_engine().lock().unwrap();
-        *guard = Some(engine);
-    }
+    runtime::set_engine(engine);
 
     tracing::info!("privet_init: engine created successfully");
     runtime::start_event_loop();
@@ -84,10 +91,7 @@ pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int
         }
     };
 
-    {
-        let mut guard = runtime::get_engine().lock().unwrap();
-        *guard = Some(engine);
-    }
+    runtime::set_engine(engine);
 
     tracing::info!("privet_init_with_defaults: engine created successfully");
     runtime::start_event_loop();
@@ -100,14 +104,7 @@ pub extern "C" fn privet_init_with_defaults(device_name: *const c_char) -> c_int
 pub extern "C" fn privet_start() -> c_int {
     tracing::debug!("privet_start called");
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => {
-            tracing::error!("privet_start: engine not initialized");
-            return -1;
-        }
-    };
+    let engine = engine_or!(-1);
 
     match rt.block_on(engine.start()) {
         Ok(()) => {
@@ -125,8 +122,7 @@ pub extern "C" fn privet_start() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_stop() {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    if let Some(engine) = guard.as_ref() {
+    if let Some(engine) = runtime::get_engine() {
         let _ = rt.block_on(engine.shutdown());
     }
 }
@@ -148,28 +144,26 @@ pub extern "C" fn privet_poll_event() -> *mut c_char {
 // Sending files
 // ---------------------------------------------------------------------------
 
-/// Send files to a peer by address (IP:port string, e.g. "192.168.1.5:53530").
-/// `paths_json` is a JSON array of file path strings.
-/// Returns 0 on success, -1 on failure.
-/// On success, writes the session ID (hyphenated UUID) into `out_session_id`
-/// (must be at least 37 bytes including NUL terminator).
+
+/// Start sending files to a peer by address (non-blocking, pre-generated session_id).
+/// The caller generates the session_id and registers it before calling this,
+/// so there is no race between session registration and Failure events.
 #[unsafe(no_mangle)]
-pub extern "C" fn privet_send_files_to_addr(
+pub extern "C" fn privet_send_files_start(
+    session_id_str: *const c_char,
     addr: *const c_char,
     paths_json: *const c_char,
-    out_session_id: *mut c_char,
 ) -> c_int {
+    let engine = engine_or!(-1);
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
+
+    let sid = match parse_session_id(session_id_str) {
+        Some(s) => s,
         None => return -1,
     };
 
     let addr_str = unsafe {
-        if addr.is_null() {
-            return -1;
-        }
+        if addr.is_null() { return -1; }
         match CStr::from_ptr(addr).to_str() {
             Ok(s) => s,
             Err(_) => return -1,
@@ -181,9 +175,7 @@ pub extern "C" fn privet_send_files_to_addr(
     };
 
     let paths_str = unsafe {
-        if paths_json.is_null() {
-            return -1;
-        }
+        if paths_json.is_null() { return -1; }
         match CStr::from_ptr(paths_json).to_str() {
             Ok(s) => s,
             Err(_) => return -1,
@@ -194,21 +186,11 @@ pub extern "C" fn privet_send_files_to_addr(
         Err(_) => return -1,
     };
 
-    match rt.block_on(engine.send_files_to_addr(addr, paths)) {
-        Ok(session_id) => {
-            if !out_session_id.is_null() {
-                let id_str = session_id.to_string();
-                let bytes = id_str.as_bytes();
-                let len = bytes.len().min(35);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_session_id as *mut u8, len);
-                    *out_session_id.add(len) = 0; // NUL terminate
-                }
-            }
-            0
-        }
-        Err(_) => -1,
-    }
+    rt.spawn(async move {
+        let _ = engine.send_files_to_addr(addr, paths, sid).await;
+    });
+
+    0
 }
 
 /// Send files to a peer by display name.
@@ -221,11 +203,7 @@ pub extern "C" fn privet_send_files_to_name(
     out_session_id: *mut c_char,
 ) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let name_str = unsafe {
         if name.is_null() {
@@ -278,11 +256,7 @@ pub extern "C" fn privet_send_files_to_name(
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_accept_transfer(session_id_str: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let sid = match parse_session_id(session_id_str) {
         Some(s) => s,
@@ -299,11 +273,7 @@ pub extern "C" fn privet_accept_transfer(session_id_str: *const c_char) -> c_int
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_reject_transfer(session_id_str: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let sid = match parse_session_id(session_id_str) {
         Some(s) => s,
@@ -320,11 +290,7 @@ pub extern "C" fn privet_reject_transfer(session_id_str: *const c_char) -> c_int
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_cancel_transfer(session_id_str: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let sid = match parse_session_id(session_id_str) {
         Some(s) => s,
@@ -346,11 +312,7 @@ pub extern "C" fn privet_cancel_transfer(session_id_str: *const c_char) -> c_int
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_trust_peer(fingerprint: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let fp = unsafe {
         if fingerprint.is_null() {
@@ -373,11 +335,7 @@ pub extern "C" fn privet_trust_peer(fingerprint: *const c_char) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_untrust_peer(fingerprint: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let fp = unsafe {
         if fingerprint.is_null() {
@@ -400,11 +358,7 @@ pub extern "C" fn privet_untrust_peer(fingerprint: *const c_char) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_trust_and_accept_peer(fingerprint: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let fp = unsafe {
         if fingerprint.is_null() {
@@ -427,11 +381,7 @@ pub extern "C" fn privet_trust_and_accept_peer(fingerprint: *const c_char) -> c_
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_reject_pairing(fingerprint: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let fp = unsafe {
         if fingerprint.is_null() {
@@ -454,11 +404,7 @@ pub extern "C" fn privet_reject_pairing(fingerprint: *const c_char) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_unaccept_peer(fingerprint: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let fp = unsafe {
         if fingerprint.is_null() {
@@ -485,11 +431,7 @@ pub extern "C" fn privet_unaccept_peer(fingerprint: *const c_char) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_peers() -> *mut c_char {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let peers = rt.block_on(engine.discovered_peers());
     let json = match serde_json::to_string(&peers) {
@@ -505,11 +447,7 @@ pub extern "C" fn privet_get_peers() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_trusted_fingerprints() -> *mut c_char {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let fps = rt.block_on(engine.trusted_fingerprints());
     let json = match serde_json::to_string(&fps) {
@@ -525,11 +463,7 @@ pub extern "C" fn privet_get_trusted_fingerprints() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_accepted_fingerprints() -> *mut c_char {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let fps = rt.block_on(engine.accepted_fingerprints());
     let json = match serde_json::to_string(&fps) {
@@ -545,11 +479,7 @@ pub extern "C" fn privet_get_accepted_fingerprints() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_sessions() -> *mut c_char {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let sessions = rt.block_on(engine.list_sessions());
     let json = match serde_json::to_string(&sessions) {
@@ -564,11 +494,7 @@ pub extern "C" fn privet_get_sessions() -> *mut c_char {
 /// Caller must free the returned string with `privet_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_identity() -> *mut c_char {
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let identity = engine.identity();
     let json = match serde_json::to_string(&serde_json::json!({
@@ -587,11 +513,7 @@ pub extern "C" fn privet_get_identity() -> *mut c_char {
 /// Caller must free the returned string with `privet_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_transfer_history(limit: u32, offset: u32) -> *mut c_char {
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let records = engine.transfer_history(limit as usize, offset as usize);
     let json = match serde_json::to_string(&records) {
@@ -612,11 +534,7 @@ pub extern "C" fn privet_get_transfer_record(session_id_str: *const c_char) -> *
         None => return std::ptr::null_mut(),
     };
 
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let record = engine.transfer_record(&sid);
     let json = match serde_json::to_string(&record) {
@@ -636,11 +554,7 @@ pub extern "C" fn privet_delete_transfer_record(session_id_str: *const c_char) -
         None => return -1,
     };
 
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     match engine.delete_transfer_record(&sid) {
         Ok(()) => 0,
@@ -657,11 +571,7 @@ pub extern "C" fn privet_delete_transfer_record(session_id_str: *const c_char) -
 /// Caller must free the returned string with `privet_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_current_networks() -> *mut c_char {
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let networks = engine.current_networks();
     let json = match serde_json::to_string(&networks) {
@@ -678,11 +588,7 @@ pub extern "C" fn privet_get_current_networks() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_probe_known_devices() -> *mut c_char {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let peers = rt.block_on(engine.probe_known_devices());
     let json = match serde_json::to_string(&peers) {
@@ -698,11 +604,7 @@ pub extern "C" fn privet_probe_known_devices() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_get_known_devices() -> *mut c_char {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return std::ptr::null_mut(),
-    };
+    let engine = engine_or!(std::ptr::null_mut());
 
     let devices = rt.block_on(engine.known_devices());
     let json = match serde_json::to_string(&devices) {
@@ -720,11 +622,7 @@ pub extern "C" fn privet_get_known_devices() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_add_known_device_ip(args_json: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let args_str = unsafe {
         if args_json.is_null() { return -1; }
@@ -771,11 +669,7 @@ pub extern "C" fn privet_add_known_device_ip(args_json: *const c_char) -> c_int 
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_remove_known_device_ip(args_json: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let args_str = unsafe {
         if args_json.is_null() { return -1; }
@@ -812,11 +706,7 @@ pub extern "C" fn privet_remove_known_device_ip(args_json: *const c_char) -> c_i
 #[unsafe(no_mangle)]
 pub extern "C" fn privet_set_network_label(args_json: *const c_char) -> c_int {
     let rt = runtime::get_runtime();
-    let guard = runtime::get_engine().lock().unwrap();
-    let engine = match guard.as_ref() {
-        Some(e) => e,
-        None => return -1,
-    };
+    let engine = engine_or!(-1);
 
     let args_str = unsafe {
         if args_json.is_null() { return -1; }

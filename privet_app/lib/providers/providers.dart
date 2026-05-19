@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -230,6 +231,21 @@ class ActiveTransfersNotifier extends Notifier<Map<String, ActiveTransfer>> {
   Future<bool> rejectTransfer(String sessionId) async {
     final ok = await ref.read(privetServiceProvider).rejectTransfer(sessionId);
     state = Map.from(state)..remove(sessionId);
+    return ok;
+  }
+
+  Future<bool> cancelTransfer(String sessionId) async {
+    final ok = await ref.read(privetServiceProvider).cancelTransfer(sessionId);
+    if (ok) {
+      final existing = state[sessionId];
+      if (existing != null) {
+        state = {
+          ...state,
+          sessionId: existing.copyWith(state: TransferState.cancelled),
+        };
+        _startRemoveTimer(sessionId);
+      }
+    }
     return ok;
   }
 
@@ -827,26 +843,46 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
 
   /// Try to send, handling pairing if the peer is not trusted.
   /// Returns session_id on success, null on unrecoverable failure.
+  /// Generate a v4 UUID string for session identification.
+  String _generateUuid() {
+    final r = Random();
+    final bytes = List<int>.generate(16, (_) => r.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    return '${_hex(bytes[0])}${_hex(bytes[1])}${_hex(bytes[2])}${_hex(bytes[3])}-'
+        '${_hex(bytes[4])}${_hex(bytes[5])}-${_hex(bytes[6])}${_hex(bytes[7])}-'
+        '${_hex(bytes[8])}${_hex(bytes[9])}-${_hex(bytes[10])}${_hex(bytes[11])}'
+        '${_hex(bytes[12])}${_hex(bytes[13])}${_hex(bytes[14])}${_hex(bytes[15])}';
+  }
+
+  String _hex(int v) => v.toRadixString(16).padLeft(2, '0');
+
   Future<String?> send() async {
     if (!state.isReady) return null;
     state = state.copyWith(sending: true, sendError: '', clearPairing: true);
 
     final service = ref.read(privetServiceProvider);
 
-    // First attempt
-    var sessionId = await service.sendFilesToAddr(
+    // Generate session_id on Dart side and register BEFORE starting the
+    // Rust send, so there is no race between event arrival and registration.
+    final sessionId = _generateUuid();
+    ref.read(activeTransfersProvider.notifier).registerSendSession(
+      sessionId,
+      peerName: state.peerName,
+      peerFingerprint: state.peerFingerprint,
+    );
+
+    // First attempt — non-blocking, uses the pre-generated session_id
+    var ok = await service.sendFilesStart(
+      sessionId,
       state.peerAddress!,
       state.filePaths,
     );
 
     // If failed, handle pairing flow — poll for the PairRequest event
-    // (which may arrive asynchronously via the 50ms event poll loop)
-    if (sessionId == null) {
-      state = state.copyWith(
-        sendError: 'Pairing required',
-      );
+    if (!ok) {
+      state = state.copyWith(sendError: 'Pairing required');
 
-      // Poll for the PairRequest to arrive
       PairRequest? pr;
       for (int i = 0; i < 50; i++) {
         await Future.delayed(const Duration(milliseconds: 100));
@@ -866,37 +902,33 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
         return null;
       }
 
-      // Wait for user to accept/reject pairing (Trust button on the card)
       await ref.read(pairingProvider.notifier).waitForResolution;
-
-      // Retry after pairing
-      sessionId = await service.sendFilesToAddr(
-        state.peerAddress!,
-        state.filePaths,
-      );
-    }
-
-    if (sessionId != null) {
+      // Retry after pairing — new session_id
+      final sessionId2 = _generateUuid();
       ref.read(activeTransfersProvider.notifier).registerSendSession(
-        sessionId,
+        sessionId2,
         peerName: state.peerName,
         peerFingerprint: state.peerFingerprint,
       );
-      // Persist file identifiers for history
+      await service.sendFilesStart(
+        sessionId2,
+        state.peerAddress!,
+        state.filePaths,
+      );
+
       if (state.fileIdentifiers.isNotEmpty) {
-        FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
+        FileIdentifierStore.instance.recordIdentifiers(sessionId2, state.fileIdentifiers);
       }
       state = state.copyWith(sending: false, clearPairing: true);
-    } else {
-      state = state.copyWith(
-        sending: false,
-        sendError: 'Failed to start transfer after pairing',
-      );
+      return sessionId2;
     }
+
+    if (state.fileIdentifiers.isNotEmpty) {
+      FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
+    }
+    state = state.copyWith(sending: false, clearPairing: true);
     return sessionId;
   }
-
-  /// Handle pairing decision from within the preparation page.
   Future<bool> trustPeer() async {
     if (state.pairingRequest == null) return false;
     final fp = state.pairingRequest!.peer.fingerprint;

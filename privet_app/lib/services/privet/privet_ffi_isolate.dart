@@ -110,13 +110,16 @@ class PrivetFfiIsolate {
     await _call('stop', {});
   }
 
-  Future<String?> sendFilesToAddr(String addr, List<String> paths) async {
-    final r = await _call('send_files_to_addr', {
+  /// Start sending files with a pre-generated session_id (non-blocking).
+  /// The caller must register the session via [registerSendSession] before
+  /// calling this to avoid a race between session registration and failure events.
+  Future<bool> sendFilesStart(String sessionId, String addr, List<String> paths) async {
+    final r = await _call('send_files_start', {
+      'session_id': sessionId,
       'addr': addr,
       'paths': paths,
     });
-    if (r['ok'] == true) return r['session_id'] as String?;
-    return null;
+    return r['ok'] == true;
   }
 
   Future<String?> sendFilesToName(String name, List<String> paths) async {
@@ -358,8 +361,8 @@ void _handleCommand(PrivetFfi ffi, _FfiCommand cmd) {
         ffi.stop();
         cmd.replyTo.send({'ok': true});
         break;
-      case 'send_files_to_addr':
-        _cmdSendFilesToAddr(ffi, cmd);
+      case 'send_files_start':
+        _cmdSendFilesStart(ffi, cmd);
         break;
       case 'send_files_to_name':
         _cmdSendFilesToName(ffi, cmd);
@@ -462,29 +465,19 @@ void _cmdStart(PrivetFfi ffi, _FfiCommand cmd) {
   cmd.replyTo.send({'ok': result == 0});
 }
 
-void _cmdSendFilesToAddr(PrivetFfi ffi, _FfiCommand cmd) {
+void _cmdSendFilesStart(PrivetFfi ffi, _FfiCommand cmd) {
+  final sessionId = (cmd.args['session_id'] as String).toNativeUtf8();
   final addr = (cmd.args['addr'] as String).toNativeUtf8();
   final paths = cmd.args['paths'] as List<String>;
   final pathsJson = jsonEncode(paths).toNativeUtf8();
-  final outSessionId = calloc<Uint8>(37);
 
   try {
-    final result = ffi.sendFilesToAddr(addr, pathsJson, outSessionId.cast<Utf8>());
-    if (result == 0) {
-      // Read session ID from output buffer
-      var len = 0;
-      while (len < 36 && outSessionId[len] != 0) {
-        len++;
-      }
-      final sessionId = String.fromCharCodes(List.generate(len, (i) => outSessionId[i]));
-      cmd.replyTo.send({'ok': true, 'session_id': sessionId});
-    } else {
-      cmd.replyTo.send({'ok': false, 'error': 'send_files_to_addr returned $result'});
-    }
+    final result = ffi.sendFilesStart(sessionId, addr, pathsJson);
+    cmd.replyTo.send({'ok': result == 0});
   } finally {
+    calloc.free(sessionId);
     calloc.free(addr);
     calloc.free(pathsJson);
-    calloc.free(outSessionId);
   }
 }
 

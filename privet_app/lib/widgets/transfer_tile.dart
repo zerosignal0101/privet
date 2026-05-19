@@ -97,6 +97,12 @@ class _TransferTileState extends ConsumerState<TransferTile> {
       ),
       title: Text('${_directionIcon(t.direction)} Connecting...'),
       subtitle: Text(t.peerName ?? 'Unknown'),
+      trailing: IconButton(
+        icon: const Icon(Icons.stop_circle_outlined, color: Colors.red),
+        tooltip: 'Cancel',
+        onPressed: () => ref.read(activeTransfersProvider.notifier)
+            .cancelTransfer(t.sessionId),
+      ),
     );
   }
 
@@ -166,6 +172,17 @@ class _TransferTileState extends ConsumerState<TransferTile> {
                   fontWeight: FontWeight.w600,
                 ),
               ),
+              const SizedBox(width: 4),
+              IconButton(
+                icon: const Icon(Icons.stop_circle_outlined, size: 20,
+                    color: Colors.red),
+                tooltip: 'Cancel transfer',
+                onPressed: () => ref.read(activeTransfersProvider.notifier)
+                    .cancelTransfer(t.sessionId),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
             ],
           ),
           const SizedBox(height: 8),
@@ -215,12 +232,13 @@ class _TransferTileState extends ConsumerState<TransferTile> {
               child: Text('$_countdown',
                   style: TextStyle(color: Colors.grey.shade500)),
             ),
-          TextButton(
-            onPressed: () {
-              // Resend — will be handled by navigation
-            },
-            child: const Text('Resend'),
-          ),
+          if (t.direction == TransferDirection.sending)
+            TextButton(
+              onPressed: () {
+                // Resend — will be handled by navigation
+              },
+              child: const Text('Resend'),
+            ),
         ],
       ),
     );
