@@ -352,12 +352,33 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   Future<void> _send(BuildContext context, WidgetRef ref) async {
     final sessionId = await ref.read(sendPreparationProvider.notifier).send();
     if (!context.mounted) return;
+
+    // Pop the page and show result
     ref.read(sendPreparationProvider.notifier).reset();
-    Navigator.pop(context);
+
+    // Check error state
+    final err = ref.read(sendPreparationProvider).sendError;
     if (sessionId != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Transfer started')),
-      );
+      // Success: pop to root (home page) so user can monitor progress
+      if (context.mounted) {
+        Navigator.popUntil(context, (route) => route.isFirst);
+      }
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Transfer started')),
+        );
+      }
+    } else if (err != null && err.isNotEmpty) {
+      if (context.mounted) {
+        Navigator.pop(context);
+      }
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Send failed: $err')),
+        );
+      }
+    } else {
+      if (context.mounted) Navigator.pop(context);
     }
   }
 }

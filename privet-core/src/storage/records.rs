@@ -35,6 +35,9 @@ pub struct TransferRecord {
     pub direction: TransferDirection,
     pub peer_fingerprint: String,
     pub peer_name: String,
+    /// The peer's IP:port address at the time of transfer, for Resend/Forward.
+    #[serde(default)]
+    pub peer_address: Option<String>,
     pub files: Vec<TransferFileRecord>,
     pub total_bytes: u64,
     pub bytes_transferred: u64,

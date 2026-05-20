@@ -65,6 +65,7 @@ class TransferHistoryRecord {
   final TransferDirection direction;
   final String peerFingerprint;
   final String peerName;
+  final String? peerAddress;
   final List<TransferFileRecord> files;
   final int totalBytes;
   final int bytesTransferred;
@@ -78,6 +79,7 @@ class TransferHistoryRecord {
     required this.direction,
     this.peerFingerprint = '',
     this.peerName = '',
+    this.peerAddress,
     this.files = const [],
     this.totalBytes = 0,
     this.bytesTransferred = 0,
@@ -98,6 +100,7 @@ class TransferHistoryRecord {
           : TransferDirection.sending,
       peerFingerprint: json['peer_fingerprint'] as String? ?? '',
       peerName: json['peer_name'] as String? ?? '',
+      peerAddress: json['peer_address'] as String?,
       files: rawFiles
           .map((f) => TransferFileRecord.fromJson(f as Map<String, dynamic>))
           .toList(),

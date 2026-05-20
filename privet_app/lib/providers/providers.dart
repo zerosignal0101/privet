@@ -1062,119 +1062,108 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
   String _hex(int v) => v.toRadixString(16).padLeft(2, '0');
 
   Future<String?> send() async {
-    print('[send] send() called, isReady=${state.isReady} filePaths=${state.filePaths.length} peerAddress=${state.peerAddress}');
+    print('[send] send() called');
     if (!state.isReady) return null;
     state = state.copyWith(sending: true, sendError: '', clearPairing: true);
 
     final service = ref.read(privetServiceProvider);
 
-    // Generate session_id on Dart side and register BEFORE starting the
-    // Rust send, so there is no race between event arrival and registration.
-    final sessionId = _generateUuid();
-    ref.read(activeTransfersProvider.notifier).registerSendSession(
-      sessionId,
-      peerName: state.peerName,
-      peerFingerprint: state.peerFingerprint,
-    );
+    // Event-driven outer loop: start send → wait for first signal
+    //   'progress' → transfer started → register session + pop page
+    //   'pair'     → handle pairing → retry
+    //   'fail'     → error
+    while (true) {
+      // Don't register session yet — only on first progress or retry.
+      // This avoids "Transfer failed" stubs on home page when pairing is needed.
+      final sessionId = _generateUuid();
 
-    // Build payload: new format (with relative paths) or old format (just paths)
-    final payload = state.entries.isNotEmpty
-        ? state.entries.map((e) => {
-            'path': e.absolutePath,
-            'relative': e.relativePath,
-          }).toList()
-        : state.filePaths; // old format
+      final payload = state.entries.isNotEmpty
+          ? state.entries.map((e) => {
+              'path': e.absolutePath,
+              'relative': e.relativePath,
+            }).toList()
+          : state.filePaths;
 
-    // First attempt
-    var ok = await service.sendFilesStart(
-      sessionId,
-      state.peerAddress!,
-      payload,
-    );
-    print('[send] sendFilesStart returned ok=$ok');
+      await service.sendFilesStart(sessionId, state.peerAddress!, payload);
+      print('[send] sendFilesStart returned (session=$sessionId)');
 
-    // Wait briefly for a possible PairRequest event (FFI event polling
-    // delay: the Rust engine emits PairRequest BEFORE sendFilesStart
-    // returns, but the event may not have reached PairingNotifier yet).
-    // If PairRequest arrives, enter pairing flow. Otherwise, the send
-    // genuinely succeeded or it's a connection error.
-    final pairNotifier = ref.read(pairingProvider.notifier);
-    bool hadPairRequest = ref.read(pairingProvider).isNotEmpty;
+      final signal = await _pollFirstSignal(sessionId);
 
-    // Quick check: if PairRequest is already pending, go straight to pairing
-    if (!hadPairRequest) {
-      // Wait up to 2 seconds for a potential PairRequest to arrive
-      for (int i = 0; i < 20; i++) {
-        await Future.delayed(const Duration(milliseconds: 100));
-        final p = ref.read(pairingProvider);
-        if (p.isNotEmpty) {
-          hadPairRequest = true;
-          break;
+      switch (signal) {
+        case 'progress':
+          // Data is flowing — register so home page shows progress
+          ref.read(activeTransfersProvider.notifier).registerSendSession(
+            sessionId,
+            peerName: state.peerName,
+            peerFingerprint: state.peerFingerprint,
+          );
+          print('[send] transfer started (session=$sessionId)');
+          state = state.copyWith(sending: false, clearPairing: true);
+          return sessionId;
+
+        case 'pair':
+          print('[send] PairRequest detected, handling pairing');
+          state = state.copyWith(sendError: '');
+
+          final pairingOk = await _waitForPairing();
+          if (!pairingOk) {
+            state = state.copyWith(sending: false, sendError: 'Pairing timed out');
+            return null;
+          }
+          if (state.sendError != null && state.sendError!.isNotEmpty) {
+            state = state.copyWith(sending: false);
+            return null;
+          }
+          print('[send] pairing resolved, retrying send...');
+          continue;
+
+        case 'fail':
+          final err = state.sendError;
+          print('[send] transfer failed: $err');
+          state = state.copyWith(sending: false);
+          return null;
+
+        default:
+          print('[send] timed out waiting for first signal');
+          state = state.copyWith(sending: false, sendError: 'Connection timed out');
+          return null;
+      }
+    }
+  }
+
+  /// Poll for the first signal after sendFilesStart: TransferProgress (data
+  /// flowing), PairRequest (pairing needed), or TransferFailed (error).
+  Future<String> _pollFirstSignal(String sessionId) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 60));
+
+    while (DateTime.now().isBefore(deadline)) {
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      if (ref.read(pairingProvider).isNotEmpty) return 'pair';
+
+      final transfers = ref.read(activeTransfersProvider);
+      if (transfers.containsKey(sessionId)) {
+        final session = transfers[sessionId]!;
+        if (session.isTransferring || session.isCompleted) return 'progress';
+        if (session.isFailed) {
+          // TransferFailed could be "pairing required" — wait briefly
+          // to see if a PairRequest arrives in the next poll cycle.
+          await Future.delayed(const Duration(milliseconds: 300));
+          if (ref.read(pairingProvider).isNotEmpty) return 'pair';
+          return 'fail';
         }
       }
     }
+    return 'timeout';
+  }
 
-    if (!hadPairRequest) {
-      // No PairRequest — either succeeded or connection error
-      if (ok) {
-        print('[send] send succeeded');
-        if (state.fileIdentifiers.isNotEmpty) {
-          FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
-        }
-        state = state.copyWith(sending: false, clearPairing: true);
-        return sessionId;
-      }
-      state = state.copyWith(
-        sending: false,
-        sendError: 'peer is offline or unreachable',
-      );
-      return null;
+  /// Wait for user to trust/reject (pairing list becomes empty).
+  Future<bool> _waitForPairing() async {
+    for (int i = 0; i < 300; i++) {
+      if (ref.read(pairingProvider).isEmpty) return true;
+      await Future.delayed(const Duration(milliseconds: 100));
     }
-
-    // PairRequest was seen — wait for resolution (user trust/reject)
-    state = state.copyWith(sendError: '');
-
-    for (int i = 0; i < 150; i++) {
-      final p = ref.read(pairingProvider);
-      if (p.isEmpty) {
-        print('[send] pairing resolved at poll $i');
-        break;
-      }
-
-      await Future.any([
-        Future.delayed(const Duration(milliseconds: 100)),
-        pairNotifier.waitForResolution,
-      ]);
-    }
-
-    print('[send] pairing done, retrying...');
-
-    // Retry after pairing (new connection, both sides should now trust)
-    final sessionId2 = _generateUuid();
-    ref.read(activeTransfersProvider.notifier).registerSendSession(
-      sessionId2,
-      peerName: state.peerName,
-      peerFingerprint: state.peerFingerprint,
-    );
-    ok = await service.sendFilesStart(
-      sessionId2,
-      state.peerAddress!,
-      payload,
-    );
-
-    if (ok) {
-      if (state.fileIdentifiers.isNotEmpty) {
-        FileIdentifierStore.instance.recordIdentifiers(sessionId2, state.fileIdentifiers);
-      }
-      state = state.copyWith(sending: false, clearPairing: true);
-      return sessionId2;
-    }
-
-    state = state.copyWith(
-      sending: false,
-      sendError: 'Transfer failed after pairing',
-    );
-    return null;
+    return false;
   }
   Future<bool> trustPeer() async {
     final pairing = ref.read(pairingProvider);

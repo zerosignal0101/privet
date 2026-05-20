@@ -43,7 +43,7 @@ pub async fn receive_tcp<S>(
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     cancel_signals: &Arc<RwLock<HashMap<SessionId, Arc<AtomicBool>>>>,
     session_meta: &Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>>,
-) -> Result<(SessionId, String, String, Vec<TransferFileRecord>), PrivetError>
+) -> Result<(SessionId, String, String, Vec<TransferFileRecord>, Option<std::net::SocketAddr>), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -418,7 +418,7 @@ where
     }).collect();
 
     tracing::info!("[tcp-recv] transfer complete for session {session_id}");
-    Ok((session_id, peer_fingerprint, hello.device_name.clone(), file_records))
+    Ok((session_id, peer_fingerprint, hello.device_name.clone(), file_records, peer_listen_addr))
 }
 
 /// Receive data chunks for a single file from the TCP stream.
@@ -675,6 +675,21 @@ where
             },
             code,
         });
+        // Send a Reject so the receiver sees a clean message instead of a
+        // TLS close_notify error when we drop the connection.
+        if let Ok(reject) = handshake::serialize(&ControlMessage::Reject(
+            handshake::Reject {
+                session_id: SessionId(uuid::Uuid::nil()),
+                reason: "pairing required".into(),
+            },
+        )) {
+            let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject).await;
+            // Attempt graceful TLS shutdown (best-effort).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::io::AsyncWriteExt::shutdown(&mut stream),
+            ).await;
+        }
         return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
     }
 
@@ -1414,7 +1429,7 @@ mod tests {
         let recv_result = recv_handle.await.expect("receiver task panicked");
 
         match (&send_result, &recv_result) {
-            (Ok(send_res), Ok((_sid, _fp, _name, file_records))) => {
+            (Ok(send_res), Ok((_sid, _fp, _name, file_records, _peer_addr))) => {
                 assert_eq!(send_res.0, *_sid, "session IDs should match");
                 // Verify the received file
                 assert_eq!(file_records.len(), 1, "should have 1 file record");
@@ -1558,7 +1573,7 @@ mod tests {
         let recv_result = recv_handle.await.expect("recv task");
 
         match (&send_result, &recv_result) {
-            (Ok(send_res), Ok((_sid, _fp, _name, file_records))) => {
+            (Ok(send_res), Ok((_sid, _fp, _name, file_records, _peer_addr))) => {
                 assert_eq!(send_res.0, *_sid, "session IDs should match");
                 assert_eq!(file_records.len(), 1, "should have 1 file");
                 let received_data = std::fs::read(&file_records[0].path).unwrap();

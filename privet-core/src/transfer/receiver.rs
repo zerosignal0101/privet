@@ -152,7 +152,7 @@ impl Receiver {
     pub async fn receive(
         &self,
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
-    ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>), PrivetError> {
+    ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>, Option<std::net::SocketAddr>), PrivetError> {
         let (mut ctrl_send, mut ctrl_recv) = self.conn.accept_bi()
             .await.map_err(|e| TransportError::ConnectionLost(format!("accept-bi: {e}")))?;
 
@@ -268,7 +268,7 @@ impl Receiver {
             // also handle the read error gracefully below.
             if self.conn.close_reason().is_some() {
                 tracing::info!("[quic-recv] pairing resolved but sender closed connection, returning Ok");
-                return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
+                return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new(), peer_listen_addr));
             }
 
             // Try to read Offer — will fail if sender closed the connection.
@@ -281,14 +281,14 @@ impl Receiver {
                     // Sender sent a Reject (pairing needed) instead of Offer.
                     if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&data) {
                         tracing::info!("[quic-recv] sender rejected: {}", rej.reason);
-                        return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
+                        return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new(), peer_listen_addr));
                     }
                     // Sender retried with Offer on this same connection
                     return self.handle_offer(data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx, peer_listen_addr).await;
                 }
                 _ => {
                     tracing::info!("[quic-recv] pairing resolved but no Offer (connection dead or timeout), returning Ok");
-                    return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
+                    return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new(), peer_listen_addr));
                 }
             }
         }
@@ -304,10 +304,10 @@ impl Receiver {
         // Sender may have sent a Reject instead (pairing needed on its side)
         if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&offer_data) {
             tracing::info!("[quic-recv] sender rejected: {}", rej.reason);
-            return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
+            return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new(), peer_listen_addr));
         }
-        let (session_id, fp, device_name, file_records) = self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx, peer_listen_addr).await?;
-        Ok((session_id, fp, device_name, file_records))
+        let (session_id, fp, device_name, file_records, peer_addr) = self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx, peer_listen_addr).await?;
+        Ok((session_id, fp, device_name, file_records, peer_addr))
     }
 
     async fn handle_offer(
@@ -319,7 +319,7 @@ impl Receiver {
         mut ctrl_recv: quinn::RecvStream,
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         peer_listen_addr: Option<std::net::SocketAddr>,
-    ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>), PrivetError> {
+    ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>, Option<std::net::SocketAddr>), PrivetError> {
         let peer_device_name = hello.device_name.clone();
         let offer = match handshake::deserialize(&offer_data)? {
             ControlMessage::Offer(o) => o,
@@ -604,7 +604,7 @@ impl Receiver {
         let _ = ctrl_recv.read(&mut buf).await;
         let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Receiving });
         tracing::info!("[quic-recv] transfer complete for session {session_id}");
-        Ok((session_id, peer_fingerprint.to_owned(), peer_device_name.clone(), actual_file_records))
+        Ok((session_id, peer_fingerprint.to_owned(), peer_device_name.clone(), actual_file_records, peer_listen_addr))
     }
 }
 

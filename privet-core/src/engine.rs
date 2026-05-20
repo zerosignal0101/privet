@@ -302,7 +302,7 @@ impl PrivetEngine {
                                             session_meta,
                                         );
                                         match receiver.receive(&event_tx).await {
-                                            Ok((session_id, _fp, peer_name, file_records)) => {
+                                            Ok((session_id, _fp, peer_name, file_records, _peer_addr)) => {
                                                 if let Some(log) = &transfer_log {
                                                     let now = std::time::SystemTime::now()
                                                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -313,6 +313,7 @@ impl PrivetEngine {
                                                         direction: crate::session::TransferDirection::Receiving,
                                                         peer_fingerprint: _fp,
                                                         peer_name,
+                                                        peer_address: _peer_addr.map(|a| a.to_string()),
                                                         files: file_records,
                                                         total_bytes,
                                                         bytes_transferred: total_bytes,
@@ -433,7 +434,7 @@ impl PrivetEngine {
                                         )
                                         .await
                                         {
-                                            Ok((session_id, fp, peer_name, file_records)) => {
+                                            Ok((session_id, fp, peer_name, file_records, peer_addr)) => {
                                                 if let Some(log) = &tl {
                                                     let now = std::time::SystemTime::now()
                                                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -444,6 +445,7 @@ impl PrivetEngine {
                                                         direction: crate::session::TransferDirection::Receiving,
                                                         peer_fingerprint: fp,
                                                         peer_name,
+                                                        peer_address: peer_addr.map(|a| a.to_string()),
                                                         files: file_records,
                                                         total_bytes,
                                                         bytes_transferred: total_bytes,
@@ -647,6 +649,7 @@ impl PrivetEngine {
                     direction: TransferDirection::Sending,
                     peer_fingerprint: peer_fp.to_owned(),
                     peer_name: peer_name.to_owned(),
+                    peer_address: Some(addr.to_string()),
                     files: file_records.clone(),
                     total_bytes,
                     bytes_transferred: 0,
@@ -782,7 +785,7 @@ impl PrivetEngine {
                             let tcp_peer_listen = tcp_result.3;
                             self.log_transfer(
                                 tcp_session, TransferDirection::Sending, &tcp_fp, &tcp_name,
-                                file_records.clone(), total_bytes, total_bytes,
+                                Some(addr.to_string()), file_records.clone(), total_bytes, total_bytes,
                                 tcp_started_at,
                                 TransferRecordState::Completed, None,
                             ).await;
@@ -795,6 +798,11 @@ impl PrivetEngine {
                         Err(tcp_err) => {
                             self.cancel_signals.write().await.remove(&session_id);
                             self.session_meta.write().await.remove(&session_id);
+                            // Skip logging for PairingRequired (handshake completed,
+                            // PairRequest event carries peer info).
+                            if matches!(&tcp_err, PrivetError::Security(crate::error::SecurityError::PairingRequired)) {
+                                return Err(tcp_err);
+                            }
                             let err_msg = tcp_err.to_string();
                             log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
@@ -805,6 +813,14 @@ impl PrivetEngine {
                             return Err(tcp_err);
                         }
                     }
+                }
+
+                // PairingRequired: the handshake completed but trust check
+                // failed. The PairRequest event already carries the peer's
+                // fingerprint and name (from HelloAck), so skip logging a
+                // "transfer failed" with empty peer info.
+                if matches!(&quic_err, PrivetError::Security(crate::error::SecurityError::PairingRequired)) {
+                    return Err(quic_err);
                 }
 
                 let err_msg = quic_err.to_string();
@@ -834,7 +850,7 @@ impl PrivetEngine {
         // Log
         self.log_transfer(
             session_id, TransferDirection::Sending, &peer_fingerprint, &peer_device_name,
-            file_records, total_bytes, total_bytes, send_started_at,
+            Some(addr.to_string()), file_records, total_bytes, total_bytes, send_started_at,
             TransferRecordState::Completed, None,
         ).await;
 
@@ -872,11 +888,25 @@ impl PrivetEngine {
             listen_addr,
         )?;
 
-        let conn = ep
+        let connecting = ep
             .connect(addr, "privet")
-            .map_err(|e| crate::error::TransportError::Quic(format!("connect: {e}")))?
-            .await
-            .map_err(|e| crate::error::TransportError::Quic(format!("handshake: {e}")))?;
+            .map_err(|e| crate::error::TransportError::Quic(format!("connect: {e}")))?;
+
+        let conn = tokio::time::timeout(
+            self.config.transport.handshake_timeout,
+            connecting,
+        )
+        .await
+        .map_err(|_| {
+            tracing::debug!(
+                "QUIC handshake timed out after {:?}",
+                self.config.transport.handshake_timeout,
+            );
+            PrivetError::ConnectionTimeout
+        })?
+        .map_err(|e| {
+            crate::error::TransportError::Quic(format!("handshake: {e}"))
+        })?;
 
 
         // Register cancel signal and metadata for this send session
@@ -926,6 +956,7 @@ impl PrivetEngine {
         direction: TransferDirection,
         peer_fingerprint: &str,
         peer_name: &str,
+        peer_address: Option<String>,
         files: Vec<TransferFileRecord>,
         total_bytes: u64,
         bytes_transferred: u64,
@@ -943,6 +974,7 @@ impl PrivetEngine {
                 direction,
                 peer_fingerprint: peer_fingerprint.to_owned(),
                 peer_name: peer_name.to_owned(),
+                peer_address,
                 files,
                 total_bytes,
                 bytes_transferred,
@@ -1172,7 +1204,7 @@ impl PrivetEngine {
             .unwrap_or(("", "", Vec::new(), 0, None));
         self.log_transfer(
             *session_id,
-            dir, peer_fp, peer_name,
+            dir, peer_fp, peer_name, None,
             record_files, record_total, 0,
             record_started,
             crate::storage::records::TransferRecordState::Cancelled,

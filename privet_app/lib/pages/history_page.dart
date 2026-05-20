@@ -317,6 +317,7 @@ class _HistoryRecordTile extends ConsumerWidget {
         MaterialPageRoute(
           builder: (_) => SendPreparationPage(
             initialFilePaths: filePaths.isNotEmpty ? filePaths : null,
+            initialPeerAddress: record.peerAddress,
             initialPeerName: record.peerName,
             initialPeerFingerprint: record.peerFingerprint,
           ),
@@ -357,6 +358,7 @@ class _HistoryRecordTile extends ConsumerWidget {
       MaterialPageRoute(
         builder: (_) => SendPreparationPage(
           initialFilePaths: recoveredPaths.isNotEmpty ? recoveredPaths : null,
+          initialPeerAddress: record.peerAddress,
           initialPeerName: record.peerName,
           initialPeerFingerprint: record.peerFingerprint,
         ),
