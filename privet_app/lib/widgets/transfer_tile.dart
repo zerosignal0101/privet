@@ -114,7 +114,11 @@ class _TransferTileState extends ConsumerState<TransferTile> {
 
     // Check if there's a hierarchy to display
     final hasHierarchy = t.files.any((f) => f.relativePath.contains('/'));
-    final treeNodes = hasHierarchy ? buildFileTreeFromPaths(t.files.map((f) => f.relativePath).toList()) : <FileTreeNode>[];
+    final treeNodes = hasHierarchy
+        ? buildFileTreeFromSizedPaths(Map.fromEntries(
+            t.files.map((f) => MapEntry(f.relativePath, f.size)),
+          ))
+        : <FileTreeNode>[];
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -159,6 +163,7 @@ class _TransferTileState extends ConsumerState<TransferTile> {
         child: FileTreeView(
           nodes: treeNodes,
           formatSize: _formatSize,
+          showSizeOnly: true,
         ),
       ),
   ],

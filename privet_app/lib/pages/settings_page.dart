@@ -18,6 +18,13 @@ class SettingsPage extends ConsumerWidget {
     final knownDevices = ref.watch(knownDevicesProvider);
     final currentNetworks = ref.watch(currentNetworksProvider);
 
+    // Name lookup: fingerprint → device_name for Trusted/Auto-Accept display
+    final deviceNames = Map<String, String>.fromEntries(
+      knownDevices
+          .where((d) => d['device_name'] is String && (d['fingerprint'] is String))
+          .map((d) => MapEntry(d['fingerprint'] as String, d['device_name'] as String)),
+    );
+
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: ListView(
@@ -129,18 +136,28 @@ class SettingsPage extends ConsumerWidget {
               child: Text('No trusted devices', style: TextStyle(color: Colors.grey)),
             )
           else
-            ...trusted.map((fp) => ListTile(
-                  dense: true,
-                  leading: const Icon(Icons.verified_user, size: 20),
-                  title: Text(
-                    fp.length > 16 ? '${fp.substring(0, 16)}...' : fp,
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+            ...trusted.map((fp) {
+              final name = deviceNames[fp];
+              return ListTile(
+                dense: true,
+                leading: const Icon(Icons.verified_user, size: 20),
+                title: Text(
+                  name ?? (fp.length > 16 ? '${fp.substring(0, 16)}...' : fp),
+                  style: TextStyle(
+                    fontWeight: name != null ? FontWeight.w500 : null,
+                    fontFamily: name != null ? null : 'monospace',
+                    fontSize: 13,
                   ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.delete_outline, size: 20),
-                    onPressed: () => _confirmUntrust(context, ref, fp),
-                  ),
-                )),
+                ),
+                subtitle: name != null
+                    ? Text(fp, style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.grey))
+                    : null,
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline, size: 20),
+                  onPressed: () => _confirmUntrust(context, ref, fp),
+                ),
+              );
+            }),
 
           const SizedBox(height: 8),
 
@@ -158,18 +175,28 @@ class SettingsPage extends ConsumerWidget {
               child: Text('No auto-accept devices', style: TextStyle(color: Colors.grey)),
             )
           else
-            ...accepted.map((fp) => ListTile(
-                  dense: true,
-                  leading: const Icon(Icons.auto_mode, size: 20),
-                  title: Text(
-                    fp.length > 16 ? '${fp.substring(0, 16)}...' : fp,
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+            ...accepted.map((fp) {
+              final name = deviceNames[fp];
+              return ListTile(
+                dense: true,
+                leading: const Icon(Icons.auto_mode, size: 20),
+                title: Text(
+                  name ?? (fp.length > 16 ? '${fp.substring(0, 16)}...' : fp),
+                  style: TextStyle(
+                    fontWeight: name != null ? FontWeight.w500 : null,
+                    fontFamily: name != null ? null : 'monospace',
+                    fontSize: 13,
                   ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.delete_outline, size: 20),
-                    onPressed: () => _confirmUnaccept(context, ref, fp),
-                  ),
-                )),
+                ),
+                subtitle: name != null
+                    ? Text(fp, style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.grey))
+                    : null,
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline, size: 20),
+                  onPressed: () => _confirmUnaccept(context, ref, fp),
+                ),
+              );
+            }),
 
           const Divider(),
 

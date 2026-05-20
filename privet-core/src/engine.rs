@@ -243,6 +243,7 @@ impl PrivetEngine {
         let security_mode = self.config.security_mode;
         let accept_store = self.accept_store.clone();
         let known_device_store = self.known_device_store.clone();
+        let known_device_store_tcp = known_device_store.clone();
         let pending_incoming = self.pending_incoming.clone();
         let pending_pairing = self.pending_pairing.clone();
         let cancel_signals = self.cancel_signals.clone();
@@ -280,12 +281,13 @@ impl PrivetEngine {
                                     let identity = identity.clone();
                                     let trust_store = trust_store.clone();
                                     let accept_store = accept_store.clone();
-                                    let known_device_store = known_device_store.clone();
                                     let pending_incoming = pending_incoming.clone();
                                     let pending_pairing = pending_pairing.clone();
                                     let cancel_signals = cancel_signals.clone();
                                     let session_meta = session_meta.clone();
                                     let transfer_log = transfer_log.clone();
+                                    let known_device_store_quic = known_device_store.clone();
+                                    let kds_record = known_device_store.clone();
                                     tokio::spawn(async move {
                                         let receiver = crate::transfer::receiver::Receiver::new(
                                             conn,
@@ -297,7 +299,7 @@ impl PrivetEngine {
                                             trust_store,
                                             security_mode,
                                             accept_store,
-                                            known_device_store,
+                                            known_device_store_quic,
                                             pending_incoming,
                                             pending_pairing,
                                             cancel_signals,
@@ -307,25 +309,45 @@ impl PrivetEngine {
                                             Ok((session_id, _fp, peer_name, file_records, _peer_addr)) => {
                                                 if file_records.is_empty() {
                                                     tracing::debug!("[quic-recv] empty file records (handshake rejected?), skipping log");
-                                                } else if let Some(log) = &transfer_log {
-                                                    let now = std::time::SystemTime::now()
-                                                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                                        .map(|d| d.as_secs()).ok();
-                                                    let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
-                                                    let _ = log.append(&crate::storage::records::TransferRecord {
-                                                        session_id,
-                                                        direction: crate::session::TransferDirection::Receiving,
-                                                        peer_fingerprint: _fp,
-                                                        peer_name,
-                                                        peer_address: _peer_addr.map(|a| a.to_string()),
-                                                        files: file_records,
-                                                        total_bytes,
-                                                        bytes_transferred: total_bytes,
-                                                        started_at: None,
-                                                        completed_at: now,
-                                                        state: crate::storage::records::TransferRecordState::Completed,
-                                                        error: None,
-                                                    });
+                                                } else {
+                                                    // Record as known device for future discovery
+                                                    if let Some(ref peer_addr) = _peer_addr {
+                                                        if let std::net::IpAddr::V4(ref v4) = peer_addr.ip() {
+                                                            let subnet = crate::network::subnet_from_addr(
+                                                                &peer_addr.ip(),
+                                                                crate::network::default_prefix_len(v4),
+                                                            );
+                                                            let mut store = kds_record.lock().await;
+                                                            let _ = store.add_or_update_device(
+                                                                _fp.clone(),
+                                                                crate::peer::PeerId(uuid::Uuid::nil()),
+                                                                peer_name.clone(),
+                                                                subnet,
+                                                                *peer_addr,
+                                                                None,
+                                                            );
+                                                        }
+                                                    }
+                                                    if let Some(log) = &transfer_log {
+                                                        let now = std::time::SystemTime::now()
+                                                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                                            .map(|d| d.as_secs()).ok();
+                                                        let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
+                                                        let _ = log.append(&crate::storage::records::TransferRecord {
+                                                            session_id,
+                                                            direction: crate::session::TransferDirection::Receiving,
+                                                            peer_fingerprint: _fp,
+                                                            peer_name,
+                                                            peer_address: _peer_addr.map(|a| a.to_string()),
+                                                            files: file_records,
+                                                            total_bytes,
+                                                            bytes_transferred: total_bytes,
+                                                            started_at: None,
+                                                            completed_at: now,
+                                                            state: crate::storage::records::TransferRecordState::Completed,
+                                                            error: None,
+                                                        });
+                                                    }
                                                 }
                                             }
                                             Err(PrivetError::TransferCancelled) => {
@@ -364,6 +386,7 @@ impl PrivetEngine {
             let tcp_ts = trust_store_tcp.clone();
             let tcp_sm = security_mode;
             let tcp_accept_store = accept_store_tcp.clone();
+            let tcp_known_store = known_device_store_tcp.clone();
             let tcp_pending_incoming = pending_incoming_tcp.clone();
             let tcp_pending_pairing = pending_pairing_tcp.clone();
             let tcp_handle = tokio::spawn(async move {
@@ -397,6 +420,7 @@ impl PrivetEngine {
                                     let cs = cancel_signals_tcp.clone();
                                     let sm = session_meta_tcp.clone();
                                     let tl = transfer_log_tcp.clone();
+                                    let kds = tcp_known_store.clone();
                                     tokio::spawn(async move {
                                         // Peek first byte: probe marker (0x00) vs TLS ClientHello
                                         let mut peek_buf = [0u8; 1];
@@ -442,7 +466,26 @@ impl PrivetEngine {
                                                 if file_records.is_empty() {
                                                     // Empty result (e.g. sender rejected the handshake, retry expected)
                                                     tracing::debug!("[tcp-recv] empty file records (handshake rejected?), skipping log");
-                                                } else if let Some(log) = &tl {
+                                                } else {
+                                                    // Record as known device for future discovery
+                                                    if let Some(ref peer_addr) = peer_addr {
+                                                        if let std::net::IpAddr::V4(ref v4) = peer_addr.ip() {
+                                                            let subnet = crate::network::subnet_from_addr(
+                                                                &peer_addr.ip(),
+                                                                crate::network::default_prefix_len(v4),
+                                                            );
+                                                            let mut store = kds.lock().await;
+                                                            let _ = store.add_or_update_device(
+                                                                fp.clone(),
+                                                                crate::peer::PeerId(uuid::Uuid::nil()),
+                                                                peer_name.clone(),
+                                                                subnet,
+                                                                *peer_addr,
+                                                                None,
+                                                            );
+                                                        }
+                                                    }
+                                                    if let Some(log) = &tl {
                                                     let now = std::time::SystemTime::now()
                                                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                                         .map(|d| d.as_secs()).ok();
@@ -462,6 +505,7 @@ impl PrivetEngine {
                                                         error: None,
                                                     });
                                                 }
+                                            }
                                             }
                                             Err(PrivetError::TransferCancelled) => {
                                                 tracing::info!("TCP receive cancelled");

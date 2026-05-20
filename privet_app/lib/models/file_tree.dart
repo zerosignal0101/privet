@@ -33,6 +33,16 @@ class FileTreeNode {
   }
 }
 
+/// Build a tree from a flat list of relative paths with sizes.
+/// Used for incoming transfer display where file sizes come from the Offer.
+List<FileTreeNode> buildFileTreeFromSizedPaths(Map<String, int> pathSizes) {
+  final pathMap = <String, _RecordEntry>{};
+  for (final entry in pathSizes.entries) {
+    pathMap[entry.key] = _RecordEntry(size: entry.value);
+  }
+  return _buildTreeFromMap(pathMap, '');
+}
+
 /// Build a tree from a flat list of relative paths.
 /// Each path is split by '/' to create nested nodes.
 /// [dirPaths] is an optional set of relative paths that should be treated as directories.

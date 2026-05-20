@@ -12,6 +12,10 @@ class FileTreeView extends StatelessWidget {
   final void Function(String fullPath)? onOpenFile;
   final bool showRemoveButtons;
   final String Function(int bytes)? formatSize;
+  /// When true, always show the node's declared size instead of checking
+  /// whether the file exists on disk (used for incoming transfers where
+  /// files haven't been received yet).
+  final bool showSizeOnly;
 
   const FileTreeView({
     super.key,
@@ -20,6 +24,7 @@ class FileTreeView extends StatelessWidget {
     this.onOpenFile,
     this.showRemoveButtons = false,
     this.formatSize,
+    this.showSizeOnly = false,
   });
 
   @override
@@ -51,6 +56,7 @@ class FileTreeView extends StatelessWidget {
         onRemoveFile: onRemoveFile,
         onOpenFile: onOpenFile,
         formatSize: formatSize,
+        showSizeOnly: showSizeOnly,
       );
     }
     final exists = node.fullPath != null && File(node.fullPath!).existsSync();
@@ -64,7 +70,7 @@ class FileTreeView extends StatelessWidget {
       onOpen: onOpenFile != null && node.fullPath != null && exists
           ? () => onOpenFile!(node.fullPath!)
           : null,
-      fileExists: exists,
+      fileExists: showSizeOnly || exists,
       formatSize: formatSize,
     );
   }
@@ -77,6 +83,7 @@ class _DirectoryNode extends StatefulWidget {
   final void Function(String relativePath)? onRemoveFile;
   final void Function(String fullPath)? onOpenFile;
   final String Function(int bytes)? formatSize;
+  final bool showSizeOnly;
 
   const _DirectoryNode({
     required this.node,
@@ -85,6 +92,7 @@ class _DirectoryNode extends StatefulWidget {
     this.onRemoveFile,
     this.onOpenFile,
     this.formatSize,
+    this.showSizeOnly = false,
   });
 
   @override
@@ -162,6 +170,7 @@ class _DirectoryNodeState extends State<_DirectoryNode> {
           onRemoveFile: widget.onRemoveFile,
           onOpenFile: widget.onOpenFile,
           formatSize: widget.formatSize,
+          showSizeOnly: widget.showSizeOnly,
         ));
       } else {
         final exists = child.fullPath != null && File(child.fullPath!).existsSync();
@@ -175,7 +184,7 @@ class _DirectoryNodeState extends State<_DirectoryNode> {
           onOpen: widget.onOpenFile != null && child.fullPath != null && exists
               ? () => widget.onOpenFile!(child.fullPath!)
               : null,
-          fileExists: exists,
+          fileExists: widget.showSizeOnly || exists,
           formatSize: widget.formatSize,
         ));
       }
