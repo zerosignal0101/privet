@@ -76,9 +76,16 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
             println!("Sending {} file(s) to {addr}...", args.files.len());
 
             let expanded = privet_core::session::expand_paths(&args.files);
-            let session_id = send_to_addr_with_progress(
+            let session_id = match send_to_addr_with_progress(
                 &engine, &mut events, addr, expanded.files, args.non_interactive,
-            ).await?;
+            ).await {
+                Ok(sid) => sid,
+                Err(privet_core::PrivetError::TransferCancelled) => {
+                    println!("\nTransfer cancelled by receiver.");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             println!("\nTransfer complete! Session: {session_id}");
         }
         (false, true) => {
@@ -98,11 +105,18 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
                         println!("Found peer '{}' at {}", peer.name, peer.primary_address().map_or("?".into(), |a| a.to_string()));
                         found = true;
                         println!("Sending {} file(s)...", args.files.len());
-                        let session_id = send_to_peer_with_progress(
+                        match send_to_peer_with_progress(
                             &engine, &mut events, &peer.id, args.files.clone(), args.non_interactive,
-                        ).await?;
-                        println!("\nTransfer complete! Session: {session_id}");
-                        break;
+                        ).await {
+                            Ok(session_id) => {
+                                println!("\nTransfer complete! Session: {session_id}");
+                            }
+                            Err(privet_core::PrivetError::TransferCancelled) => {
+                                println!("\nTransfer cancelled by receiver.");
+                                return Ok(());
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }
@@ -112,10 +126,17 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
                 if let Some(peer) = peers.iter().find(|p| p.name == *name) {
                     found = true;
                     println!("Sending {} file(s) to '{}'...", args.files.len(), name);
-                    let session_id = send_to_peer_with_progress(
+                    match send_to_peer_with_progress(
                         &engine, &mut events, &peer.id, args.files.clone(), args.non_interactive,
-                    ).await?;
-                    println!("\nTransfer complete! Session: {session_id}");
+                    ).await {
+                        Ok(session_id) => {
+                            println!("\nTransfer complete! Session: {session_id}");
+                        }
+                        Err(privet_core::PrivetError::TransferCancelled) => {
+                            println!("\nTransfer cancelled by receiver.");
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 

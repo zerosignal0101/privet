@@ -1,5 +1,7 @@
 use tokio::sync::{mpsc, Semaphore};
 
+use std::net::SocketAddr;
+
 use crate::error::{PrivetError, TransportError};
 use crate::protocol::control;
 use crate::protocol::data::{self, Chunk, StreamFileEntry, StreamHeader};
@@ -17,6 +19,9 @@ pub struct Sender {
     chunk_size: u32,
     fingerprint: String,
     device_name: String,
+    remote_addr: SocketAddr,
+    /// The sender's configured listen port (e.g. 53530), advertised in the Hello message.
+    listen_port: u16,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -26,12 +31,16 @@ impl Sender {
         chunk_size: u32,
         fingerprint: String,
         device_name: String,
+        remote_addr: SocketAddr,
+        listen_port: u16,
     ) -> Self {
         Self {
             conn,
             chunk_size,
             fingerprint,
             device_name,
+            remote_addr,
+            listen_port,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -49,7 +58,7 @@ impl Sender {
     }
 
     /// Execute the full send flow: handshake → trust check → offer → send data (parallel streams).
-    /// Returns (session_id, peer_fingerprint, peer_device_name) on success.
+    /// Returns (session_id, peer_fingerprint, peer_device_name, peer_listen_addr) on success.
     pub async fn send(
         &self,
         session_id: SessionId,
@@ -57,7 +66,7 @@ impl Sender {
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         trusted_fingerprints: &[String],
         security_mode: &crate::config::SecurityMode,
-    ) -> Result<(SessionId, String, String), PrivetError> {
+    ) -> Result<(SessionId, String, String, Option<SocketAddr>), PrivetError> {
         if self.is_cancelled() {
             return Err(PrivetError::TransferCancelled);
         }
@@ -70,13 +79,14 @@ impl Sender {
             .await
             .map_err(|e| TransportError::ConnectionLost(format!("step1: {e}")))?;
 
-        // 2. Send Hello with our fingerprint
-        tracing::debug!("[sender] sending Hello");
+        // 2. Send Hello with our fingerprint and listen port
+        tracing::debug!("[sender] sending Hello listen_port={}", self.listen_port);
         let hello = ControlMessage::Hello(Hello {
             version: handshake::PROTOCOL_VERSION,
             device_name: self.device_name.clone(),
             platform: std::env::consts::OS.to_owned(),
             fingerprint: self.fingerprint.clone(),
+            listen_port: Some(self.listen_port),
         });
         let hello_data = handshake::serialize(&hello)?;
         control::write_control_frame(&mut ctrl_send, &hello_data)
@@ -101,6 +111,12 @@ impl Sender {
         };
         let peer_fingerprint = hello_ack.fingerprint;
         let peer_device_name = hello_ack.device_name;
+        // Build the peer's listening address from the connection's remote IP
+        // (the IP we connected to) and the peer's advertised listen port.
+        let peer_listen_addr = hello_ack.listen_port
+            .map(|port| SocketAddr::new(self.remote_addr.ip(), port));
+        tracing::debug!("[sender] received HelloAck listen_port={:?} → peer_listen_addr={:?}",
+            hello_ack.listen_port, peer_listen_addr);
 
         // 3c. Verify HelloAck fingerprint matches TLS certificate (MITM protection)
         // Extract fingerprint eagerly and drop the Box<dyn Any> before any .await.
@@ -145,11 +161,14 @@ impl Sender {
                 ).await;
             }
             let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
+            // Use the peer's advertised listen address (from HelloAck) if available,
+            // otherwise fall back to the connection's remote address.
+            let pairing_addr = peer_listen_addr.unwrap_or(self.remote_addr);
             let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
                 peer: crate::peer::PeerInfo {
                     id: crate::peer::PeerId(uuid::Uuid::nil()),
                     name: self.device_name.clone(),
-                    addresses: vec![],
+                    addresses: vec![pairing_addr],
                     fingerprint: peer_fingerprint.clone(),
                     is_trusted: false,
                     last_seen: std::time::SystemTime::now(),
@@ -364,7 +383,7 @@ impl Sender {
         tracing::info!("[sender] transfer complete for session {session_id}");
         let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Sending });
 
-        Ok((session_id, peer_fingerprint, peer_device_name))
+        Ok((session_id, peer_fingerprint, peer_device_name, peer_listen_addr))
     }
 }
 

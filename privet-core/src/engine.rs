@@ -224,7 +224,8 @@ impl PrivetEngine {
             self.config.security_mode, self.config.download_dir);
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
 
-        let listen_addr: SocketAddr = format!("0.0.0.0:{}", self.config.transport.listen_port)
+        let listen_port = self.config.transport.listen_port;
+        let listen_addr: SocketAddr = format!("0.0.0.0:{listen_port}")
             .parse()
             .map_err(|e: std::net::AddrParseError| PrivetError::Transport(
                 crate::error::TransportError::Quic(e.to_string())
@@ -286,10 +287,11 @@ impl PrivetEngine {
                                     tokio::spawn(async move {
                                         let receiver = crate::transfer::receiver::Receiver::new(
                                             conn,
-                                            download_dir,
+                                            download_dir.clone(),
                                             chunk_size,
                                             identity.fingerprint.clone(),
                                             identity.device_name.clone(),
+                                            listen_port,
                                             trust_store,
                                             security_mode,
                                             accept_store,
@@ -352,6 +354,7 @@ impl PrivetEngine {
             let tcp_ev = self.event_tx.clone();
             let tcp_dl = self.config.download_dir.clone();
             let tcp_ck = self.config.transport.chunk_size;
+            let tcp_lp = listen_port;
             let tcp_id = self.identity.clone();
             let tcp_ts = trust_store_tcp.clone();
             let tcp_sm = security_mode;
@@ -381,6 +384,7 @@ impl PrivetEngine {
                                     let ts = tcp_ts.clone();
                                     let aa = tcp_sm;
                                     let ck = tcp_ck;
+                                    let lp = tcp_lp;
                                     let as_ = tcp_accept_store.clone();
                                     let pi = tcp_pending_incoming.clone();
                                     let pp = tcp_pending_pairing.clone();
@@ -423,8 +427,8 @@ impl PrivetEngine {
 
                                         let tf = ts.lock().await.trusted_fingerprints();
                                         match crate::transfer::tcp_transport::receive_tcp(
-                                            tls_stream, dl, ck, &id, &tf, &aa,
-                                            tls_fp.as_deref(), as_, &*pi, &*pp, &ev,
+                                            tls_stream, dl, ck, lp, &id, &tf, &aa,
+                                            tls_fp.as_deref(), Some(addr), as_, &*pi, &*pp, &ev,
                                             &cs, &sm,
                                         )
                                         .await
@@ -662,7 +666,7 @@ impl PrivetEngine {
             self.try_send_quic(session_id, addr, &files, &trusted, &self.config.security_mode, &file_records, total_bytes).await
         };
 
-        let (session_id, peer_fingerprint, peer_device_name) = match quic_result {
+        let (session_id, peer_fingerprint, peer_device_name, peer_listen_addr) = match quic_result {
             Ok(r) => r,
             Err(quic_err) => {
                 let is_tcp_candidate = matches!(
@@ -758,6 +762,8 @@ impl PrivetEngine {
                         addr,
                         files.clone(),
                         self.config.transport.chunk_size,
+                        self.config.transport.listen_port,
+                        session_id,
                         &self.identity,
                         &trusted,
                         &self.config.security_mode,
@@ -773,14 +779,16 @@ impl PrivetEngine {
                             let tcp_session = tcp_result.0;
                             let tcp_fp = tcp_result.1;
                             let tcp_name = tcp_result.2;
+                            let tcp_peer_listen = tcp_result.3;
                             self.log_transfer(
                                 tcp_session, TransferDirection::Sending, &tcp_fp, &tcp_name,
                                 file_records.clone(), total_bytes, total_bytes,
                                 tcp_started_at,
                                 TransferRecordState::Completed, None,
                             ).await;
-                            self.record_to_known_devices(&tcp_fp, &addr, &tcp_name).await;
-                            self.emit_pairing_if_needed(&tcp_fp, &addr).await;
+                            let record_addr = tcp_peer_listen.unwrap_or(addr);
+                            self.record_to_known_devices(&tcp_fp, &record_addr, &tcp_name).await;
+                            self.emit_pairing_if_needed(&tcp_fp, &record_addr).await;
                             self.track_session(tcp_session).await;
                             return Ok(tcp_session);
                         }
@@ -830,11 +838,12 @@ impl PrivetEngine {
             TransferRecordState::Completed, None,
         ).await;
 
-        // Auto-record to known device store
-        self.record_to_known_devices(&peer_fingerprint, &addr, &peer_device_name).await;
+        // Auto-record to known device store (use peer's advertised listen address if available)
+        let record_addr = peer_listen_addr.unwrap_or(addr);
+        self.record_to_known_devices(&peer_fingerprint, &record_addr, &peer_device_name).await;
 
-        // Pairing flow
-        self.emit_pairing_if_needed(&peer_fingerprint, &addr).await;
+        // Pairing flow (use peer's listen address for the event)
+        self.emit_pairing_if_needed(&peer_fingerprint, &record_addr).await;
 
         // Track session
         self.track_session(session_id).await;
@@ -842,7 +851,8 @@ impl PrivetEngine {
         Ok(session_id)
     }
 
-    /// Try QUIC transport: connect and send. Returns (session_id, peer_fingerprint, peer_device_name).
+    /// Try QUIC transport: connect and send.
+    /// Returns (session_id, peer_fingerprint, peer_device_name, peer_listen_addr).
     async fn try_send_quic(
         &self,
         session_id: SessionId,
@@ -852,7 +862,7 @@ impl PrivetEngine {
         security_mode: &crate::config::SecurityMode,
         file_records: &[crate::storage::records::TransferFileRecord],
         total_bytes: u64,
-    ) -> Result<(SessionId, String, String)> {
+    ) -> Result<(SessionId, String, String, Option<SocketAddr>)> {
         let client_config = tls::build_client_config(&self.identity, trusted)?;
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
@@ -895,6 +905,8 @@ impl PrivetEngine {
             self.config.transport.chunk_size,
             self.identity.fingerprint.clone(),
             self.identity.device_name.clone(),
+            addr,
+            self.config.transport.listen_port,
         );
         sender.set_cancel_flag(cancel_flag);
 
@@ -1005,6 +1017,20 @@ impl PrivetEngine {
             None,
         ) {
             tracing::warn!("Failed to record known device: {e}");
+        }
+    }
+
+    /// Look up a peer by fingerprint in the discovered peers map and
+    /// record it as a known device if we have an address.
+    async fn record_known_peer(&self, fingerprint: &str) {
+        let found = {
+            let peers = self.peers.read().await;
+            peers.values()
+                .find(|p| p.fingerprint == fingerprint)
+                .and_then(|p| p.primary_address().map(|a| (a, p.name.clone())))
+        };
+        if let Some((peer_addr, name)) = found {
+            self.record_to_known_devices(fingerprint, &peer_addr, &name).await;
         }
     }
 
@@ -1160,11 +1186,14 @@ impl PrivetEngine {
     /// Trust a peer by fingerprint.
     /// If there is a pending pairing request for this fingerprint,
     /// it will be resolved with PairDecision::Trust.
+    /// If the peer is in the discovered peers map, also records it as a known device.
     pub async fn trust_peer(&self, fingerprint: &str) -> Result<()> {
         self.trust_store.lock().await.trust(fingerprint.to_owned())?;
         if let Some(tx) = self.pending_pairing.write().await.remove(fingerprint) {
             let _ = tx.send(PairDecision::Trust);
         }
+        // Record as known device if we have peer info
+        self.record_known_peer(fingerprint).await;
         Ok(())
     }
 
@@ -1175,6 +1204,8 @@ impl PrivetEngine {
         if let Some(tx) = self.pending_pairing.write().await.remove(fingerprint) {
             let _ = tx.send(PairDecision::TrustAndAccept);
         }
+        // Record as known device if we have peer info
+        self.record_known_peer(fingerprint).await;
         Ok(())
     }
 

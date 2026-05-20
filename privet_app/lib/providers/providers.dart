@@ -287,6 +287,8 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
   StreamSubscription<PrivetEvent>? _sub;
   Completer<void>? _resolutionCompleter;
   bool _pendingResolution = false;
+  /// Cache the most recent peer info per fingerprint for known-device recording.
+  final Map<String, _CachedPeerInfo> _cachedPeers = {};
 
   @override
   List<PairRequest> build() {
@@ -304,6 +306,12 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
       if (!state.any((p) => p.peer.fingerprint == event.peer!.fingerprint)) {
         _resolutionCompleter = Completer<void>();
         state = [...state, PairRequest(event.peer!, event.pairingCode!)];
+        debugPrint('[pairing] _onEvent: type=${event.type} name=${event.peer!.name} addrs=${event.peer!.addresses}');
+        // Cache peer info for known-device recording
+        _cachedPeers[event.peer!.fingerprint] = _CachedPeerInfo(
+          name: event.peer!.name,
+          addresses: event.peer!.addresses,
+        );
       }
     }
   }
@@ -344,6 +352,8 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
     if (ok) {
       _resolve(fingerprint);
       ref.read(trustedListProvider.notifier).refresh();
+      debugPrint('[pairing] refreshing known devices after trust');
+      ref.read(knownDevicesProvider.notifier).refresh();
     }
     return ok;
   }
@@ -357,6 +367,8 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
       _resolve(fingerprint);
       ref.read(trustedListProvider.notifier).refresh();
       ref.read(acceptedListProvider.notifier).refresh();
+      debugPrint('[pairing] refreshing known devices after trust+accept');
+      ref.read(knownDevicesProvider.notifier).refresh();
     }
     return ok;
   }
@@ -375,6 +387,12 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
 
 final pairingProvider =
     NotifierProvider<PairingNotifier, List<PairRequest>>(PairingNotifier.new);
+
+class _CachedPeerInfo {
+  final String name;
+  final List<String> addresses;
+  const _CachedPeerInfo({required this.name, required this.addresses});
+}
 
 // ---------------------------------------------------------------------------
 // IncomingTransfer (kept for backward compat, reads from ActiveTransfersNotifier)
@@ -505,12 +523,14 @@ class Settings {
   final String downloadDir;
   final String securityMode;
   final bool enableTcpFallback;
+  final int listenPort;
 
   const Settings({
     this.deviceName = 'Privet',
     this.downloadDir = '',
     this.securityMode = 'trust_required',
     this.enableTcpFallback = true,
+    this.listenPort = 53530,
   });
 
   Settings copyWith({
@@ -518,12 +538,14 @@ class Settings {
     String? downloadDir,
     String? securityMode,
     bool? enableTcpFallback,
+    int? listenPort,
   }) =>
       Settings(
         deviceName: deviceName ?? this.deviceName,
         downloadDir: downloadDir ?? this.downloadDir,
         securityMode: securityMode ?? this.securityMode,
         enableTcpFallback: enableTcpFallback ?? this.enableTcpFallback,
+        listenPort: listenPort ?? this.listenPort,
       );
 }
 
@@ -544,6 +566,7 @@ class SettingsNotifier extends Notifier<Settings> {
       downloadDir: prefs.getString('download_dir') ?? '',
       securityMode: prefs.getString('security_mode') ?? 'trust_required',
       enableTcpFallback: prefs.getBool('enable_tcp_fallback') ?? true,
+      listenPort: prefs.getInt('listen_port') ?? 53530,
     );
     _readyCompleter.complete();
   }
@@ -570,6 +593,12 @@ class SettingsNotifier extends Notifier<Settings> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('enable_tcp_fallback', value);
     state = state.copyWith(enableTcpFallback: value);
+  }
+
+  Future<void> setListenPort(int port) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('listen_port', port);
+    state = state.copyWith(listenPort: port);
   }
 }
 
@@ -1148,13 +1177,13 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     return null;
   }
   Future<bool> trustPeer() async {
-    // Get fingerprint from PairingNotifier (not state.pairingRequest)
-    // to handle the case where send() hasn't set state.pairingRequest yet.
     final pairing = ref.read(pairingProvider);
     if (pairing.isEmpty) return false;
     final fp = pairing.last.peer.fingerprint;
     final ok = await ref.read(pairingProvider.notifier).trust(fp);
-    if (ok) state = state.copyWith(clearPairing: true);
+    if (ok) {
+      state = state.copyWith(clearPairing: true);
+    }
     return ok;
   }
 
@@ -1163,7 +1192,9 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     if (pairing.isEmpty) return false;
     final fp = pairing.last.peer.fingerprint;
     final ok = await ref.read(pairingProvider.notifier).trustAndAccept(fp);
-    if (ok) state = state.copyWith(clearPairing: true);
+    if (ok) {
+      state = state.copyWith(clearPairing: true);
+    }
     return ok;
   }
 

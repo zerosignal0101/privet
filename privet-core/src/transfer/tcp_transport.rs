@@ -31,10 +31,12 @@ pub async fn receive_tcp<S>(
     mut stream: S,
     download_dir: PathBuf,
     _chunk_size: u32,
+    listen_port: u16,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
     security_mode: &crate::config::SecurityMode,
     tls_peer_fingerprint: Option<&str>,
+    remote_addr: Option<std::net::SocketAddr>,
     accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
     pending_incoming: &RwLock<HashMap<SessionId, oneshot::Sender<bool>>>,
     pending_pairing: &RwLock<HashMap<String, oneshot::Sender<crate::engine::PairDecision>>>,
@@ -45,7 +47,7 @@ pub async fn receive_tcp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let remote_addr: Option<std::net::SocketAddr> = None;
+    use std::net::SocketAddr;
 
     // 1. Read Hello
     let (_, hello_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
@@ -61,6 +63,14 @@ where
         }
     };
     let peer_fingerprint = hello.fingerprint.clone();
+    // Build the peer's listening address from the connection's remote IP
+    // (the IP the sender connected from) and their advertised listen port.
+    let peer_listen_addr = hello.listen_port
+        .and_then(|port| remote_addr.map(|a| std::net::SocketAddr::new(a.ip(), port)));
+    if peer_listen_addr.is_some() {
+        tracing::debug!("[tcp-recv] hello listen_port={:?} → peer_listen_addr={:?}",
+            hello.listen_port, peer_listen_addr);
+    }
 
     // 1b. If TLS is active, verify Hello fingerprint matches TLS certificate
     if let Some(tls_fp) = tls_peer_fingerprint {
@@ -71,11 +81,12 @@ where
         }
     }
 
-    // 2. Send HelloAck immediately (sender needs our fingerprint for trust check)
+    // 2. Send HelloAck with our listen port
     let hello_ack = ControlMessage::HelloAck(HelloAck {
         version: handshake::PROTOCOL_VERSION, accepted: true,
         fingerprint: identity.fingerprint.clone(),
         device_name: identity.device_name.clone(),
+        listen_port: Some(listen_port),
     });
     crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &handshake::serialize(&hello_ack)?).await?;
 
@@ -91,12 +102,16 @@ where
         if !already_pending {
             let code =
                 crate::security::trust::TrustStore::pairing_code(&identity.fingerprint, &peer_fingerprint);
+            let pairing_addr = peer_listen_addr
+                .or_else(|| remote_addr)
+                .map(|a| vec![a])
+                .unwrap_or_default();
             let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
                 session_id: SessionId(uuid::Uuid::nil()),
                 peer: crate::peer::PeerInfo {
                     id: crate::peer::PeerId(uuid::Uuid::nil()),
                     name: hello.device_name.clone(),
-                    addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
+                    addresses: pairing_addr,
                     fingerprint: peer_fingerprint.clone(),
                     is_trusted: false,
                     last_seen: std::time::SystemTime::now(),
@@ -195,6 +210,12 @@ where
         return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
     }
 
+    // Use the peer's advertised listen address for events, falling back to connection remote_addr.
+    let addr_for_events: Vec<SocketAddr> = peer_listen_addr
+        .into_iter()
+        .chain(remote_addr.into_iter())
+        .collect();
+
     // 5b. AwaitAccept: if Strict mode and NOT in accept_store, wait for user decision
     if *security_mode == crate::config::SecurityMode::Strict
         && !accept_store.lock().await.is_accepted(&peer_fingerprint) {
@@ -206,7 +227,7 @@ where
             peer: crate::peer::PeerInfo {
                 id: crate::peer::PeerId(uuid::Uuid::nil()),
                 name: hello.device_name.clone(),
-                addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
+                addresses: addr_for_events.clone(),
                 fingerprint: peer_fingerprint.clone(),
                 is_trusted: true,
                 last_seen: std::time::SystemTime::now(),
@@ -244,7 +265,7 @@ where
         peer: crate::peer::PeerInfo {
             id: crate::peer::PeerId(uuid::Uuid::nil()),
             name: hello.device_name.clone(),
-            addresses: remote_addr.map(|a| vec![a]).unwrap_or_default(),
+            addresses: addr_for_events.clone(),
             fingerprint: peer_fingerprint.clone(),
             is_trusted: true,
             last_seen: std::time::SystemTime::now(),
@@ -315,7 +336,7 @@ where
     let total_size = offer.total_size;
     let tracker = std::sync::Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
 
-    let dest_paths = receive_tcp_files(
+    let dest_paths = match receive_tcp_files(
         &mut stream,
         &offer.files.files,
         &download_dir,
@@ -325,7 +346,42 @@ where
         total_size,
         Some(&cancel_flag),
     )
-    .await?;
+    .await
+    {
+        Ok(paths) => paths,
+        Err(PrivetError::TransferCancelled) => {
+            tracing::info!("[tcp-recv] transfer cancelled, draining incoming data for 500ms to keep TCP buffer flowing...");
+            // Read and discard incoming data for up to 500ms.  Without this, the
+            // TCP receive buffer fills up during the sleep, the sender's writes
+            // block and eventually fail with WSAECONNABORTED before it can read
+            // the Cancel frame via the per-chunk non-blocking poll.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut discard_buf = [0u8; 65536];
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    tokio::io::AsyncReadExt::read(&mut stream, &mut discard_buf),
+                ).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break, // EOF or timeout → sender is done
+                    Ok(Ok(_n)) => {} // discarded, continue draining
+                }
+            }
+            tracing::info!("[tcp-recv] drain done, starting graceful TLS shutdown...");
+            let shutdown_result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::io::AsyncWriteExt::shutdown(&mut stream),
+            ).await;
+            tracing::info!("[tcp-recv] TLS shutdown result: {:?}", shutdown_result);
+            cleanup_session().await;
+            tracing::info!("[tcp-recv] cleanup done, returning TransferCancelled");
+            return Err(PrivetError::TransferCancelled);
+        }
+        Err(e) => return Err(e),
+    };
 
     // 11. Read Complete
     let (_, complete_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
@@ -365,10 +421,126 @@ where
     Ok((session_id, peer_fingerprint, hello.device_name.clone(), file_records))
 }
 
+/// Receive data chunks for a single file from the TCP stream.
+/// On error, the partial file at `dest` is deleted before returning.
+async fn receive_one_file_tcp<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    file_info: &handshake::FileInfo,
+    file_idx: usize,
+    mut file: tokio::fs::File,
+    tracker: &std::sync::Arc<std::sync::Mutex<ProgressTracker>>,
+    event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
+    session_id: SessionId,
+    total_size: u64,
+    cancel_flag: Option<&Arc<AtomicBool>>,
+) -> Result<(), PrivetError> {
+    let expected_bytes = file_info.size;
+    let mut written: u64 = 0;
+
+    while written < expected_bytes {
+        // Check local cancel flag
+        if let Some(ref flag) = cancel_flag {
+            if flag.load(Ordering::SeqCst) {
+                let cancel = ControlMessage::Cancel(handshake::Cancel {
+                    session_id,
+                    reason: "cancelled by user".into(),
+                });
+                if let Ok(data) = handshake::serialize(&cancel) {
+                    tracing::info!("[tcp-recv] sending Cancel frame to sender");
+                    if let Err(e) = crate::transport::tcp_fallback::write_frame(stream, CONTROL_STREAM, &data).await {
+                        tracing::warn!("[tcp-recv] Cancel frame write failed: {e}");
+                    } else {
+                        tracing::info!("[tcp-recv] Cancel frame sent successfully");
+                    }
+                }
+                let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                    session_id,
+                    error: "cancelled by user".into(),
+                    direction: crate::session::TransferDirection::Receiving,
+                });
+                return Err(PrivetError::TransferCancelled);
+            }
+        }
+
+        let (sid, frame_data) = match crate::transport::tcp_fallback::read_frame(stream).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("[tcp-recv] read_frame failed (sender disconnected?): {e}");
+                return Err(PrivetError::Transport(e));
+            }
+        };
+
+        // Check for Cancel control message from sender
+        if sid == CONTROL_STREAM {
+            if let Ok(ControlMessage::Cancel(_)) = handshake::deserialize(&frame_data) {
+                let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                    session_id,
+                    error: "cancelled by sender".into(),
+                    direction: crate::session::TransferDirection::Receiving,
+                });
+                return Err(PrivetError::TransferCancelled);
+            }
+            return Err(crate::error::ProtocolError::UnexpectedMessage {
+                expected: "data frame".into(),
+                got: format!("control stream_id={sid}"),
+            }.into());
+        }
+
+        if sid != DATA_STREAM {
+            return Err(crate::error::ProtocolError::UnexpectedMessage {
+                expected: "data frame".into(),
+                got: format!("stream_id={sid}"),
+            }.into());
+        }
+
+        let (chunk, payload) = postcard::take_from_bytes::<Chunk>(&frame_data)
+            .map_err(|e| crate::error::ProtocolError::InvalidMessage(e.to_string()))?;
+
+        if payload.len() != chunk.length as usize {
+            return Err(TransportError::TcpFallback(format!(
+                "chunk length mismatch: header says {}, payload is {}",
+                chunk.length,
+                payload.len()
+            )).into());
+        }
+
+        if chunk.path_index != file_idx as u16 {
+            tracing::warn!(
+                "tcp chunk path_index mismatch: expected {file_idx}, got {}",
+                chunk.path_index
+            );
+        }
+
+        tokio::io::AsyncWriteExt::write_all(&mut file, payload).await?;
+        written += chunk.length as u64;
+
+        let bytes_so_far = {
+            let mut t = tracker.lock().unwrap();
+            t.record(chunk.length as u64);
+            (t.bytes_transferred(), t.speed_bps())
+        };
+
+        let _ = event_tx.send(crate::engine::PrivetEvent::TransferProgress {
+            session_id,
+            progress: crate::session::TransferProgress {
+                total_bytes: total_size,
+                bytes_transferred: bytes_so_far.0,
+                current_speed_bps: bytes_so_far.1,
+                per_file: vec![],
+            },
+            direction: crate::session::TransferDirection::Receiving,
+        });
+    }
+
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
+}
+
 /// Read data chunks for all files from the TCP stream.
 /// Files are sent sequentially (file 0, then file 1, ...).
 /// Each data frame = postcard-encoded Chunk + raw chunk payload bytes.
 /// Returns the list of actual destination paths (may differ from relative paths due to dedup).
+/// Partial files are automatically cleaned up on any error.
 async fn receive_tcp_files<S>(
     stream: &mut S,
     files: &[handshake::FileInfo],
@@ -396,103 +568,20 @@ where
         let base = download_dir.join(&file_info.relative_path);
         let pair = crate::transfer::receiver::open_file_atomic(&base).await?;
         let dest = pair.0;
-        let mut file = pair.1;
+        let file = pair.1;
 
-        let expected_bytes = file_info.size;
-        let mut written: u64 = 0;
-
-        while written < expected_bytes {
-            // Check local cancel flag
-            if let Some(ref flag) = cancel_flag {
-                if flag.load(Ordering::SeqCst) {
-                    // Send Cancel on the control stream
-                    let cancel = ControlMessage::Cancel(handshake::Cancel {
-                        session_id,
-                        reason: "cancelled by user".into(),
-                    });
-                    if let Ok(data) = handshake::serialize(&cancel) {
-                        let _ = crate::transport::tcp_fallback::write_frame(stream, CONTROL_STREAM, &data).await;
-                    }
-                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
-                        session_id,
-                        error: "cancelled by user".into(),
-                        direction: crate::session::TransferDirection::Receiving,
-                    });
-                    return Err(PrivetError::TransferCancelled);
-                }
+        match receive_one_file_tcp(
+            stream, file_info, file_idx, file,
+            tracker, event_tx, session_id, total_size, cancel_flag,
+        ).await {
+            Ok(()) => dest_paths.push(dest),
+            Err(e) => {
+                // Clean up the partial file: close handle (already dropped in helper) then delete
+                let _ = tokio::fs::remove_file(&dest).await;
+                tracing::debug!("[tcp-recv] error, cleaned up partial file {:?}: {e}", dest);
+                return Err(e);
             }
-
-            let (sid, frame_data) =
-                crate::transport::tcp_fallback::read_frame(stream).await?;
-
-            // Check for Cancel control message from sender
-            if sid == CONTROL_STREAM {
-                if let Ok(ControlMessage::Cancel(_)) = handshake::deserialize(&frame_data) {
-                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
-                        session_id,
-                        error: "cancelled by sender".into(),
-                        direction: crate::session::TransferDirection::Receiving,
-                    });
-                    return Err(PrivetError::TransferCancelled);
-                }
-                return Err(crate::error::ProtocolError::UnexpectedMessage {
-                    expected: "data frame".into(),
-                    got: format!("control stream_id={sid}"),
-                }.into());
-            }
-
-            if sid != DATA_STREAM {
-                return Err(crate::error::ProtocolError::UnexpectedMessage {
-                    expected: "data frame".into(),
-                    got: format!("stream_id={sid}"),
-                }
-                .into());
-            }
-
-            // Use postcard::take_from_bytes to split serialized Chunk from raw payload
-            let (chunk, payload) = postcard::take_from_bytes::<Chunk>(&frame_data)
-                .map_err(|e| crate::error::ProtocolError::InvalidMessage(e.to_string()))?;
-
-            if payload.len() != chunk.length as usize {
-                return Err(TransportError::TcpFallback(format!(
-                    "chunk length mismatch: header says {}, payload is {}",
-                    chunk.length,
-                    payload.len()
-                ))
-                .into());
-            }
-
-            // Verify path_index matches (best-effort sanity check)
-            if chunk.path_index != file_idx as u16 {
-                tracing::warn!(
-                    "tcp chunk path_index mismatch: expected {file_idx}, got {}",
-                    chunk.path_index
-                );
-            }
-
-            tokio::io::AsyncWriteExt::write_all(&mut file, payload).await?;
-            written += chunk.length as u64;
-
-            let bytes_so_far = {
-                let mut t = tracker.lock().unwrap();
-                t.record(chunk.length as u64);
-                (t.bytes_transferred(), t.speed_bps())
-            };
-
-            let _ = event_tx.send(crate::engine::PrivetEvent::TransferProgress {
-                session_id,
-                progress: crate::session::TransferProgress {
-                    total_bytes: total_size,
-                    bytes_transferred: bytes_so_far.0,
-                    current_speed_bps: bytes_so_far.1,
-                    per_file: vec![],
-                },
-                direction: crate::session::TransferDirection::Receiving,
-            });
         }
-
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
-        dest_paths.push(dest);
     }
 
     Ok(dest_paths)
@@ -510,24 +599,28 @@ pub async fn send_files_tcp<S>(
     addr: std::net::SocketAddr,
     files: Vec<FileToSend>,
     chunk_size: u32,
+    listen_port: u16,
+    session_id: SessionId,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
     security_mode: &crate::config::SecurityMode,
     tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     cancel_flag: Option<Arc<AtomicBool>>,
-) -> Result<(SessionId, String, String), PrivetError>
+) -> Result<(SessionId, String, String, Option<std::net::SocketAddr>), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let session_id = SessionId::new();
+    use std::net::SocketAddr;
 
-    // 1. Send Hello
+    // 1. Send Hello with our listen port
+    tracing::debug!("[tcp-send] sending Hello listen_port={}", listen_port);
     let hello = ControlMessage::Hello(handshake::Hello {
         version: handshake::PROTOCOL_VERSION,
         device_name: identity.device_name.clone(),
         platform: std::env::consts::OS.to_owned(),
         fingerprint: identity.fingerprint.clone(),
+        listen_port: Some(listen_port),
     });
     let hello_data = handshake::serialize(&hello)?;
     crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &hello_data).await?;
@@ -547,6 +640,11 @@ where
     };
     let peer_fingerprint = hello_ack.fingerprint;
     let peer_device_name = hello_ack.device_name;
+    // Build peer's listening address from the connection's remote IP and advertised port.
+    let peer_listen_addr = hello_ack.listen_port
+        .map(|port| SocketAddr::new(addr.ip(), port));
+    tracing::debug!("[tcp-send] received HelloAck listen_port={:?} → peer_listen_addr={:?}",
+        hello_ack.listen_port, peer_listen_addr);
 
     // 2b. If TLS is active, verify HelloAck fingerprint matches TLS certificate
     if let Some(tls_fp) = tls_peer_fingerprint {
@@ -563,11 +661,12 @@ where
             &identity.fingerprint,
             &peer_fingerprint,
         );
+        let pairing_addr = peer_listen_addr.unwrap_or(addr);
         let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
             peer: crate::peer::PeerInfo {
                 id: crate::peer::PeerId(uuid::Uuid::nil()),
                 name: identity.device_name.clone(),
-                addresses: vec![addr],
+                addresses: vec![pairing_addr],
                 fingerprint: peer_fingerprint.clone(),
                 is_trusted: false,
                 last_seen: std::time::SystemTime::now(),
@@ -667,6 +766,39 @@ where
                 }
             }
 
+            // Trigger the TLS layer to read any pending data from TCP and decrypt
+            // it (e.g. a Cancel frame sent by the receiver).  An empty poll_read
+            // does not consume any data from the decrypted buffer.
+            let poll_ready = {
+                use std::pin::Pin;
+                use std::task::Context;
+                use tokio::io::ReadBuf;
+                let waker = std::task::Waker::noop();
+                let mut cx = Context::from_waker(&waker);
+                let mut empty = [0u8; 0];
+                let mut read_buf = ReadBuf::new(&mut empty);
+                Pin::new(&mut stream).poll_read(&mut cx, &mut read_buf).is_ready()
+            };
+            if poll_ready && tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                crate::transport::tcp_fallback::read_frame(&mut stream),
+            ).await.ok().and_then(|r| r.ok()).map_or(false, |(sid, data)| {
+                sid == CONTROL_STREAM && handshake::deserialize(&data)
+                    .map_or(false, |msg| matches!(msg, ControlMessage::Cancel(_)))
+            }) {
+                tracing::info!("[tcp-send] received Cancel frame from receiver");
+                let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                    session_id,
+                    error: "cancelled by receiver".into(),
+                    direction: crate::session::TransferDirection::Sending,
+                });
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::io::AsyncWriteExt::shutdown(&mut stream),
+                ).await;
+                return Err(PrivetError::TransferCancelled);
+            }
+
             let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
             if n == 0 {
                 break;
@@ -684,7 +816,38 @@ where
             frame_data.extend_from_slice(&chunk_header);
             frame_data.extend_from_slice(&buf[..n]);
 
-            crate::transport::tcp_fallback::write_frame(&mut stream, DATA_STREAM, &frame_data).await?;
+            tracing::trace!("[tcp-send] writing data chunk offset={} len={}", offset, n);
+            let write_result = crate::transport::tcp_fallback::write_frame(&mut stream, DATA_STREAM, &frame_data).await;
+            if let Err(write_err) = &write_result {
+                tracing::warn!("[tcp-send] write_frame failed: {write_err}");
+                // The Cancel frame may have been sent by the receiver and buffered
+                // by the TLS layer before the connection was aborted.  Try to read
+                // it from the TLS buffer to report a clean cancellation.
+                let cancel_reason = match tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    crate::transport::tcp_fallback::read_frame(&mut stream),
+                ).await {
+                    Ok(Ok((0, data))) => {
+                        if let Ok(ControlMessage::Cancel(cancel)) = handshake::deserialize(&data) {
+                            Some(cancel.reason)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = cancel_reason {
+                    let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                        session_id,
+                        error: format!("cancelled by receiver: {reason}"),
+                        direction: crate::session::TransferDirection::Sending,
+                    });
+                    return Err(PrivetError::TransferCancelled);
+                }
+                return Err(PrivetError::Transport(TransportError::TcpFallback(
+                    format!("connection lost: {write_err}"),
+                )));
+            }
 
             offset += n as u64;
             let bytes_so_far = {
@@ -711,14 +874,41 @@ where
     let complete_data = handshake::serialize(&complete)?;
     crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &complete_data).await?;
 
-    // 8. Read Verified
-    let (_, verified_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
-    let _verified = handshake::deserialize(&verified_data)?;
-
-    let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Sending });
-
-    tracing::info!("[tcp-send] transfer complete for session {session_id}");
-    Ok((session_id, peer_fingerprint, peer_device_name))
+    // 8. Read Verified (or Cancel from receiver)
+    let (_, resp_data) = match crate::transport::tcp_fallback::read_frame(&mut stream).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Connection lost — no Cancel frame was received, so this is not
+            // a clean cancel signal but a disconnect (e.g. receiver process killed).
+            let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                session_id,
+                error: format!("connection lost: {e}"),
+                direction: crate::session::TransferDirection::Sending,
+            });
+            return Err(PrivetError::Transport(e));
+        }
+    };
+    match handshake::deserialize(&resp_data)? {
+        ControlMessage::Verified(_) => {
+            let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Sending });
+            tracing::info!("[tcp-send] transfer complete for session {session_id}");
+            Ok((session_id, peer_fingerprint, peer_device_name, peer_listen_addr))
+        }
+        ControlMessage::Cancel(cancel) => {
+            let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                session_id,
+                error: format!("cancelled by receiver: {}", cancel.reason),
+                direction: crate::session::TransferDirection::Sending,
+            });
+            Err(PrivetError::TransferCancelled)
+        }
+        other => {
+            Err(crate::error::ProtocolError::UnexpectedMessage {
+                expected: "Verified/Cancel".into(),
+                got: format!("{other:?}"),
+            }.into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -964,9 +1154,9 @@ mod tests {
             other => panic!("expected TransferCancelled, got: {other:?}"),
         }
 
-        // File may or may not have partial content depending on I/O flush behavior
+        // File should be cleaned up (removed) after cancel
         let dest = download_dir.join("partial_cancel.bin");
-        assert!(dest.exists(), "at least the file should have been created");
+        assert!(!dest.exists(), "partial file should have been cleaned up after cancel");
     }
 
     #[tokio::test]
@@ -1066,6 +1256,7 @@ mod tests {
                 accepted: true,
                 fingerprint: recv_identity.fingerprint.clone(),
                 device_name: recv_identity.device_name.clone(),
+                listen_port: None,
             });
             let ack_data = handshake::serialize(&hello_ack).unwrap();
             crate::transport::tcp_fallback::write_frame(&mut server, CONTROL_STREAM, &ack_data)
@@ -1103,6 +1294,8 @@ mod tests {
             addr,
             vec![file_to_send(file_path)],
             64 * 1024,
+            0,
+            session_id,
             &identity,
             &[],
             &crate::config::SecurityMode::AllowAll,
@@ -1182,10 +1375,12 @@ mod tests {
                 server,
                 recv_dir2,
                 64 * 1024,
+                53530,
                 &r_id,
                 &[],   // empty trusted — AllowAll handles trust
                 &crate::config::SecurityMode::AllowAll,
                 None,  // no TLS fingerprint
+                None,  // no remote addr
                 r_as,
                 &*r_pi,
                 &*r_pp,
@@ -1198,11 +1393,14 @@ mod tests {
 
         // --- Send files ---
         let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let send_session_id = SessionId::new();
         let send_result = send_files_tcp(
             client,
             addr,
             vec![file_to_send(file_path.clone())],
             64 * 1024,
+            0,
+            send_session_id,
             &send_id,
             &[],   // empty trusted — AllowAll
             &crate::config::SecurityMode::AllowAll,
@@ -1307,6 +1505,7 @@ mod tests {
                 tls_stream,
                 r_recv_dir,
                 64 * 1024,
+                53530,
                 &crate::security::identity::DeviceIdentity::generate(
                     "dummy-recv".into(),
                     dummy_dir,
@@ -1314,6 +1513,7 @@ mod tests {
                 ).unwrap(),
                 &[],
                 &crate::config::SecurityMode::AllowAll,
+                None,
                 None,
                 r_as,
                 &*r_pi,
@@ -1338,11 +1538,14 @@ mod tests {
             .expect("TLS connect");
 
         let tls_fingerprint: Option<String> = None;
+        let send_session_id = SessionId::new();
         let send_result = send_files_tcp(
             tls_stream,
             addr,
             vec![file_to_send(file_path)],
             64 * 1024,
+            0,
+            send_session_id,
             &send_id,
             &[],
             &crate::config::SecurityMode::AllowAll,

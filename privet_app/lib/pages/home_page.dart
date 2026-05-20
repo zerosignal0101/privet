@@ -56,6 +56,7 @@ class _HomePageState extends ConsumerState<HomePage> {
       dataDir: dataDir,
       downloadDir: resolvedDownloadDir,
       securityMode: settings.securityMode,
+      listenPort: settings.listenPort,
     );
     if (mounted) {
       ref.read(engineRunningProvider.notifier).setRunning(ok);

@@ -11,7 +11,7 @@ use crate::config::SecurityMode;
 use crate::error::{PrivetError, TransportError};
 use crate::known_device::KnownDeviceStore;
 use crate::protocol::control;
-use crate::protocol::data::{self, Chunk, StreamHeader};
+use crate::protocol::data::{self, Chunk, StreamFileEntry, StreamHeader};
 use crate::protocol::handshake::{self, Accept, ControlMessage, HelloAck, ResumePoint};
 use crate::session::SessionId;
 use crate::transfer::progress::ProgressTracker;
@@ -46,6 +46,9 @@ pub struct Receiver {
     chunk_size: u32,
     fingerprint: String,
     device_name: String,
+    /// The receiver's configured listen port (e.g. 53530), used to build the
+    /// `listen_addr` advertised in HelloAck.
+    listen_port: u16,
     trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
     security_mode: SecurityMode,
     accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
@@ -64,6 +67,7 @@ impl Receiver {
         chunk_size: u32,
         fingerprint: String,
         device_name: String,
+        listen_port: u16,
         trust_store: Arc<tokio::sync::Mutex<crate::security::trust::TrustStore>>,
         security_mode: SecurityMode,
         accept_store: Arc<tokio::sync::Mutex<crate::security::accept::AcceptStore>>,
@@ -83,6 +87,7 @@ impl Receiver {
             chunk_size,
             fingerprint,
             device_name,
+            listen_port,
             trust_store,
             security_mode,
             accept_store,
@@ -95,10 +100,18 @@ impl Receiver {
     }
 
     /// Record the peer as a known device after trust is established.
-    async fn record_known_device(&self, fingerprint: String, device_name: &str) {
+    /// Uses the peer's advertised listen address (from Hello) if available,
+    /// falling back to the connection's remote address.
+    async fn record_known_device(
+        &self,
+        fingerprint: String,
+        device_name: &str,
+        listen_addr: Option<std::net::SocketAddr>,
+    ) {
+        let addr = listen_addr.unwrap_or(self.remote_addr);
         let subnet = crate::network::subnet_from_addr(
-            &self.remote_addr.ip(),
-            crate::network::default_prefix_len(match self.remote_addr.ip() {
+            &addr.ip(),
+            crate::network::default_prefix_len(match addr.ip() {
                 std::net::IpAddr::V4(ref v4) => v4,
                 std::net::IpAddr::V6(_) => return,
             }),
@@ -109,7 +122,7 @@ impl Receiver {
             crate::peer::PeerId(uuid::Uuid::nil()),
             device_name.to_owned(),
             subnet,
-            self.remote_addr,
+            addr,
             None,
         );
     }
@@ -157,6 +170,14 @@ impl Receiver {
         };
         let peer_fingerprint = hello.fingerprint.clone();
         let _peer_device_name = hello.device_name.clone();
+        // Build the peer's listening address from the connection's remote IP
+        // (the IP the sender connected from) and their advertised listen port.
+        let peer_listen_addr = hello.listen_port
+            .map(|port| std::net::SocketAddr::new(self.remote_addr.ip(), port));
+        if peer_listen_addr.is_some() {
+            tracing::debug!("[quic-recv] hello listen_port={:?} → peer_listen_addr={:?}",
+                hello.listen_port, peer_listen_addr);
+        }
 
         // 2. TLS fingerprint verification (MITM protection)
         // Verify the peer's TLS certificate fingerprint matches the Hello claim.
@@ -186,6 +207,7 @@ impl Receiver {
             version: handshake::PROTOCOL_VERSION, accepted: true,
             fingerprint: self.fingerprint.clone(),
             device_name: self.device_name.clone(),
+            listen_port: Some(self.listen_port),
         });
         control::write_control_frame(&mut ctrl_send, &handshake::serialize(&hello_ack)?).await?;
 
@@ -202,11 +224,15 @@ impl Receiver {
             // Only emit AwaitingPairing once per peer to avoid duplicate prompts.
             if !already_pending {
                 let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
+                // Use peer's advertised listen address if available, fall back to connection remote address.
+                let pairing_addr = peer_listen_addr.unwrap_or(self.remote_addr);
+                tracing::debug!("[receiver] AwaitingPairing: name={} addr={:?} fp={}",
+                    hello.device_name, pairing_addr, peer_fingerprint);
                 let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingPairing {
                     session_id: SessionId(uuid::Uuid::nil()),
                     peer: crate::peer::PeerInfo {
                         id: crate::peer::PeerId(uuid::Uuid::nil()),
-                        name: hello.device_name.clone(), addresses: vec![self.remote_addr],
+                        name: hello.device_name.clone(), addresses: vec![pairing_addr],
                         fingerprint: peer_fingerprint.clone(), is_trusted: false,
                         last_seen: std::time::SystemTime::now(), platform: Some(hello.platform.clone()), version: None,
                     }, code,
@@ -216,12 +242,12 @@ impl Receiver {
             match rx.await.unwrap_or(PairDecision::Reject) {
                 PairDecision::Trust => {
                     let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
-                    self.record_known_device(peer_fingerprint.clone(), &hello.device_name).await;
+                    self.record_known_device(peer_fingerprint.clone(), &hello.device_name, peer_listen_addr).await;
                 }
                 PairDecision::TrustAndAccept => {
                     let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
                     let _ = self.accept_store.lock().await.accept(peer_fingerprint.clone());
-                    self.record_known_device(peer_fingerprint.clone(), &hello.device_name).await;
+                    self.record_known_device(peer_fingerprint.clone(), &hello.device_name, peer_listen_addr).await;
                 }
                 PairDecision::Reject => {
                     // Send a Reject so the sender gets a clean rejection,
@@ -258,7 +284,7 @@ impl Receiver {
                         return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
                     }
                     // Sender retried with Offer on this same connection
-                    return self.handle_offer(data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await;
+                    return self.handle_offer(data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx, peer_listen_addr).await;
                 }
                 _ => {
                     tracing::info!("[quic-recv] pairing resolved but no Offer (connection dead or timeout), returning Ok");
@@ -280,7 +306,7 @@ impl Receiver {
             tracing::info!("[quic-recv] sender rejected: {}", rej.reason);
             return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
         }
-        let (session_id, fp, device_name, file_records) = self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await?;
+        let (session_id, fp, device_name, file_records) = self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx, peer_listen_addr).await?;
         Ok((session_id, fp, device_name, file_records))
     }
 
@@ -292,6 +318,7 @@ impl Receiver {
         mut ctrl_send: quinn::SendStream,
         mut ctrl_recv: quinn::RecvStream,
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
+        peer_listen_addr: Option<std::net::SocketAddr>,
     ) -> Result<(SessionId, String, String, Vec<crate::storage::records::TransferFileRecord>), PrivetError> {
         let peer_device_name = hello.device_name.clone();
         let offer = match handshake::deserialize(&offer_data)? {
@@ -346,13 +373,15 @@ impl Receiver {
             return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
         }
 
+        let addr_for_events = peer_listen_addr.unwrap_or(self.remote_addr);
+
         // Notify app layer of incoming transfer (after trust check — only for accepted transfers)
         let _ = event_tx.send(crate::engine::PrivetEvent::IncomingTransfer {
             session_id,
             peer: crate::peer::PeerInfo {
                 id: crate::peer::PeerId(uuid::Uuid::nil()),
                 name: hello.device_name.clone(),
-                addresses: vec![self.remote_addr],
+                addresses: vec![addr_for_events],
                 fingerprint: peer_fingerprint.to_owned(),
                 is_trusted: true,
                 last_seen: std::time::SystemTime::now(),
@@ -384,7 +413,7 @@ impl Receiver {
                 session_id,
                 peer: crate::peer::PeerInfo {
                     id: crate::peer::PeerId(uuid::Uuid::nil()), name: hello.device_name.clone(),
-                    addresses: vec![self.remote_addr], fingerprint: peer_fingerprint.to_owned(),
+                    addresses: vec![addr_for_events], fingerprint: peer_fingerprint.to_owned(),
                     is_trusted: true, last_seen: std::time::SystemTime::now(),
                     platform: Some(hello.platform.clone()), version: None,
                 },
@@ -599,14 +628,14 @@ async fn receive_stream_files(
         // Use atomic create_new (O_CREAT|O_EXCL) to avoid FUSE caching races
         let dest;
         let mut file;
-        if file_entry.start_offset > 0 {
+        let is_resume = file_entry.start_offset > 0;
+        if is_resume {
             // Resume: exact path required (previous partial transfer)
             dest = download_dir.join(&file_entry.relative_path);
             if let Some(parent) = dest.parent() { tokio::fs::create_dir_all(parent).await?; }
             file = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(file_entry.start_offset)).await?;
-            actual_dests.push(dest.clone());
         } else {
             // New file: atomically create with unique name
             let base = download_dir.join(&file_entry.relative_path);
@@ -614,37 +643,69 @@ async fn receive_stream_files(
                 .map_err(PrivetError::Io)?;
             dest = pair.0;
             file = pair.1;
-            actual_dests.push(dest.clone());
         }
-        let expected_bytes = file_entry.total_size.saturating_sub(file_entry.start_offset);
-        let mut written: u64 = 0;
-        while written < expected_bytes {
-            if let Some(flag) = cancel_flag {
-                if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(PrivetError::TransferCancelled);
+
+        let result = receive_stream_one_file(
+            data_stream, file_entry, dest.clone(), file,
+            tracker, event_tx, session_id, total_size,
+            cancel_flag, is_resume,
+        ).await;
+
+        match result {
+            Ok(()) => actual_dests.push(dest),
+            Err(e) => {
+                // Only clean up non-resume files (resume files keep partial progress)
+                if !is_resume {
+                    let _ = tokio::fs::remove_file(&dest).await;
+                    tracing::debug!("[quic-recv] error, cleaned up partial file {:?}: {e}", dest);
                 }
+                return Err(e);
             }
-            let chunk_header_data = control::read_control_frame(data_stream).await
-                .map_err(|_| PrivetError::Transport(TransportError::ConnectionLost(
-                    "sender disconnected".into(),
-                )))?;
-            let chunk: Chunk = data::deserialize_chunk(&chunk_header_data)?;
-            let mut buf = vec![0u8; chunk.length as usize];
-            data_stream.read_exact(&mut buf).await
-                .map_err(|_| PrivetError::Transport(TransportError::ConnectionLost(
-                    "sender disconnected".into(),
-                )))?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &buf).await?;
-            written += chunk.length as u64;
-            let (tx, sp) = { let mut t = tracker.lock().unwrap(); t.record(chunk.length as u64); (t.bytes_transferred(), t.speed_bps()) };
-            let _ = event_tx.send(crate::engine::PrivetEvent::TransferProgress {
-                session_id, progress: crate::session::TransferProgress { total_bytes: total_size, bytes_transferred: tx, current_speed_bps: sp, per_file: vec![] },
-                direction: crate::session::TransferDirection::Receiving,
-            });
         }
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
     }
     Ok(actual_dests)
+}
+
+/// Receive chunk data for a single file from a QUIC stream.
+async fn receive_stream_one_file(
+    data_stream: &mut quinn::RecvStream,
+    file_entry: &StreamFileEntry,
+    _dest: std::path::PathBuf,
+    mut file: tokio::fs::File,
+    tracker: &std::sync::Arc<std::sync::Mutex<ProgressTracker>>,
+    event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
+    session_id: SessionId, total_size: u64,
+    cancel_flag: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    _is_resume: bool,
+) -> Result<(), PrivetError> {
+    let expected_bytes = file_entry.total_size.saturating_sub(file_entry.start_offset);
+    let mut written: u64 = 0;
+    while written < expected_bytes {
+        if let Some(flag) = cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PrivetError::TransferCancelled);
+            }
+        }
+        let chunk_header_data = control::read_control_frame(data_stream).await
+            .map_err(|_| PrivetError::Transport(TransportError::ConnectionLost(
+                "sender disconnected".into(),
+            )))?;
+        let chunk: Chunk = data::deserialize_chunk(&chunk_header_data)?;
+        let mut buf = vec![0u8; chunk.length as usize];
+        data_stream.read_exact(&mut buf).await
+            .map_err(|_| PrivetError::Transport(TransportError::ConnectionLost(
+                "sender disconnected".into(),
+            )))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &buf).await?;
+        written += chunk.length as u64;
+        let (tx, sp) = { let mut t = tracker.lock().unwrap(); t.record(chunk.length as u64); (t.bytes_transferred(), t.speed_bps()) };
+        let _ = event_tx.send(crate::engine::PrivetEvent::TransferProgress {
+            session_id, progress: crate::session::TransferProgress { total_bytes: total_size, bytes_transferred: tx, current_speed_bps: sp, per_file: vec![] },
+            direction: crate::session::TransferDirection::Receiving,
+        });
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
 }
 
 pub(crate) fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> { Ok(u64::MAX) }

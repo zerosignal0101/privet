@@ -27,6 +27,11 @@ pub struct Hello {
     pub device_name: String,
     pub platform: String,
     pub fingerprint: String,
+    /// The sender's configured listen port (e.g. 53530) so the receiver can
+    /// combine it with the connection's remote IP for known-device discovery.
+    /// `None` for backward compatibility with older versions.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +41,11 @@ pub struct HelloAck {
     pub fingerprint: String,
     #[serde(default)]
     pub device_name: String,
+    /// The receiver's configured listen port (e.g. 53530) so the sender can
+    /// combine it with the connection's remote IP for known-device discovery.
+    /// `None` for backward compatibility with older versions.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

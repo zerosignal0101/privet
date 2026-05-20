@@ -148,10 +148,23 @@ impl CEvent {
                 ce.event_type = EVENT_AWAITING_PAIRING;
                 ce.session_id = uuid_to_bytes(&session_id.0);
                 ce.peer_id = uuid_to_bytes(peer.id.as_uuid());
-                ce.extra_json = json_to_cstring(&serde_json::json!({
-                    "peer": peer,
+                let addrs: Vec<String> = peer.addresses.iter().map(|a| a.to_string()).collect();
+                tracing::debug!("[ffi] AwaitingPairing addrs_debug={:?} addrs_ser={:?}", peer.addresses, addrs);
+                let extra = serde_json::json!({
+                    "peer": {
+                        "id": peer.id,
+                        "name": peer.name,
+                        "addresses": addrs,
+                        "fingerprint": peer.fingerprint,
+                        "is_trusted": peer.is_trusted,
+                        "last_seen": peer.last_seen,
+                        "platform": peer.platform,
+                        "version": peer.version,
+                    },
                     "code": code,
-                }));
+                });
+                tracing::debug!("[ffi] AwaitingPairing extra_json={}", extra);
+                ce.extra_json = json_to_cstring(&extra);
             }
             privet_core::PrivetEvent::KnownDeviceProbed { peer } => {
                 ce.event_type = EVENT_KNOWN_DEVICE_PROBED;

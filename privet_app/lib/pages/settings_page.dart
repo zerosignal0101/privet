@@ -100,6 +100,15 @@ class SettingsPage extends ConsumerWidget {
                 ref.read(settingsProvider.notifier).setEnableTcpFallback(v),
           ),
 
+          // Listen port
+          ListTile(
+            leading: const Icon(Icons.settings_ethernet),
+            title: const Text('Listen Port'),
+            subtitle: Text('${settings.listenPort}'),
+            trailing: const Icon(Icons.edit),
+            onTap: () => _editPort(context, ref, settings.listenPort),
+          ),
+
           const Divider(),
 
           // Current Network(s)
@@ -257,6 +266,44 @@ class SettingsPage extends ConsumerWidget {
     if (confirmed == true) {
       await ref.read(acceptedListProvider.notifier).unaccept(fp);
     }
+  }
+
+  Future<void> _editPort(BuildContext context, WidgetRef ref, int currentPort) async {
+    final controller = TextEditingController(text: currentPort.toString());
+    final confirmed = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Listen Port'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Port (1–65535)',
+            hintText: '53530',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () {
+              final value = int.tryParse(controller.text.trim());
+              if (value == null || value < 1 || value > 65535) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(content: Text('Invalid port number')),
+                );
+                return;
+              }
+              Navigator.pop(ctx, value);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != null && confirmed != currentPort) {
+      await ref.read(settingsProvider.notifier).setListenPort(confirmed);
+    }
+    controller.dispose();
   }
 
   Future<void> _editKnownDevice(
