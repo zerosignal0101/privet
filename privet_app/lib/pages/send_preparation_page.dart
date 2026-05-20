@@ -568,16 +568,18 @@ class _FileTreeSection extends StatelessWidget {
       }
     }
 
-    // Build size map: relativePath → size
+    // Build size map and absolute path map: relativePath → (size, absolutePath)
     final sizeMap = <String, int>{};
+    final absPathMap = <String, String>{};
     for (final e in entries) {
       sizeMap[e.relativePath] = e.size;
+      absPathMap[e.relativePath] = e.absolutePath;
     }
 
-    return _buildTreeNodes(lookup, '', dirSet, sizeMap);
+    return _buildTreeNodes(lookup, '', dirSet, sizeMap, absPathMap);
   }
 
-  List<FileTreeNode> _buildTreeNodes(Map<String, List<String>> lookup, String prefix, Set<String> dirSet, Map<String, int> sizeMap) {
+  List<FileTreeNode> _buildTreeNodes(Map<String, List<String>> lookup, String prefix, Set<String> dirSet, Map<String, int> sizeMap, Map<String, String> absPathMap) {
     final result = <FileTreeNode>[];
     final dirs = <String>{};
     final files = <String>[];
@@ -605,7 +607,7 @@ class _FileTreeSection extends StatelessWidget {
     // Add directories (sorted)
     for (final dirPath in (dirs.toList()..sort())) {
       final dirName = dirPath.contains('/') ? dirPath.split('/').last : dirPath;
-      final children = _buildTreeNodes(lookup, dirPath, dirSet, sizeMap);
+      final children = _buildTreeNodes(lookup, dirPath, dirSet, sizeMap, absPathMap);
       result.add(FileTreeNode(
         name: dirName,
         relativePath: dirPath,
@@ -616,12 +618,13 @@ class _FileTreeSection extends StatelessWidget {
 
     // Add files (sorted)
     for (final fileName in (files..sort())) {
-      final fullPath = prefix.isEmpty ? fileName : '$prefix/$fileName';
+      final relPath = prefix.isEmpty ? fileName : '$prefix/$fileName';
       result.add(FileTreeNode(
         name: fileName,
-        relativePath: fullPath,
+        relativePath: relPath,
+        fullPath: absPathMap[relPath],
         isDir: false,
-        size: sizeMap[fullPath] ?? 0,
+        size: sizeMap[relPath] ?? 0,
       ));
     }
 

@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:io' show File, Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -8,7 +8,7 @@ import 'send_preparation_page.dart';
 
 import '../models/transfer_history.dart';
 import '../models/file_tree.dart';
-import '../services/privet/content_uri_helper.dart';
+import '../services/privet/content_uri_helper.dart' show openContentUri, recoverFilePath;
 import '../providers/providers.dart';
 import '../widgets/file_tree_view.dart';
 
@@ -201,30 +201,40 @@ class _HistoryRecordTile extends ConsumerWidget {
       );
     } else {
       // Sent file — path may be a cache path (file_picker) or a recovered content URI copy.
-      final filePath = File(f.path).isAbsolute ? f.path : null;
-      final exists = filePath != null ? File(filePath).existsSync() : false;
-      debugPrint('[history] sent file: path="$filePath" exists=$exists');
+      final absPath = File(f.path).isAbsolute ? f.path : null;
+      final exists = absPath != null && File(absPath).existsSync();
+      final hasContentUri = f.identifier != null && Platform.isAndroid;
+      debugPrint('[history] sent file: path="$absPath" exists=$exists hasContentUri=$hasContentUri');
 
       return ListTile(
         dense: true,
         leading: Icon(
-          Icons.insert_drive_file,
+          exists ? Icons.insert_drive_file : Icons.file_present,
           size: 18,
           color: exists ? null : Colors.grey,
         ),
-        title: Text(fileName, style: const TextStyle(fontSize: 13)),
+        title: Text(
+          fileName,
+          style: TextStyle(fontSize: 13, color: exists ? null : Colors.grey),
+        ),
         subtitle: Text(
-          exists ? _formatSize(f.size) : 'File not accessible',
+          exists ? _formatSize(f.size) : (hasContentUri ? 'Content URI available' : 'File not accessible'),
           style: TextStyle(
             fontSize: 11,
             color: exists ? Colors.grey : Colors.orange,
           ),
         ),
-        trailing: exists && !f.isDir
+        trailing: !f.isDir && (exists || hasContentUri)
             ? IconButton(
                 icon: const Icon(Icons.open_in_new, size: 16),
                 tooltip: 'Open file',
-                onPressed: () => OpenFile.open(filePath),
+                onPressed: () {
+                  if (absPath != null && File(absPath).existsSync()) {
+                    OpenFile.open(absPath);
+                  } else if (hasContentUri) {
+                    openContentUri(f.identifier!);
+                  }
+                },
               )
             : null,
       );
@@ -245,18 +255,40 @@ class _HistoryRecordTile extends ConsumerWidget {
 
     // Build tree from records
     final treeNodes = buildFileTreeFromRecords(files);
-    final isReceiveFile = record.direction == TransferDirection.receiving;
+    // Build lookup: absolute path → content:// URI for sent file fallback
+    final pathToIdentifier = <String, String>{};
+    for (final f in files) {
+      if (f.identifier != null && File(f.path).isAbsolute) {
+        pathToIdentifier[f.path] = f.identifier!;
+      }
+    }
 
     return [
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8),
         child: FileTreeView(
           nodes: treeNodes,
-          onOpenFile: isReceiveFile ? (path) => OpenFile.open(path) : null,
+          onOpenFile: (path) => _openFile(context, path, pathToIdentifier),
           formatSize: _formatSize,
         ),
       ),
     ];
+  }
+
+  void _openFile(BuildContext context, String path, Map<String, String> pathToIdentifier) {
+    if (File(path).existsSync()) {
+      OpenFile.open(path);
+      return;
+    }
+    // Try content:// URI fallback for sent files
+    final identifier = pathToIdentifier[path];
+    if (identifier != null && Platform.isAndroid) {
+      openContentUri(identifier);
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('File not found')),
+    );
   }
 
   void _resend(BuildContext context, WidgetRef ref) async {

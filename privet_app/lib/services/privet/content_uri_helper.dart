@@ -15,6 +15,17 @@ Future<String?> copyContentUri(String uri) async {
   }
 }
 
+/// Android: open a content:// URI using the system's default handler.
+/// Returns true if the intent was launched successfully.
+Future<bool> openContentUri(String uri) async {
+  if (!Platform.isAndroid) return false;
+  try {
+    return await _channel.invokeMethod<bool>('openContentUri', {'uri': uri}) ?? false;
+  } catch (_) {
+    return false;
+  }
+}
+
 /// Android: check if a content:// URI is still accessible.
 Future<bool> checkContentUri(String uri) async {
   if (!Platform.isAndroid) return false;

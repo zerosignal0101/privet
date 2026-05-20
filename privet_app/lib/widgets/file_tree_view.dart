@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../models/file_tree.dart';
@@ -47,9 +49,11 @@ class FileTreeView extends StatelessWidget {
         depth: depth,
         showRemoveButtons: showRemoveButtons,
         onRemoveFile: onRemoveFile,
+        onOpenFile: onOpenFile,
         formatSize: formatSize,
       );
     }
+    final exists = node.fullPath != null && File(node.fullPath!).existsSync();
     return _FileNode(
       node: node,
       depth: depth,
@@ -57,9 +61,10 @@ class FileTreeView extends StatelessWidget {
       onRemove: onRemoveFile != null
           ? () => onRemoveFile!(node.relativePath)
           : null,
-      onOpen: onOpenFile != null && node.fullPath != null
+      onOpen: onOpenFile != null && node.fullPath != null && exists
           ? () => onOpenFile!(node.fullPath!)
           : null,
+      fileExists: exists,
       formatSize: formatSize,
     );
   }
@@ -70,6 +75,7 @@ class _DirectoryNode extends StatefulWidget {
   final int depth;
   final bool showRemoveButtons;
   final void Function(String relativePath)? onRemoveFile;
+  final void Function(String fullPath)? onOpenFile;
   final String Function(int bytes)? formatSize;
 
   const _DirectoryNode({
@@ -77,6 +83,7 @@ class _DirectoryNode extends StatefulWidget {
     required this.depth,
     required this.showRemoveButtons,
     this.onRemoveFile,
+    this.onOpenFile,
     this.formatSize,
   });
 
@@ -153,9 +160,11 @@ class _DirectoryNodeState extends State<_DirectoryNode> {
           depth: depth,
           showRemoveButtons: widget.showRemoveButtons,
           onRemoveFile: widget.onRemoveFile,
+          onOpenFile: widget.onOpenFile,
           formatSize: widget.formatSize,
         ));
       } else {
+        final exists = child.fullPath != null && File(child.fullPath!).existsSync();
         widgets.add(_FileNode(
           node: child,
           depth: depth,
@@ -163,8 +172,11 @@ class _DirectoryNodeState extends State<_DirectoryNode> {
           onRemove: widget.onRemoveFile != null
               ? () => widget.onRemoveFile!(child.relativePath)
               : null,
+          onOpen: widget.onOpenFile != null && child.fullPath != null && exists
+              ? () => widget.onOpenFile!(child.fullPath!)
+              : null,
+          fileExists: exists,
           formatSize: widget.formatSize,
-          // In tree view, open from path is less useful since we only have relative path
         ));
       }
     }
@@ -178,6 +190,7 @@ class _FileNode extends StatelessWidget {
   final bool showRemoveButton;
   final VoidCallback? onRemove;
   final VoidCallback? onOpen;
+  final bool fileExists;
   final String Function(int bytes)? formatSize;
 
   const _FileNode({
@@ -186,6 +199,7 @@ class _FileNode extends StatelessWidget {
     this.showRemoveButton = false,
     this.onRemove,
     this.onOpen,
+    this.fileExists = false,
     this.formatSize,
   });
 
@@ -199,15 +213,25 @@ class _FileNode extends StatelessWidget {
       padding: EdgeInsets.only(left: 16.0 * depth),
       child: ListTile(
         dense: true,
-        leading: const Icon(Icons.insert_drive_file, size: 18),
+        leading: Icon(
+          fileExists ? Icons.insert_drive_file : Icons.file_present,
+          size: 18,
+          color: fileExists ? null : Colors.grey,
+        ),
         title: Text(
           node.name,
-          style: const TextStyle(fontSize: 13),
+          style: TextStyle(
+            fontSize: 13,
+            color: fileExists ? null : Colors.grey,
+          ),
           overflow: TextOverflow.ellipsis,
         ),
         subtitle: Text(
-          sizeText,
-          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+          fileExists ? sizeText : 'File not accessible',
+          style: TextStyle(
+            fontSize: 11,
+            color: fileExists ? Colors.grey.shade600 : Colors.orange,
+          ),
         ),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,

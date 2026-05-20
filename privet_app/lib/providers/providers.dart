@@ -1059,18 +1059,50 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     );
     print('[send] sendFilesStart returned ok=$ok');
 
-    // Wait for pairing resolution. The PairRequest event may arrive with
-    // a delay (FFI event polling), so we cannot rely on !ok being false.
-    // The polling loop covers all cases: no request yet, pending, resolved.
-    state = state.copyWith(sendError: 'Pairing required');
-    print('[send] waiting for pairing resolution...');
-
+    // Wait briefly for a possible PairRequest event (FFI event polling
+    // delay: the Rust engine emits PairRequest BEFORE sendFilesStart
+    // returns, but the event may not have reached PairingNotifier yet).
+    // If PairRequest arrives, enter pairing flow. Otherwise, the send
+    // genuinely succeeded or it's a connection error.
     final pairNotifier = ref.read(pairingProvider.notifier);
     bool hadPairRequest = ref.read(pairingProvider).isNotEmpty;
+
+    // Quick check: if PairRequest is already pending, go straight to pairing
+    if (!hadPairRequest) {
+      // Wait up to 2 seconds for a potential PairRequest to arrive
+      for (int i = 0; i < 20; i++) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        final p = ref.read(pairingProvider);
+        if (p.isNotEmpty) {
+          hadPairRequest = true;
+          break;
+        }
+      }
+    }
+
+    if (!hadPairRequest) {
+      // No PairRequest — either succeeded or connection error
+      if (ok) {
+        print('[send] send succeeded');
+        if (state.fileIdentifiers.isNotEmpty) {
+          FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
+        }
+        state = state.copyWith(sending: false, clearPairing: true);
+        return sessionId;
+      }
+      state = state.copyWith(
+        sending: false,
+        sendError: 'peer is offline or unreachable',
+      );
+      return null;
+    }
+
+    // PairRequest was seen — wait for resolution (user trust/reject)
+    state = state.copyWith(sendError: '');
+
     for (int i = 0; i < 150; i++) {
       final p = ref.read(pairingProvider);
-      if (p.isNotEmpty) hadPairRequest = true;
-      if (hadPairRequest && p.isEmpty) {
+      if (p.isEmpty) {
         print('[send] pairing resolved at poll $i');
         break;
       }
@@ -1081,20 +1113,9 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       ]);
     }
 
-    print('[send] poll done: hadPairRequest=$hadPairRequest');
-
-    // If no PairRequest was seen, the first attempt probably succeeded:
-    // return the original session.
-    if (!hadPairRequest) {
-      if (state.fileIdentifiers.isNotEmpty) {
-        FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
-      }
-      state = state.copyWith(sending: false, clearPairing: true);
-      return sessionId;
-    }
+    print('[send] pairing done, retrying...');
 
     // Retry after pairing (new connection, both sides should now trust)
-    print('[send] retrying after pairing...');
     final sessionId2 = _generateUuid();
     ref.read(activeTransfersProvider.notifier).registerSendSession(
       sessionId2,

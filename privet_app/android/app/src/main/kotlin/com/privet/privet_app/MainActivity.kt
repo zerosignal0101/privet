@@ -79,6 +79,20 @@ class MainActivity : FlutterActivity() {
                         result.error("COPY_ERROR", e.message, null)
                     }
                 }
+                "openContentUri" -> {
+                    val uri = call.argument<String>("uri") ?: return@setMethodCallHandler
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(Uri.parse(uri), contentResolver.getType(Uri.parse(uri)))
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e("PrivetSAF", "openContentUri failed", e)
+                        result.success(false)
+                    }
+                }
                 "checkContentUri" -> {
                     val uri = call.argument<String>("uri") ?: return@setMethodCallHandler result.success(false)
                     try {
