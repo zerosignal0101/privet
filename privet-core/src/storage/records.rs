@@ -15,6 +15,10 @@ pub struct TransferFileRecord {
     pub path: String,
     pub size: u64,
     pub is_dir: bool,
+    /// Relative path from the protocol (for tree display in history).
+    /// None for legacy records that predate folder transfer support.
+    #[serde(default)]
+    pub relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

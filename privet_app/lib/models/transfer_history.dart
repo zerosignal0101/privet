@@ -35,13 +35,15 @@ enum TransferRecordState {
 
 /// A file entry in a transfer history record.
 class TransferFileRecord {
-  final String path;
+  final String path;           // Absolute path (for opening files)
+  final String? relativePath;  // Relative path from protocol (for tree display)
   final String? identifier; // Android content:// URI
   final int size;
   final bool isDir;
 
   const TransferFileRecord({
     required this.path,
+    this.relativePath,
     this.identifier,
     this.size = 0,
     this.isDir = false,
@@ -50,6 +52,7 @@ class TransferFileRecord {
   factory TransferFileRecord.fromJson(Map<String, dynamic> json) =>
       TransferFileRecord(
         path: json['path'] as String? ?? '',
+        relativePath: json['relative_path'] as String?,
         identifier: json['identifier'] as String?,
         size: json['size'] as int? ?? 0,
         isDir: json['is_dir'] as bool? ?? false,

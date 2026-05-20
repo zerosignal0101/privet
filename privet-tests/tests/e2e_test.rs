@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,47 @@ fn sha256_file(path: &Path) -> String {
     let data = std::fs::read(path).unwrap();
     let hash = Sha256::digest(&data);
     format!("{hash:x}")
+}
+
+/// Helper: expand paths (handles directories) then send to addr.
+async fn send_files(
+    engine: &privet_core::PrivetEngine,
+    addr: SocketAddr,
+    paths: Vec<PathBuf>,
+) -> Result<privet_core::SessionId, privet_core::PrivetError> {
+    let expanded = privet_core::session::expand_paths(&paths);
+    let sid = SessionId::new();
+    engine.send_files_to_addr(addr, expanded.files, sid).await
+}
+
+/// Generate a directory tree with test files.
+/// `structure` is a list of `(relative_path, file_size)` pairs.
+/// Returns: (dir_path, HashMap<relative_path, (path, hash, size)>)
+fn generate_dir_tree(
+    base_dir: &Path,
+    name: &str,
+    structure: &[(&str, usize)],
+) -> (PathBuf, HashMap<String, (PathBuf, String, u64)>) {
+    let dir = base_dir.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files = HashMap::new();
+
+    for (rel_path, size) in structure {
+        // Create parent directories if needed
+        let full_path = dir.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        if *size > 0 {
+            let (path, hash) = generate_test_file(&dir, rel_path, *size);
+            let rel = rel_path.replace('\\', "/");
+            files.insert(rel.clone(), (path, hash, *size as u64));
+        } else {
+            // size 0 = empty directory marker
+            std::fs::create_dir_all(&full_path).unwrap();
+        }
+    }
+    (dir, files)
 }
 
 // --- Test cases ---
@@ -111,8 +153,7 @@ async fn e2e_pairing_rejects_untrusted() {
 
     // --- Attempt 1: should fail because peer is not trusted ---
     eprintln!("[pairing] attempting transfer without trust...");
-    let err = send_engine
-        .send_files_to_addr(addr, vec![file_path.clone()], SessionId::new())
+    let err = send_files(&send_engine, addr, vec![file_path.clone()])
         .await
         .expect_err("expected PairingRequired error");
 
@@ -175,8 +216,7 @@ async fn e2e_pairing_rejects_untrusted() {
 
     // --- Attempt 2: should succeed after trusting ---
     eprintln!("[pairing] retrying transfer after trust...");
-    send_engine
-        .send_files_to_addr(addr, vec![file_path.clone()], SessionId::new())
+    send_files(&send_engine, addr, vec![file_path.clone()])
         .await
         .expect("send should succeed after trust");
     eprintln!("[pairing] transfer succeeded after trust");
@@ -191,8 +231,7 @@ async fn e2e_pairing_rejects_untrusted() {
     let trusted_after = send_engine.trusted_fingerprints().await;
     assert!(!trusted_after.contains(&peer_fp), "fingerprint should no longer be trusted");
 
-    let err = send_engine
-        .send_files_to_addr(addr, vec![file_path], SessionId::new())
+    let err = send_files(&send_engine, addr, vec![file_path])
         .await
         .expect_err("expected PairingRequired after untrust");
     match &err {
@@ -249,7 +288,7 @@ async fn e2e_pairing_code_deterministic() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let _ = send_engine.send_files_to_addr(addr, vec![file_path], SessionId::new()).await;
+    let _ = send_files(&send_engine, addr, vec![file_path]).await;
 
     // Give events time to be dispatched
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -372,8 +411,7 @@ async fn e2e_resume_partial_transfer() {
         let engine = privet_core::PrivetEngine::new(send_config)
             .await
             .expect("send engine");
-        engine
-            .send_files_to_addr(addr, vec![file_path], SessionId::new())
+        send_files(&engine, addr, vec![file_path])
             .await
             .expect("send with resume");
     }
@@ -433,8 +471,7 @@ async fn e2e_transfer_log_created() {
     sc.log_dir = Some(log_dir.clone());
     let send_engine = privet_core::PrivetEngine::new(sc).await.expect("send");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    send_engine
-        .send_files_to_addr(addr, vec![file_path], SessionId::new())
+    send_files(&send_engine, addr, vec![file_path])
         .await
         .expect("send");
 
@@ -504,7 +541,7 @@ async fn e2e_tcp_fallback_engine() {
     let send = privet_core::PrivetEngine::new(sc).await.expect("send engine");
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    send.send_files_to_addr(addr, vec![file_path], SessionId::new())
+    send_files(&send, addr, vec![file_path])
         .await
         .expect("TCP fallback send");
 
@@ -566,8 +603,7 @@ async fn run_multifile_transfer(sizes: &[usize]) {
         let engine = privet_core::PrivetEngine::new(config)
             .await
             .expect("send engine");
-        engine
-            .send_files_to_addr(addr, file_paths, SessionId::new())
+        send_files(&engine, addr, file_paths)
             .await
             .expect("multi-file send");
         eprintln!("[multi] send complete");
@@ -642,6 +678,238 @@ async fn collect_awaiting_pairing_code(
     None
 }
 
+// ---------------------------------------------------------------------------
+// Directory transfer tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_directory_nested_structure() {
+    // Send a directory with nested files and subdirectories.
+    // Verify the full tree is recreated on the receiver.
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+
+    // Create directory tree:
+    // mydir/
+    //   readme.txt (512B)
+    //   src/
+    //     main.rs (1KB)
+    //     lib.rs (2KB)
+    //   docs/
+    //     guide.md (768B)
+    //   empty_dir/  (empty, should be preserved)
+    let (_dir_path, files) = generate_dir_tree(&send_dir, "mydir", &[
+        ("readme.txt", 512),
+        ("src/main.rs", 1024),
+        ("src/lib.rs", 2048),
+        ("docs/guide.md", 768),
+        ("empty_dir/", 0),
+    ]);
+    eprintln!("[dir-nested] generated {} files in mydir/", files.len());
+
+    // Start receiver
+    let mut recv_config = PrivetConfig::default_with_name("dir-recv".into());
+    recv_config.transport.listen_port = port;
+    recv_config.download_dir = recv_dir.clone();
+    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    let recv_engine = privet_core::PrivetEngine::new(recv_config)
+        .await
+        .expect("recv engine");
+    recv_engine.start().await.expect("recv start");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send the entire directory (separate sender engine)
+    let dir_path = send_dir.join("mydir");
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    {
+        let mut send_config = PrivetConfig::default_with_name("dir-send".into());
+        send_config.transport.listen_port = 0;
+        send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        let send_engine = privet_core::PrivetEngine::new(send_config)
+            .await
+            .expect("send engine");
+        send_files(&send_engine, addr, vec![dir_path])
+            .await
+            .expect("directory send");
+        eprintln!("[dir-nested] send complete");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recv_engine.shutdown().await.expect("shutdown");
+
+    // Verify each file arrived with correct path under recv_dir/mydir/
+    for (rel_path, (_src_path, src_hash, _size)) in &files {
+        let received_path = recv_dir.join("mydir").join(rel_path);
+        assert!(
+            received_path.exists(),
+            "file missing: {}",
+            received_path.display()
+        );
+        let actual_hash = sha256_file(&received_path);
+        assert_eq!(
+            *src_hash, actual_hash,
+            "hash mismatch for {}: src={} got={}",
+            rel_path, src_hash, actual_hash
+        );
+        eprintln!("[dir-nested] verified {rel_path} OK");
+    }
+
+    // Verify empty directory is preserved
+    let empty_dir = recv_dir.join("mydir").join("empty_dir");
+    assert!(empty_dir.exists(), "empty directory should exist");
+    assert!(empty_dir.is_dir(), "empty_dir should be a directory");
+    eprintln!("[dir-nested] verified empty_dir/ OK");
+
+    eprintln!("[dir-nested] PASS — {} files + 1 empty dir verified", files.len());
+}
+
+#[tokio::test]
+async fn e2e_directory_mixed_with_files() {
+    // Send a mix of individual files AND a directory.
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+
+    // Create individual root-level files
+    let (root_txt, root_txt_hash) = generate_test_file(&send_dir, "root.txt", 256);
+    let (root_bin, root_bin_hash) = generate_test_file(&send_dir, "data.bin", 512);
+
+    // Create a subdirectory with files
+    let (_dir_path, sub_files) = generate_dir_tree(&send_dir, "subdir", &[
+        ("inner.txt", 128),
+        ("deep/nested.md", 256),
+    ]);
+    let subdir_path = send_dir.join("subdir");
+
+    eprintln!("[dir-mixed] generated files");
+
+    // Start receiver
+    let mut recv_config = PrivetConfig::default_with_name("mixed-recv".into());
+    recv_config.transport.listen_port = port;
+    recv_config.download_dir = recv_dir.clone();
+    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    let recv_engine = privet_core::PrivetEngine::new(recv_config)
+        .await
+        .expect("recv engine");
+    recv_engine.start().await.expect("recv start");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send root files + directory together (separate sender engine)
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    {
+        let mut send_config = PrivetConfig::default_with_name("mixed-send".into());
+        send_config.transport.listen_port = 0;
+        send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        let send_engine = privet_core::PrivetEngine::new(send_config)
+            .await
+            .expect("send engine");
+        send_files(&send_engine, addr, vec![root_txt, root_bin, subdir_path])
+            .await
+            .expect("mixed send");
+        eprintln!("[dir-mixed] send complete");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recv_engine.shutdown().await.expect("shutdown");
+
+    // Verify root files
+    let recv_root_txt = recv_dir.join("root.txt");
+    assert!(recv_root_txt.exists(), "root.txt missing");
+    assert_eq!(sha256_file(&recv_root_txt), root_txt_hash, "root.txt hash");
+    eprintln!("[dir-mixed] verified root.txt OK");
+
+    let recv_root_bin = recv_dir.join("data.bin");
+    assert!(recv_root_bin.exists(), "data.bin missing");
+    assert_eq!(sha256_file(&recv_root_bin), root_bin_hash, "data.bin hash");
+    eprintln!("[dir-mixed] verified data.bin OK");
+
+    // Verify subdirectory files
+    for (rel_path, (_src_path, src_hash, _size)) in &sub_files {
+        let received_path = recv_dir.join("subdir").join(rel_path);
+        assert!(
+            received_path.exists(),
+            "subdir file missing: {}",
+            received_path.display()
+        );
+        assert_eq!(
+            &sha256_file(&received_path),
+            src_hash,
+            "hash mismatch for subdir/{}",
+            rel_path
+        );
+        eprintln!("[dir-mixed] verified subdir/{rel_path} OK");
+    }
+
+    eprintln!("[dir-mixed] PASS — root files + subdir verified");
+}
+
+#[tokio::test]
+async fn e2e_directory_empty_dir_marker() {
+    // Send a directory that contains ONLY empty subdirectories (no files).
+    privet_core::init();
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let send_dir = temp_dir.path().join("send");
+    let recv_dir = temp_dir.path().join("recv");
+    std::fs::create_dir_all(&send_dir).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let port = pick_port();
+
+    // Create empty directory
+    let empty_dir = send_dir.join("empties");
+    std::fs::create_dir_all(&empty_dir.join("a")).unwrap();
+    std::fs::create_dir_all(&empty_dir.join("b").join("c")).unwrap();
+
+    // Start receiver
+    let mut recv_config = PrivetConfig::default_with_name("empty-recv".into());
+    recv_config.transport.listen_port = port;
+    recv_config.download_dir = recv_dir.clone();
+    recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    let recv_engine = privet_core::PrivetEngine::new(recv_config).await.expect("recv");
+    recv_engine.start().await.expect("recv start");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    {
+        let mut send_config = PrivetConfig::default_with_name("empty-send".into());
+        send_config.transport.listen_port = 0;
+        send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        let send_engine = privet_core::PrivetEngine::new(send_config).await.expect("send");
+        send_files(&send_engine, addr, vec![empty_dir])
+            .await
+            .expect("empty dir send");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recv_engine.shutdown().await.expect("shutdown");
+
+    // Verify empty directories were created
+    assert!(recv_dir.join("empties").exists(), "empties/ should exist");
+    assert!(recv_dir.join("empties").is_dir(), "empties/ should be a dir");
+    assert!(recv_dir.join("empties").join("a").exists(), "empties/a/ should exist");
+    assert!(recv_dir.join("empties").join("a").is_dir(), "empties/a/ should be a dir");
+    assert!(recv_dir.join("empties").join("b").exists(), "empties/b/ should exist");
+    assert!(recv_dir.join("empties").join("b").join("c").exists(), "empties/b/c/ should exist");
+    eprintln!("[dir-empty] PASS — empty directories recreated");
+}
+
 // --- Core transfer helper ---
 
 async fn run_transfer(file_size: usize) {
@@ -681,10 +949,9 @@ async fn run_transfer(file_size: usize) {
         config.transport.listen_port = 0;
         config.security_mode = privet_core::SecurityMode::AllowAll;
         let engine = privet_core::PrivetEngine::new(config).await.expect("sender engine");
-        engine
-            .send_files_to_addr(addr, vec![file_path], SessionId::new())
+        send_files(&engine, addr, vec![file_path])
             .await
-            .expect("send_files_to_addr");
+            .expect("send files");
         eprintln!("[{file_size}B] send complete");
     }
 

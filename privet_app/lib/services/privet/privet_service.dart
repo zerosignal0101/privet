@@ -183,11 +183,13 @@ class PrivetService {
   // File transfer
   // -----------------------------------------------------------------------
 
-  Future<bool> sendFilesStart(String sessionId, String addr, List<String> paths) =>
-      _ffiIsolate.sendFilesStart(sessionId, addr, paths);
+  /// `fileEntries` is a list of strings (old format) or maps with 'path'/'relative' keys.
+  Future<bool> sendFilesStart(String sessionId, String addr, List<dynamic> fileEntries) =>
+      _ffiIsolate.sendFilesStart(sessionId, addr, fileEntries);
 
-  Future<String?> sendFilesToName(String name, List<String> paths) =>
-      _ffiIsolate.sendFilesToName(name, paths);
+  /// `fileEntries` is a list of strings (old format) or maps with 'path'/'relative' keys.
+  Future<String?> sendFilesToName(String name, List<dynamic> fileEntries) =>
+      _ffiIsolate.sendFilesToName(name, fileEntries);
 
   Future<bool> acceptTransfer(String sessionId) =>
       _ffiIsolate.acceptTransfer(sessionId);

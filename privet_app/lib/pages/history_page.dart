@@ -7,8 +7,10 @@ import 'package:open_file/open_file.dart';
 import 'send_preparation_page.dart';
 
 import '../models/transfer_history.dart';
+import '../models/file_tree.dart';
 import '../services/privet/content_uri_helper.dart';
 import '../providers/providers.dart';
+import '../widgets/file_tree_view.dart';
 
 class HistoryPage extends ConsumerWidget {
   const HistoryPage({super.key});
@@ -98,7 +100,8 @@ class _HistoryRecordTile extends ConsumerWidget {
               child: Text(record.error!,
                   style: const TextStyle(fontSize: 12, color: Colors.red)),
             ),
-          ...record.files.map((f) => _fileTile(f, context)),
+          // Show hierarchical tree if there are directory structures.
+          ..._buildFileList(context, record.files),
           // Resend/Forward + Delete
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
@@ -226,6 +229,34 @@ class _HistoryRecordTile extends ConsumerWidget {
             : null,
       );
     }
+  }
+
+  /// Build the file list — uses tree view for hierarchical structures.
+  List<Widget> _buildFileList(BuildContext context, List<TransferFileRecord> files) {
+    // Check if any file has a directory structure (relative path with '/')
+    final hasHierarchy = files.any((f) =>
+        (f.relativePath != null && f.relativePath!.contains('/')) ||
+        (f.path.contains('/') && !File(f.path).isAbsolute));
+
+    if (!hasHierarchy) {
+      // Flat list — single-level display
+      return files.map((f) => _fileTile(f, context)).toList();
+    }
+
+    // Build tree from records
+    final treeNodes = buildFileTreeFromRecords(files);
+    final isReceiveFile = record.direction == TransferDirection.receiving;
+
+    return [
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: FileTreeView(
+          nodes: treeNodes,
+          onOpenFile: isReceiveFile ? (path) => OpenFile.open(path) : null,
+          formatSize: _formatSize,
+        ),
+      ),
+    ];
   }
 
   void _resend(BuildContext context, WidgetRef ref) async {

@@ -315,6 +315,7 @@ impl Receiver {
                 path: f.relative_path.clone(),
                 size: f.size,
                 is_dir: f.is_dir,
+                relative_path: Some(f.relative_path.clone()),
             })
             .collect();
         self.session_meta.write().await.insert(
@@ -433,13 +434,22 @@ impl Receiver {
         // Send Accept
         control::write_control_frame(&mut ctrl_send, &handshake::serialize(&ControlMessage::Accept(Accept { session_id, resume_map }))?).await?;
 
-        // Receive data streams
-        let file_count = offer.files.files.len();
+        // Create directories for directory marker entries (no data stream for these)
+        let mut actual_dests: Vec<PathBuf> = Vec::new();
+        for file_entry in &offer.files.files {
+            if file_entry.is_dir && file_entry.size == 0 {
+                let dir_path = self.download_dir.join(&file_entry.relative_path);
+                tokio::fs::create_dir_all(&dir_path).await?;
+                actual_dests.push(dir_path);
+            }
+        }
+
+        // Receive data streams (directory markers have no data stream)
+        let data_file_count = offer.files.files.iter().filter(|f| !f.is_dir).count();
         let total_size = offer.total_size;
         let tracker = std::sync::Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
         let mut files_received = 0usize;
-        let mut actual_dests: Vec<PathBuf> = Vec::new();
-        while files_received < file_count {
+        while files_received < data_file_count {
             // Check local cancel flag first
             if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
                 send_cancel_and_wait(&mut ctrl_send, &mut ctrl_recv, session_id, "cancelled by user").await;
@@ -536,13 +546,19 @@ impl Receiver {
         self.cancel_signals.write().await.remove(&session_id);
         self.session_meta.write().await.remove(&session_id);
 
-        // Build file_records from the actual paths (handles duplicate filenames)
+        // Build file_records from actual paths, deriving relative path from download_dir
         let actual_file_records: Vec<crate::storage::records::TransferFileRecord> = actual_dests.iter().map(|p| {
-            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let meta = std::fs::metadata(p).ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let relative_path = p.strip_prefix(&self.download_dir).ok()
+                .and_then(|r| r.to_str())
+                .map(|s| s.replace('\\', "/"));
             crate::storage::records::TransferFileRecord {
-                path: p.to_string_lossy().to_string(), // absolute path, independent of download dir setting
+                path: p.to_string_lossy().to_string(),
                 size,
-                is_dir: false,
+                is_dir,
+                relative_path,
             }
         }).collect();
 
@@ -570,6 +586,14 @@ async fn receive_stream_files(
 ) -> Result<Vec<PathBuf>, PrivetError> {
     let mut actual_dests = Vec::new();
     for file_entry in &stream_header.files {
+        // Directory marker: create directory, no data to read
+        if file_entry.is_dir && file_entry.total_size == 0 {
+            let dir_path = download_dir.join(&file_entry.relative_path);
+            tokio::fs::create_dir_all(&dir_path).await?;
+            actual_dests.push(dir_path);
+            continue;
+        }
+
         // Use atomic create_new (O_CREAT|O_EXCL) to avoid FUSE caching races
         let dest;
         let mut file;

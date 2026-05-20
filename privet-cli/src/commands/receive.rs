@@ -110,6 +110,18 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
                     println!("\nIncoming transfer from {}", peer.name);
                     println!("  Session: {session_id}");
                     println!("  Files: {} ({})", files.files.len(), super::format_size(files.total_size));
+                    // Show files with directory structure
+                    let has_subdirs = files.files.iter().any(|f| f.relative_path.contains('/'));
+                    if has_subdirs {
+                        println!("  File structure:");
+                        for f in &files.files {
+                            if f.is_dir {
+                                println!("    📁 {} (dir)", f.relative_path);
+                            } else {
+                                println!("    📄 {} ({})", f.relative_path, super::format_size(f.size));
+                            }
+                        }
+                    }
                     let choice = super::prompt_choice("  Accept?", "A=Accept, R=Reject");
                     match choice {
                         'A' | 'a' => {

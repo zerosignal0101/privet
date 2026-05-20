@@ -17,6 +17,9 @@ pub struct StreamFileEntry {
     pub start_offset: u64,
     /// Total size of the file.
     pub total_size: u64,
+    /// True for directory marker entries (no data to read/write).
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// A single data chunk within a stream.

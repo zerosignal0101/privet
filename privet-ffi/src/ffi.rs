@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int};
 
 use crate::runtime;
+use privet_core::session::{FileToSend, expand_paths};
 
 /// Helper macro: unwrap the engine or return an error value.
 macro_rules! engine_or {
@@ -181,13 +182,38 @@ pub extern "C" fn privet_send_files_start(
             Err(_) => return -1,
         }
     };
-    let paths: Vec<std::path::PathBuf> = match serde_json::from_str(paths_str) {
-        Ok(p) => p,
-        Err(_) => return -1,
+
+    // Parse paths_json — supports two formats:
+    //   Old: ["/abs/path1", "/abs/path2"]
+    //   New: [{"path": "/abs/path1", "relative": "dir/file1.txt"}, ...]
+    let files: Vec<FileToSend> = if let Ok(entries) = serde_json::from_str::<Vec<std::collections::HashMap<String, String>>>(paths_str) {
+        // New format with explicit relative paths
+        entries.iter().filter_map(|e| {
+            let abs = std::path::PathBuf::from(e.get("path")?);
+            let rel = e.get("relative")?.clone();
+            let meta = std::fs::metadata(&abs).ok()?;
+            Some(FileToSend {
+                absolute_path: abs,
+                relative_path: rel,
+                size: meta.len(),
+                modified: meta.modified().ok(),
+                sha256: None,
+                is_dir: meta.is_dir(),
+            })
+        }).collect()
+    } else if let Ok(paths) = serde_json::from_str::<Vec<std::path::PathBuf>>(paths_str) {
+        // Old format — expand directories on this side
+        let expanded = expand_paths(&paths);
+        for s in &expanded.skipped {
+            tracing::warn!("FFI: skipped path {}: {}", s.path.display(), s.reason);
+        }
+        expanded.files
+    } else {
+        return -1;
     };
 
     rt.spawn(async move {
-        let _ = engine.send_files_to_addr(addr, paths, sid).await;
+        let _ = engine.send_files_to_addr(addr, files, sid).await;
     });
 
     0

@@ -7,6 +7,9 @@ import 'package:open_file/open_file.dart';
 
 import '../providers/providers.dart';
 import '../widgets/peer_picker_sheet.dart';
+import '../widgets/file_tree_view.dart';
+import '../models/file_tree.dart';
+import '../services/privet/content_uri_dir_helper.dart';
 
 /// Multi-file send preparation screen.
 /// Allows adding files incrementally, changing recipient, then sending.
@@ -164,22 +167,97 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
                         ],
                       ),
                     ),
-                    _AddFileButton(onTap: () => _pickFiles(ref)),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: () => _pickFiles(ref),
+                              icon: const Icon(Icons.add, size: 18),
+                              label: const Text('Add files'),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: () => _pickFolder(ref),
+                              icon: const Icon(Icons.create_new_folder, size: 18),
+                              label: const Text('Add folder'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ],
                 )
-              : ListView.builder(
-                  itemCount: state.filePaths.length + 1,
-                  itemBuilder: (_, i) {
-                    if (i == state.filePaths.length) {
-                      return _AddFileButton(onTap: () => _pickFiles(ref));
-                    }
-                    return _FileItem(
-                      path: state.filePaths[i],
-                      onRemove: () =>
-                          ref.read(sendPreparationProvider.notifier).removeFile(i),
-                    );
-                  },
-                ),
+              : state.entries.isNotEmpty
+                  ? ListView(
+                      children: [
+                        // Tree view for expanded entries
+                        _FileTreeSection(
+                          entries: state.entries,
+                          onRemove: (relPath) => ref.read(sendPreparationProvider.notifier).removeByRelativePath(relPath),
+                        ),
+                        // Add buttons at bottom
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  onPressed: () => _pickFiles(ref),
+                                  icon: const Icon(Icons.add, size: 18),
+                                  label: const Text('Add files'),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  onPressed: () => _pickFolder(ref),
+                                  icon: const Icon(Icons.create_new_folder, size: 18),
+                                  label: const Text('Add folder'),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    )
+                  : ListView.builder(
+                      itemCount: state.filePaths.length + 1,
+                      itemBuilder: (_, i) {
+                        if (i == state.filePaths.length) {
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: () => _pickFiles(ref),
+                                    icon: const Icon(Icons.add, size: 18),
+                                    label: const Text('Add files'),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: () => _pickFolder(ref),
+                                    icon: const Icon(Icons.create_new_folder, size: 18),
+                                    label: const Text('Add folder'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }
+                        return _FileItem(
+                          path: state.filePaths[i],
+                          onRemove: () =>
+                              ref.read(sendPreparationProvider.notifier).removeFile(i),
+                        );
+                      },
+                    ),
         ),
         const Divider(height: 1),
         _BottomBar(
@@ -228,7 +306,42 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
     }
   }
 
-  Future<void> _send(BuildContext context, WidgetRef ref) async {
+  void _pickFolder(WidgetRef ref) async {
+    if (Platform.isAndroid) {
+      // Android: use native SAF picker (ACTION_OPEN_DOCUMENT_TREE) which
+      // always returns a content:// URI, bypassing file_picker's MIUI path bug.
+      // Files are copied to cache via ContentResolver on the native side.
+      final entries = await ContentUriDirectoryHelper.pickAndCacheDirectory();
+      debugPrint('[pickFolder] SAF picker result: ${entries?.length ?? 0} entries');
+      if (entries != null && entries.isNotEmpty) {
+        final sendEntries = entries.map((e) {
+          int size = 0;
+          try { size = File(e.absolutePath).lengthSync(); } catch (_) {}
+          return SendFileEntry(
+            absolutePath: e.absolutePath,
+            relativePath: e.relativePath,
+            size: size,
+          );
+        }).toList();
+        ref.read(sendPreparationProvider.notifier).addFileEntries(sendEntries);
+      } else if (entries != null && entries.isEmpty) {
+        debugPrint('[pickFolder] user cancelled SAF picker');
+      } else {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not access folder via SAF. Try selecting files individually.')),
+          );
+        }
+      }
+      return;
+    }
+
+    // Non-Android: use file_picker
+    final dirPath = await FilePicker.platform.getDirectoryPath();
+    if (dirPath != null) {
+      ref.read(sendPreparationProvider.notifier).addFiles([dirPath]);
+    }
+  }  Future<void> _send(BuildContext context, WidgetRef ref) async {
     final sessionId = await ref.read(sendPreparationProvider.notifier).send();
     if (sessionId != null && context.mounted) {
       Navigator.pop(context);
@@ -280,15 +393,39 @@ class _FileItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final file = File(path);
-    final exists = file.existsSync();
-    final size = exists ? file.lengthSync() : 0;
+    debugPrint('[FileItem] path="$path"');
+
+    // Handle content:// URIs — cannot access via dart:io
+    if (path.startsWith('content://')) {
+      final name = path.split('/').last;
+      return ListTile(
+        leading: Icon(Icons.folder, color: Colors.amber.shade600, size: 22),
+        title: Text(Uri.decodeComponent(name),
+            overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
+        subtitle: const Text('Android content URI (cannot scan)',
+            style: TextStyle(fontSize: 12, color: Colors.grey)),
+        trailing: IconButton(
+          icon: const Icon(Icons.close, size: 18),
+          onPressed: onRemove,
+        ),
+      );
+    }
+
+    final entity = FileSystemEntity.typeSync(path);
+    final exists = entity != FileSystemEntityType.notFound;
+    final isDir = entity == FileSystemEntityType.directory;
     final name = path.split(Platform.pathSeparator).last;
+    int size = 0;
+    if (exists && !isDir) {
+      try { size = File(path).lengthSync(); } catch (_) {}
+    }
+    debugPrint('[FileItem] pathType=$entity exists=$exists isDir=$isDir');
 
     return ListTile(
       leading: Icon(
-        exists ? Icons.insert_drive_file : Icons.error_outline,
-        color: exists ? null : Colors.red,
+        isDir ? Icons.folder : (exists ? Icons.insert_drive_file : Icons.error_outline),
+        color: isDir ? Colors.amber.shade600 : (exists ? null : Colors.red),
+        size: 22,
       ),
       title: Text(
         name,
@@ -299,7 +436,7 @@ class _FileItem extends StatelessWidget {
         ),
       ),
       subtitle: Text(
-        exists ? _formatSize(size) : 'File not found',
+        isDir ? 'Folder selected (scanned on send)' : (exists ? _formatSize(size) : 'File not found'),
         style: TextStyle(
           fontSize: 12,
           color: exists ? Colors.grey : Colors.red.shade300,
@@ -308,7 +445,7 @@ class _FileItem extends StatelessWidget {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (exists)
+          if (exists && !isDir)
             IconButton(
               icon: const Icon(Icons.open_in_new, size: 18),
               tooltip: 'Open file',
@@ -330,28 +467,6 @@ class _FileItem extends StatelessWidget {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
     }
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Add file button
-// ---------------------------------------------------------------------------
-
-class _AddFileButton extends StatelessWidget {
-  final VoidCallback onTap;
-
-  const _AddFileButton({required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      child: OutlinedButton.icon(
-        onPressed: onTap,
-        icon: const Icon(Icons.add, size: 18),
-        label: const Text('Add files'),
-      ),
-    );
   }
 }
 
@@ -395,6 +510,131 @@ class _BottomBar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// File tree section shown in the send preparation page
+// ---------------------------------------------------------------------------
+
+class _FileTreeSection extends StatelessWidget {
+  final List<SendFileEntry> entries;
+  final void Function(String relativePath) onRemove;
+
+  const _FileTreeSection({required this.entries, required this.onRemove});
+
+  @override
+  Widget build(BuildContext context) {
+    final treeNodes = _buildTree(entries);
+    return FileTreeView(
+      nodes: treeNodes,
+      showRemoveButtons: true,
+      onRemoveFile: onRemove,
+      formatSize: _formatSize,
+    );
+  }
+
+  /// Build a tree from the flat entries list, using `isDir` to mark directory nodes.
+  List<FileTreeNode> _buildTree(List<SendFileEntry> entries) {
+    // Collect file paths and directory markers
+    final filePaths = <String>[];
+    final dirSet = <String>{};
+    for (final e in entries) {
+      if (e.isDir) {
+        dirSet.add(e.relativePath);
+      } else {
+        filePaths.add(e.relativePath);
+      }
+    }
+
+    // Build tree with known directories clearly marked
+    final lookup = <String, List<String>>{};
+    for (final path in filePaths) {
+      final parts = path.split('/');
+      if (parts.isEmpty) continue;
+      final fileName = parts.last;
+      final dirParts = parts.sublist(0, parts.length - 1);
+      final dirKey = dirParts.join('/');
+      lookup.putIfAbsent(dirKey, () => []).add(fileName);
+    }
+    // Also add empty dirs so they appear in the lookup
+    for (final dirPath in dirSet) {
+      final parts = dirPath.split('/');
+      for (int i = 0; i < parts.length; i++) {
+        final prefix = parts.sublist(0, i).join('/');
+        lookup.putIfAbsent(prefix, () => []);
+      }
+    }
+
+    // Build size map: relativePath → size
+    final sizeMap = <String, int>{};
+    for (final e in entries) {
+      sizeMap[e.relativePath] = e.size;
+    }
+
+    return _buildTreeNodes(lookup, '', dirSet, sizeMap);
+  }
+
+  List<FileTreeNode> _buildTreeNodes(Map<String, List<String>> lookup, String prefix, Set<String> dirSet, Map<String, int> sizeMap) {
+    final result = <FileTreeNode>[];
+    final dirs = <String>{};
+    final files = <String>[];
+
+    for (final entry in lookup.entries) {
+      final dirPath = entry.key;
+      if (dirPath == prefix) {
+        for (final fileName in entry.value) {
+          final fullPath = prefix.isEmpty ? fileName : '$prefix/$fileName';
+          // Check if it's a known directory marker or has a sub-path in dirSet
+          if (dirSet.contains(fullPath)) {
+            dirs.add(fullPath);
+          } else {
+            files.add(fileName);
+          }
+        }
+      } else if (dirPath.startsWith(prefix) && prefix.length < dirPath.length) {
+        final rest = dirPath.substring(prefix.isEmpty ? 0 : prefix.length + 1);
+        if (!rest.contains('/')) {
+          dirs.add(dirPath);
+        }
+      }
+    }
+
+    // Add directories (sorted)
+    for (final dirPath in (dirs.toList()..sort())) {
+      final dirName = dirPath.contains('/') ? dirPath.split('/').last : dirPath;
+      final children = _buildTreeNodes(lookup, dirPath, dirSet, sizeMap);
+      result.add(FileTreeNode(
+        name: dirName,
+        relativePath: dirPath,
+        isDir: true,
+        children: children,
+      ));
+    }
+
+    // Add files (sorted)
+    for (final fileName in (files..sort())) {
+      final fullPath = prefix.isEmpty ? fileName : '$prefix/$fileName';
+      result.add(FileTreeNode(
+        name: fileName,
+        relativePath: fullPath,
+        isDir: false,
+        size: sizeMap[fullPath] ?? 0,
+      ));
+    }
+
+    return result;
+  }
+
+  static String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
   }
 }
 

@@ -113,19 +113,22 @@ class PrivetFfiIsolate {
   /// Start sending files with a pre-generated session_id (non-blocking).
   /// The caller must register the session via [registerSendSession] before
   /// calling this to avoid a race between session registration and failure events.
-  Future<bool> sendFilesStart(String sessionId, String addr, List<String> paths) async {
+  /// Send files. `fileEntries` is a list of either:
+  ///   - Strings (absolute paths, old format)
+  ///   - Maps with 'path' and 'relative' keys (new format)
+  Future<bool> sendFilesStart(String sessionId, String addr, List<dynamic> fileEntries) async {
     final r = await _call('send_files_start', {
       'session_id': sessionId,
       'addr': addr,
-      'paths': paths,
+      'paths': fileEntries,
     });
     return r['ok'] == true;
   }
 
-  Future<String?> sendFilesToName(String name, List<String> paths) async {
+  Future<String?> sendFilesToName(String name, List<dynamic> fileEntries) async {
     final r = await _call('send_files_to_name', {
       'name': name,
-      'paths': paths,
+      'paths': fileEntries,
     });
     if (r['ok'] == true) return r['session_id'] as String?;
     return null;
@@ -468,8 +471,8 @@ void _cmdStart(PrivetFfi ffi, _FfiCommand cmd) {
 void _cmdSendFilesStart(PrivetFfi ffi, _FfiCommand cmd) {
   final sessionId = (cmd.args['session_id'] as String).toNativeUtf8();
   final addr = (cmd.args['addr'] as String).toNativeUtf8();
-  final paths = cmd.args['paths'] as List<String>;
-  final pathsJson = jsonEncode(paths).toNativeUtf8();
+  final rawPaths = cmd.args['paths'] as List<dynamic>;
+  final pathsJson = jsonEncode(_encodePaths(rawPaths)).toNativeUtf8();
 
   try {
     final result = ffi.sendFilesStart(sessionId, addr, pathsJson);
@@ -483,8 +486,8 @@ void _cmdSendFilesStart(PrivetFfi ffi, _FfiCommand cmd) {
 
 void _cmdSendFilesToName(PrivetFfi ffi, _FfiCommand cmd) {
   final name = (cmd.args['name'] as String).toNativeUtf8();
-  final paths = cmd.args['paths'] as List<String>;
-  final pathsJson = jsonEncode(paths).toNativeUtf8();
+  final rawPaths = cmd.args['paths'] as List<dynamic>;
+  final pathsJson = jsonEncode(_encodePaths(rawPaths)).toNativeUtf8();
   final outSessionId = calloc<Uint8>(37);
 
   try {
@@ -504,6 +507,25 @@ void _cmdSendFilesToName(PrivetFfi ffi, _FfiCommand cmd) {
     calloc.free(pathsJson);
     calloc.free(outSessionId);
   }
+}
+
+/// Encode a list of file entries to the JSON format.
+/// Supports both old format (strings) and new format (maps with path/relative).
+List<dynamic> _encodePaths(List<dynamic> entries) {
+  // Detect old format: all entries are strings
+  if (entries.every((e) => e is String)) {
+    return entries; // pass through as-is: ["/path/to/file"]
+  }
+  // New format: convert maps to objects
+  return entries.map((e) {
+    if (e is Map) {
+      return {
+        'path': e['path'],
+        'relative': e['relative'] ?? (e['path'] as String).split('/').last,
+      };
+    }
+    return e; // fallback for strings
+  }).toList();
 }
 
 void _cmdTransferAction(

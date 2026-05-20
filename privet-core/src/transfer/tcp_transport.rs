@@ -10,7 +10,7 @@ use tokio::sync::{oneshot, RwLock};
 use crate::error::{PrivetError, TransportError};
 use crate::protocol::data::{self, Chunk};
 use crate::protocol::handshake::{self, ControlMessage, HelloAck, ResumePoint};
-use crate::session::{FileManifest, SessionId};
+use crate::session::{FileManifest, FileToSend, SessionId};
 use crate::storage::records::TransferFileRecord;
 use crate::transfer::progress::ProgressTracker;
 
@@ -163,6 +163,7 @@ where
             path: f.relative_path.clone(),
             size: f.size,
             is_dir: f.is_dir,
+            relative_path: Some(f.relative_path.clone()),
         }).collect(),
         total_bytes: offer.total_size,
         started_at: std::time::SystemTime::now()
@@ -346,11 +347,17 @@ where
 
     // Build file records from actual destination paths
     let file_records: Vec<TransferFileRecord> = dest_paths.iter().map(|p| {
-        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let meta = std::fs::metadata(p).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let relative_path = p.strip_prefix(&download_dir).ok()
+            .and_then(|r| r.to_str())
+            .map(|s| s.replace('\\', "/"));
         TransferFileRecord {
             path: p.to_string_lossy().to_string(),
             size,
-            is_dir: false,
+            is_dir,
+            relative_path,
         }
     }).collect();
 
@@ -378,6 +385,14 @@ where
     let mut dest_paths = Vec::with_capacity(files.len());
 
     for (file_idx, file_info) in files.iter().enumerate() {
+        // Handle directory marker entries: create the directory, no data to read
+        if file_info.is_dir && file_info.size == 0 {
+            let dir_path = download_dir.join(&file_info.relative_path);
+            tokio::fs::create_dir_all(&dir_path).await?;
+            dest_paths.push(dir_path);
+            continue;
+        }
+
         let base = download_dir.join(&file_info.relative_path);
         let pair = crate::transfer::receiver::open_file_atomic(&base).await?;
         let dest = pair.0;
@@ -493,7 +508,7 @@ where
 pub async fn send_files_tcp<S>(
     mut stream: S,
     addr: std::net::SocketAddr,
-    files: Vec<PathBuf>,
+    files: Vec<FileToSend>,
     chunk_size: u32,
     identity: &crate::security::identity::DeviceIdentity,
     trusted_fingerprints: &[String],
@@ -565,7 +580,7 @@ where
     }
 
     // 4. Build manifest and send Offer
-    let manifest = FileManifest::from_paths(&files)?;
+    let manifest = FileManifest::from_expanded(&files);
     let offer = ControlMessage::Offer(handshake::Offer {
         session_id,
         files: handshake::FileManifestInfo {
@@ -611,15 +626,19 @@ where
     let total_size = manifest.total_size;
     let tracker = std::sync::Arc::new(std::sync::Mutex::new(ProgressTracker::new(total_size)));
 
-    for (file_idx, file_path) in files.iter().enumerate() {
-        let entry = &manifest.files[file_idx];
+    for (file_idx, file_entry) in files.iter().enumerate() {
+        // Skip directory marker entries (no data to send)
+        if file_entry.is_dir {
+            continue;
+        }
+
         let resume_offset = accept
             .resume_map
-            .get(&entry.relative_path)
+            .get(&file_entry.relative_path)
             .map(|r| r.bytes_received)
             .unwrap_or(0);
 
-        let mut file = tokio::fs::File::open(file_path).await?;
+        let mut file = tokio::fs::File::open(&file_entry.absolute_path).await?;
         if resume_offset > 0 {
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(resume_offset)).await?;
@@ -708,6 +727,23 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::io::duplex;
+
+    /// Helper: convert a PathBuf to a FileToSend (single file, flat name).
+    fn file_to_send(path: PathBuf) -> FileToSend {
+        let metadata = std::fs::metadata(&path).expect("test file should exist");
+        let relative_path = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        FileToSend {
+            absolute_path: path,
+            relative_path,
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            sha256: None,
+            is_dir: false,
+        }
+    }
 
     /// Helper: write a data frame (header + Chunk + payload) to a stream.
     async fn write_data_frame<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1065,7 +1101,7 @@ mod tests {
         let result = send_files_tcp(
             client,
             addr,
-            vec![file_path],
+            vec![file_to_send(file_path)],
             64 * 1024,
             &identity,
             &[],
@@ -1165,7 +1201,7 @@ mod tests {
         let send_result = send_files_tcp(
             client,
             addr,
-            vec![file_path],
+            vec![file_to_send(file_path.clone())],
             64 * 1024,
             &send_id,
             &[],   // empty trusted — AllowAll
@@ -1305,7 +1341,7 @@ mod tests {
         let send_result = send_files_tcp(
             tls_stream,
             addr,
-            vec![file_path],
+            vec![file_to_send(file_path)],
             64 * 1024,
             &send_id,
             &[],

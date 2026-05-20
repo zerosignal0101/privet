@@ -18,6 +18,7 @@ use crate::security::tls;
 use crate::security::trust::TrustStore;
 use crate::session::{SessionId, SessionState, TransferProgress, TransferSession};
 use crate::session::TransferDirection;
+use crate::session::FileToSend;
 use crate::storage::records::{TransferLog, TransferRecord, TransferFileRecord, TransferRecordState};
 use crate::transport::endpoint;
 
@@ -582,31 +583,37 @@ impl PrivetEngine {
             .ok_or_else(|| PrivetError::PeerNotFound(peer_id.to_string()))?;
 
         let session_id = SessionId::new();
-        self.send_files_to_addr(addr, paths, session_id).await
+        let expanded = crate::session::expand_paths(&paths);
+        for s in &expanded.skipped {
+            tracing::warn!("skipped path {}: {}", s.path.display(), s.reason);
+        }
+        self.send_files_to_addr(addr, expanded.files, session_id).await
     }
 
     /// Send files to a peer by address (IP:port), bypassing discovery.
+    /// Takes pre-expanded `FileToSend` entries. Callers that have raw paths
+    /// (potentially containing directories) should call `expand_paths` first.
     /// Tries QUIC first, then TCP fallback if configured.
     /// `session_id` is pre-generated so the caller can register it before
     /// the transfer starts; all TransferFailed events use this id.
     pub async fn send_files_to_addr(
         &self,
         addr: SocketAddr,
-        paths: Vec<PathBuf>,
+        files: Vec<FileToSend>,
         session_id: SessionId,
     ) -> Result<SessionId> {
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
 
-        // Build file records early for both success and failure logging
-        let file_records: Vec<TransferFileRecord> = paths.iter().map(|p| {
-            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        // Build file records from pre-expanded files
+        let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+        let file_records: Vec<TransferFileRecord> = files.iter().map(|f| {
             TransferFileRecord {
-                path: p.to_string_lossy().to_string(),
-                size,
-                is_dir: std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false),
+                path: f.absolute_path.to_string_lossy().to_string(),
+                size: f.size,
+                is_dir: f.is_dir,
+                relative_path: Some(f.relative_path.clone()),
             }
         }).collect();
-        let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
         let send_started_at = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -640,7 +647,7 @@ impl PrivetEngine {
             tracing::info!("force_tcp_fallback: skipping QUIC, going directly to TCP");
             Err(PrivetError::ConnectionTimeout)
         } else {
-            self.try_send_quic(session_id, addr, &paths, &trusted, &self.config.security_mode, &file_records, total_bytes).await
+            self.try_send_quic(session_id, addr, &files, &trusted, &self.config.security_mode, &file_records, total_bytes).await
         };
 
         let (session_id, peer_fingerprint, peer_device_name) = match quic_result {
@@ -725,8 +732,8 @@ impl PrivetEngine {
                     self.cancel_signals.write().await.insert(session_id, tcp_cancel_flag.clone());
                     self.session_meta.write().await.insert(session_id, SessionMeta {
                         direction: TransferDirection::Sending,
-                        file_relative_paths: paths.iter()
-                            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                        file_relative_paths: files.iter()
+                            .map(|f| f.relative_path.clone())
                             .collect(),
                         peer_name: String::new(),
                         peer_fingerprint: String::new(),
@@ -737,7 +744,7 @@ impl PrivetEngine {
                     match crate::transfer::tcp_transport::send_files_tcp(
                         tls_stream,
                         addr,
-                        paths.clone(),
+                        files.clone(),
                         self.config.transport.chunk_size,
                         &self.identity,
                         &trusted,
@@ -794,8 +801,8 @@ impl PrivetEngine {
         // Update session_meta with peer info (needed for cancel_transfer logging)
         self.session_meta.write().await.insert(session_id, SessionMeta {
             direction: TransferDirection::Sending,
-            file_relative_paths: paths.iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            file_relative_paths: files.iter()
+                .map(|f| f.relative_path.clone())
                 .collect(),
             peer_name: peer_device_name.clone(),
             peer_fingerprint: peer_fingerprint.clone(),
@@ -828,7 +835,7 @@ impl PrivetEngine {
         &self,
         session_id: SessionId,
         addr: SocketAddr,
-        paths: &[PathBuf],
+        files: &[FileToSend],
         trusted: &[String],
         security_mode: &crate::config::SecurityMode,
         file_records: &[crate::storage::records::TransferFileRecord],
@@ -858,8 +865,8 @@ impl PrivetEngine {
             .insert(session_id, cancel_flag.clone());
         self.session_meta.write().await.insert(session_id, SessionMeta {
             direction: TransferDirection::Sending,
-            file_relative_paths: paths.iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            file_relative_paths: files.iter()
+                .map(|f| f.relative_path.clone())
                 .collect(),
             peer_name: String::new(),
             peer_fingerprint: String::new(),
@@ -879,7 +886,7 @@ impl PrivetEngine {
         );
         sender.set_cancel_flag(cancel_flag);
 
-        let result = sender.send(session_id, paths, &self.event_tx, trusted, security_mode).await;
+        let result = sender.send(session_id, files, &self.event_tx, trusted, security_mode).await;
 
         // Clean up session tracking
         self.cancel_signals.write().await.remove(&session_id);
@@ -1022,7 +1029,11 @@ impl PrivetEngine {
                         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                             drop(store);
                             let sid = SessionId::new();
-                            return self.send_files_to_addr(addr, paths, sid).await;
+                            let expanded = crate::session::expand_paths(&paths);
+                            for s in &expanded.skipped {
+                                tracing::warn!("skipped path {}: {}", s.path.display(), s.reason);
+                            }
+                            return self.send_files_to_addr(addr, expanded.files, sid).await;
                         }
                     }
                 }

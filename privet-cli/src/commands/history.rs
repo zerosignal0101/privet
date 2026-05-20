@@ -206,6 +206,10 @@ async fn run_resend(
         std::process::exit(1);
     }
 
+    // Expand paths (handle directories if any)
+    let expanded = privet_core::session::expand_paths(&existing_files);
+    let expanded_files = expanded.files;
+
     // Show resume info
     let resume_msg = if existing_files.len() < record.files.len() {
         format!("Sending {} of {} file(s):", existing_files.len(), record.files.len())
@@ -284,7 +288,7 @@ async fn run_resend(
 
     let sid = SessionId::new();
     let send_result = {
-        let send_future = engine.send_files_to_addr(addr, existing_files, sid);
+        let send_future = engine.send_files_to_addr(addr, expanded_files.clone(), sid);
         tokio::pin!(send_future);
 
         let result = loop {

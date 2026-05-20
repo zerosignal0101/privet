@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
@@ -750,8 +751,26 @@ final transferHistoryProvider = NotifierProvider<TransferHistoryNotifier,
 // Send preparation state
 // ---------------------------------------------------------------------------
 
+/// A file entry with both absolute path (for reading) and relative path (for protocol).
+class SendFileEntry {
+  final String absolutePath;
+  final String relativePath;
+  final int size;
+  final bool isDir;
+
+  const SendFileEntry({
+    required this.absolutePath,
+    required this.relativePath,
+    this.size = 0,
+    this.isDir = false,
+  });
+}
+
 class SendPreparationState {
+  /// Top-level paths as added by user (files or directories).
   final List<String> filePaths;
+  /// Expanded entries with relative paths (for tree display and FFI sending).
+  final List<SendFileEntry> entries;
   /// Path → identifier (Android content:// URI) for files picked via file_picker.
   final Map<String, String?> fileIdentifiers;
   final String? peerName;
@@ -763,6 +782,7 @@ class SendPreparationState {
 
   const SendPreparationState({
     this.filePaths = const [],
+    this.entries = const [],
     this.fileIdentifiers = const {},
     this.peerName,
     this.peerAddress,
@@ -774,6 +794,7 @@ class SendPreparationState {
 
   SendPreparationState copyWith({
     List<String>? filePaths,
+    List<SendFileEntry>? entries,
     Map<String, String?>? fileIdentifiers,
     String? peerName,
     String? peerAddress,
@@ -786,6 +807,7 @@ class SendPreparationState {
   }) =>
       SendPreparationState(
         filePaths: filePaths ?? this.filePaths,
+        entries: entries ?? this.entries,
         fileIdentifiers: fileIdentifiers ?? this.fileIdentifiers,
         peerName: clearPeer == true ? null : (peerName ?? this.peerName),
         peerAddress: clearPeer == true ? null : (peerAddress ?? this.peerAddress),
@@ -796,15 +818,33 @@ class SendPreparationState {
       );
 
   bool get isReady => filePaths.isNotEmpty && (peerAddress != null) && !sending;
+
+  /// Total size of all file entries.
+  int get totalSize => entries.fold(0, (sum, e) => sum + e.size);
 }
 
 class SendPreparationNotifier extends Notifier<SendPreparationState> {
   @override
   SendPreparationState build() => const SendPreparationState();
 
+  /// Add pre-built file entries (from SAF cache, already have relative paths).
+  void addFileEntries(List<SendFileEntry> newEntries) {
+    state = state.copyWith(
+      filePaths: [...state.filePaths, ...newEntries.map((e) => e.absolutePath)],
+      entries: [...state.entries, ...newEntries],
+      sendError: '',
+    );
+  }
+
+  /// Add files or directories. Directories are expanded recursively.
   void addFiles(List<String> paths, {Map<String, String?>? identifiers}) {
+    final newEntries = <SendFileEntry>[];
+    for (final p in paths) {
+      newEntries.addAll(_scanPath(p));
+    }
     state = state.copyWith(
       filePaths: [...state.filePaths, ...paths],
+      entries: [...state.entries, ...newEntries],
       fileIdentifiers: identifiers != null
           ? {...state.fileIdentifiers, ...identifiers}
           : state.fileIdentifiers,
@@ -812,15 +852,140 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     );
   }
 
+  /// Scan a single path (file or directory) and return expanded entries.
+  List<SendFileEntry> _scanPath(String path) {
+    FileSystemEntityType type;
+    try {
+      type = FileSystemEntity.typeSync(path);
+    } catch (e) {
+      debugPrint('[scanPath] typeSync error for "$path": $e');
+      return [];
+    }
+    debugPrint('[scanPath] "$path" type=$type');
+    if (type == FileSystemEntityType.notFound) return [];
+
+    if (type == FileSystemEntityType.directory) {
+      final entries = _scanDirectory(path, path);
+      debugPrint('[scanPath] scanned dir "$path": ${entries.length} files');
+      return entries;
+    }
+
+    // Single file
+    try {
+      final size = File(path).lengthSync();
+      final name = path.split(Platform.pathSeparator).last;
+      debugPrint('[scanPath] single file "$name" size=$size');
+      return [SendFileEntry(absolutePath: path, relativePath: name, size: size)];
+    } catch (e) {
+      debugPrint('[scanPath] error reading file "$path": $e');
+      return [];
+    }
+  }
+
+  /// Recursively scan a directory, computing relative paths.
+  /// Uses manual recursion (not listSync recursive) to handle scoped storage
+  /// where each subdirectory must be tried independently.
+  List<SendFileEntry> _scanDirectory(String dirPath, String rootPath) {
+    final result = <SendFileEntry>[];
+    _scanDirRecursive(dirPath, rootPath, result);
+    debugPrint('[scanDir] found ${result.length} files total in $dirPath');
+    return result;
+  }
+
+  void _scanDirRecursive(String dirPath, String rootPath, List<SendFileEntry> result) {
+    final dir = Directory(dirPath);
+    if (!dir.existsSync()) return;
+
+    List<FileSystemEntity> entries;
+    try {
+      entries = dir.listSync();
+    } catch (e) {
+      debugPrint('[scanDir] listSync error for "$dirPath": $e');
+      return;
+    }
+
+    debugPrint('[scanDir] scanning $dirPath: ${entries.length} entries');
+
+    for (final entity in entries) {
+      final absPath = entity.path;
+      final relPath = absPath.startsWith(rootPath)
+          ? absPath.substring(rootPath.length + 1)
+          : absPath.split(Platform.pathSeparator).last;
+
+      // Check if it's a directory by trying to list it (most reliable on scoped storage)
+      bool isDir = false;
+      try {
+        // Try listing as directory first — if it succeeds, it IS a directory
+        Directory(absPath).listSync();
+        isDir = true;
+      } catch (_) {
+        // Not a directory or blocked — try typeSync as fallback
+        try {
+          isDir = FileSystemEntity.typeSync(absPath) == FileSystemEntityType.directory;
+        } catch (_) {
+          // Both blocked — use extension heuristic
+          isDir = !relPath.contains('.');
+        }
+      }
+
+      if (isDir) {
+        result.add(SendFileEntry(
+          absolutePath: absPath,
+          relativePath: relPath.replaceAll('\\', '/'),
+          size: 0,
+          isDir: true,
+        ));
+        _scanDirRecursive(absPath, rootPath, result);
+      } else {
+        int size = 0;
+        try { size = File(absPath).lengthSync(); } catch (_) {}
+        result.add(SendFileEntry(
+          absolutePath: absPath,
+          relativePath: relPath.replaceAll('\\', '/'),
+          size: size,
+        ));
+        debugPrint('[scanDir] found file "$relPath" size=$size');
+      }
+    }
+  }
+
+  /// Remove a file entry by its relative path.
+  /// If the relative path matches a directory prefix, removes all entries under it.
+  void removeByRelativePath(String relativePath) {
+    final remaining = state.entries.where((e) {
+      if (e.relativePath == relativePath) return false;
+      if (e.relativePath.startsWith('$relativePath/')) return false;
+      return true;
+    }).toList();
+
+    // Also update filePaths: remove entries whose files are gone
+    final removedAbs = <String>{};
+    for (final e in state.entries) {
+      if (!remaining.contains(e)) removedAbs.add(e.absolutePath);
+    }
+
+    state = state.copyWith(
+      entries: remaining,
+      filePaths: state.filePaths.where((p) => !removedAbs.contains(p)).toList(),
+      sendError: '',
+    );
+  }
+
+  /// Remove a file by its index in the flat filePaths list (legacy).
   void removeFile(int index) {
+    final removed = state.entries.where((e) => e.absolutePath == state.filePaths[index]).toList();
+    if (removed.isNotEmpty) {
+      for (final r in removed) {
+        removeByRelativePath(r.relativePath);
+      }
+      return;
+    }
     final paths = [...state.filePaths]..removeAt(index);
-    final removedPath = state.filePaths[index];
-    final ids = Map<String, String?>.from(state.fileIdentifiers)..remove(removedPath);
-    state = state.copyWith(filePaths: paths, fileIdentifiers: ids, sendError: '');
+    state = state.copyWith(filePaths: paths, sendError: '');
   }
 
   void clearFiles() {
-    state = state.copyWith(filePaths: [], fileIdentifiers: {}, sendError: '');
+    state = state.copyWith(filePaths: [], entries: [], fileIdentifiers: {}, sendError: '');
   }
 
   void setPeer(String address, {String? name, String? fingerprint}) {
@@ -872,11 +1037,19 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       peerFingerprint: state.peerFingerprint,
     );
 
+    // Build payload: new format (with relative paths) or old format (just paths)
+    final payload = state.entries.isNotEmpty
+        ? state.entries.map((e) => {
+            'path': e.absolutePath,
+            'relative': e.relativePath,
+          }).toList()
+        : state.filePaths; // old format
+
     // First attempt — non-blocking, uses the pre-generated session_id
     var ok = await service.sendFilesStart(
       sessionId,
       state.peerAddress!,
-      state.filePaths,
+      payload,
     );
 
     // If failed, handle pairing flow — poll for the PairRequest event
@@ -913,7 +1086,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       await service.sendFilesStart(
         sessionId2,
         state.peerAddress!,
-        state.filePaths,
+        payload,
       );
 
       if (state.fileIdentifiers.isNotEmpty) {

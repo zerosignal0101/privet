@@ -4,8 +4,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/transfer.dart';
 import '../models/transfer_history.dart';
+import '../models/file_tree.dart';
 import '../providers/providers.dart';
 import '../services/privet/privet_service.dart';
+import 'file_tree_view.dart';
 
 /// Unified transfer tile for all states:
 /// negotiating, waitingAcceptance, transferring, completed, failed, cancelled.
@@ -109,24 +111,32 @@ class _TransferTileState extends ConsumerState<TransferTile> {
   Widget _buildAwaitingAccept(ActiveTransfer t) {
     final fileCount = t.files.length;
     final totalSize = t.files.fold<int>(0, (sum, f) => sum + f.size);
-    return ListTile(
-      leading: const Icon(Icons.help_outline, color: Colors.orange),
-      title: Text('Accept transfer${fileCount > 0 ? " ($fileCount files)" : ""}?'),
-      subtitle: Text(_formatSize(totalSize)),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          IconButton(
-            icon: const Icon(Icons.close, color: Colors.red),
-            tooltip: 'Reject',
-            onPressed: () => ref.read(activeTransfersProvider.notifier)
-                .rejectTransfer(t.sessionId),
-          ),
-          IconButton(
-            icon: const Icon(Icons.check, color: Colors.green),
-            tooltip: 'Accept',
-            onPressed: () => ref.read(activeTransfersProvider.notifier)
-                .acceptTransfer(t.sessionId),
+
+    // Check if there's a hierarchy to display
+    final hasHierarchy = t.files.any((f) => f.relativePath.contains('/'));
+    final treeNodes = hasHierarchy ? buildFileTreeFromPaths(t.files.map((f) => f.relativePath).toList()) : <FileTreeNode>[];
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        ListTile(
+          leading: const Icon(Icons.help_outline, color: Colors.orange),
+          title: Text('Accept transfer${fileCount > 0 ? " ($fileCount files)" : ""}?'),
+          subtitle: Text(_formatSize(totalSize)),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.close, color: Colors.red),
+                tooltip: 'Reject',
+                onPressed: () => ref.read(activeTransfersProvider.notifier)
+                    .rejectTransfer(t.sessionId),
+              ),
+              IconButton(
+                icon: const Icon(Icons.check, color: Colors.green),
+                tooltip: 'Accept',
+                onPressed: () => ref.read(activeTransfersProvider.notifier)
+                    .acceptTransfer(t.sessionId),
           ),
           if (t.peerFingerprint != null)
             IconButton(
@@ -142,7 +152,17 @@ class _TransferTileState extends ConsumerState<TransferTile> {
             ),
         ],
       ),
-    );
+    ),
+    if (hasHierarchy && treeNodes.isNotEmpty)
+      Padding(
+        padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
+        child: FileTreeView(
+          nodes: treeNodes,
+          formatSize: _formatSize,
+        ),
+      ),
+  ],
+);
   }
 
   Widget _buildProgress(ActiveTransfer t, ThemeData theme) {

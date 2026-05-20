@@ -18,7 +18,7 @@ pub use error::{PrivetError, Result};
 pub use known_device::{KnownDevice, KnownDeviceStore, NetworkEntry};
 pub use network::NetworkInfo;
 pub use peer::{PeerId, PeerInfo};
-pub use session::{SessionId, TransferSession, TransferProgress, FileManifest};
+pub use session::{SessionId, TransferSession, TransferProgress, FileManifest, FileToSend, ExpansionResult, SkippedPath, expand_paths};
 
 static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 

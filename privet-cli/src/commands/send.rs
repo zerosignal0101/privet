@@ -75,8 +75,9 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
             let mut events = engine.subscribe_events().await;
             println!("Sending {} file(s) to {addr}...", args.files.len());
 
+            let expanded = privet_core::session::expand_paths(&args.files);
             let session_id = send_to_addr_with_progress(
-                &engine, &mut events, addr, args.files.clone(), args.non_interactive,
+                &engine, &mut events, addr, expanded.files, args.non_interactive,
             ).await?;
             println!("\nTransfer complete! Session: {session_id}");
         }
@@ -146,7 +147,7 @@ async fn send_to_addr_with_progress(
     engine: &privet_core::PrivetEngine,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<privet_core::PrivetEvent>,
     addr: SocketAddr,
-    files: Vec<PathBuf>,
+    files: Vec<privet_core::FileToSend>,
     non_interactive: bool,
 ) -> privet_core::Result<privet_core::SessionId> {
     loop {

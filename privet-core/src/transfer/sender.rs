@@ -1,12 +1,10 @@
-use std::path::PathBuf;
-
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::error::{PrivetError, TransportError};
 use crate::protocol::control;
 use crate::protocol::data::{self, Chunk, StreamFileEntry, StreamHeader};
 use crate::protocol::handshake::{self, ControlMessage, Hello, Offer};
-use crate::session::{FileManifest, SessionId};
+use crate::session::{FileManifest, FileToSend, SessionId};
 use crate::transfer::progress::ProgressTracker;
 
 /// Maximum number of concurrent QUIC data streams per connection.
@@ -55,7 +53,7 @@ impl Sender {
     pub async fn send(
         &self,
         session_id: SessionId,
-        files: &[PathBuf],
+        files: &[FileToSend],
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         trusted_fingerprints: &[String],
         security_mode: &crate::config::SecurityMode,
@@ -165,7 +163,7 @@ impl Sender {
 
         // 4. Build manifest and send Offer
         tracing::debug!("[sender] sending Offer");
-        let manifest = FileManifest::from_paths(files)?;
+        let manifest = FileManifest::from_expanded(files);
         let offer = ControlMessage::Offer(Offer {
             session_id,
             files: handshake::FileManifestInfo {
@@ -217,7 +215,7 @@ impl Sender {
             "[sender] sending {} file(s) in parallel batches",
             manifest.files.len()
         );
-        let batches = group_file_batches(&manifest.files);
+        let batches = group_file_batches(files);
         let tracker = std::sync::Arc::new(std::sync::Mutex::new(
             ProgressTracker::new(manifest.total_size),
         ));
@@ -232,8 +230,7 @@ impl Sender {
                 .await
                 .unwrap();
             let conn = self.conn.clone();
-            let files_clone: Vec<PathBuf> = files.to_vec();
-            let entries_clone = manifest.files.clone();
+            let files_clone: Vec<FileToSend> = files.to_vec();
             let batch = batch_indices.clone();
             let resume_map = accept.resume_map.clone();
             let tracker = std::sync::Arc::clone(&tracker);
@@ -245,7 +242,6 @@ impl Sender {
                 send_file_batch(
                     &conn,
                     &files_clone,
-                    &entries_clone,
                     &batch,
                     &resume_map,
                     chunk_size,
@@ -374,13 +370,17 @@ impl Sender {
 
 /// Group files into batches for parallel sending.
 /// Small files (≤64KB) are batched together; each large file gets its own batch.
-fn group_file_batches(files: &[crate::session::FileEntry]) -> Vec<Vec<usize>> {
+/// Directory marker entries (is_dir == true) are excluded from batches.
+fn group_file_batches(files: &[FileToSend]) -> Vec<Vec<usize>> {
     use crate::protocol::data::SMALL_FILE_THRESHOLD;
 
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut current_small_batch: Vec<usize> = Vec::new();
 
     for (idx, file) in files.iter().enumerate() {
+        if file.is_dir {
+            continue;
+        }
         if file.size <= SMALL_FILE_THRESHOLD {
             current_small_batch.push(idx);
             if current_small_batch.len() >= 16 {
@@ -404,8 +404,7 @@ fn group_file_batches(files: &[crate::session::FileEntry]) -> Vec<Vec<usize>> {
 /// Send file data for a batch of file entries on a single uni stream.
 async fn send_file_batch(
     conn: &quinn::Connection,
-    files: &[PathBuf],
-    entries: &[crate::session::FileEntry],
+    files: &[FileToSend],
     batch_indices: &[usize],
     resume_map: &std::collections::HashMap<String, crate::protocol::handshake::ResumePoint>,
     chunk_size: u32,
@@ -419,15 +418,16 @@ async fn send_file_batch(
         files: batch_indices
             .iter()
             .map(|&idx| {
-                let entry = &entries[idx];
+                let file = &files[idx];
                 let resume_offset = resume_map
-                    .get(&entry.relative_path)
+                    .get(&file.relative_path)
                     .map(|r| r.bytes_received)
                     .unwrap_or(0);
                 StreamFileEntry {
-                    relative_path: entry.relative_path.clone(),
+                    relative_path: file.relative_path.clone(),
                     start_offset: resume_offset,
-                    total_size: entry.size,
+                    total_size: file.size,
+                    is_dir: file.is_dir,
                 }
             })
             .collect(),
@@ -444,16 +444,23 @@ async fn send_file_batch(
         .await
         .map_err(|e| TransportError::ConnectionLost(format!("stream-header: {e}")))?;
 
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
+
     // Send each file in the batch
     for (batch_pos, &idx) in batch_indices.iter().enumerate() {
-        let entry = &entries[idx];
+        let file_entry = &files[idx];
+
+        // Skip directory marker entries (no data to send)
+        if file_entry.is_dir {
+            continue;
+        }
+
         let resume_offset = resume_map
-            .get(&entry.relative_path)
+            .get(&file_entry.relative_path)
             .map(|r| r.bytes_received)
             .unwrap_or(0);
 
-        let file_path = &files[idx];
-        let mut file = tokio::fs::File::open(file_path).await?;
+        let mut file = tokio::fs::File::open(&file_entry.absolute_path).await?;
         if resume_offset > 0 {
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(resume_offset)).await?;
@@ -497,7 +504,7 @@ async fn send_file_batch(
             let _ = event_tx.send(crate::engine::PrivetEvent::TransferProgress {
                 session_id,
                 progress: crate::session::TransferProgress {
-                    total_bytes: entries.iter().map(|e| e.size).sum(),
+                    total_bytes: total_size,
                     bytes_transferred: bytes_so_far.0,
                     current_speed_bps: bytes_so_far.1,
                     per_file: vec![],
