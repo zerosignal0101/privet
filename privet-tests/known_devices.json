@@ -1,0 +1,56 @@
+[
+  {
+    "fingerprint": "deadbeef1234",
+    "peer_id": "fc7aa67c-a8d7-4da0-9733-b71d3d0ad6e4",
+    "device_name": "injected-peer",
+    "networks": {
+      "127.0.0.0/24": {
+        "addresses": [
+          "127.0.0.1:9999"
+        ],
+        "last_seen": {
+          "secs_since_epoch": 1779286674,
+          "nanos_since_epoch": 209095900
+        },
+        "label": null
+      }
+    }
+  },
+  {
+    "fingerprint": "f716e563b845b583",
+    "peer_id": "86afe6ca-51d9-42ae-bfd4-8277b4ac4b76",
+    "device_name": "mdns-bob",
+    "networks": {
+      "192.168.72.0/24": {
+        "addresses": [
+          "192.168.72.1:22004"
+        ],
+        "last_seen": {
+          "secs_since_epoch": 1779286563,
+          "nanos_since_epoch": 991157000
+        },
+        "label": null
+      },
+      "10.0.0.0/8": {
+        "addresses": [
+          "10.29.223.97:22004"
+        ],
+        "last_seen": {
+          "secs_since_epoch": 1779286563,
+          "nanos_since_epoch": 992688000
+        },
+        "label": null
+      },
+      "192.168.124.0/24": {
+        "addresses": [
+          "192.168.124.1:22004"
+        ],
+        "last_seen": {
+          "secs_since_epoch": 1779286563,
+          "nanos_since_epoch": 992131000
+        },
+        "label": null
+      }
+    }
+  }
+]

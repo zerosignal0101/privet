@@ -17,6 +17,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private val CHANNEL = "privet/file"
+    private val DEVICE_CHANNEL = "privet/device"
     private var pendingResult: MethodChannel.Result? = null
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -53,6 +54,19 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        // Device info channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getDeviceName" -> {
+                    val model = android.os.Build.MODEL
+                    val manufacturer = android.os.Build.MANUFACTURER
+                    result.success("$manufacturer $model")
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "pickDirectory" -> {

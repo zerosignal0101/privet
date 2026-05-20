@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:convert';
+
+import 'package:flutter/services.dart';
 
 import '../../models/peer.dart';
 import '../../models/transfer.dart';
@@ -85,7 +88,7 @@ class PrivetService {
   /// [securityMode] is one of 'allow_all', 'trust_required', 'strict'.
   Future<bool> start({String? deviceName, String? dataDir, String? downloadDir, String? securityMode, int? listenPort}) async {
     try {
-      final name = deviceName ?? _defaultDeviceName();
+      final name = deviceName ?? await _defaultDeviceName();
 
       // Build JSON config with all settings
       final resolvedDataDir = dataDir ?? '.';
@@ -437,10 +440,18 @@ class PrivetService {
     _eventController.add(event);
   }
 
-  String _defaultDeviceName() {
-    // Use hostname as a default device name
+  Future<String> _defaultDeviceName() async {
+    // On Android, Platform.localHostname returns "localhost", so use
+    // the device model via the native method channel instead.
+    if (Platform.isAndroid) {
+      try {
+        const channel = MethodChannel('privet/device');
+        final name = await channel.invokeMethod<String>('getDeviceName');
+        if (name != null && name.isNotEmpty) return name;
+      } catch (_) {}
+    }
     try {
-      return 'Privet-Device';
+      return Platform.localHostname;
     } catch (_) {
       return 'Privet';
     }

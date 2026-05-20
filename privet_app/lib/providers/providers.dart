@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -580,10 +581,27 @@ class SettingsNotifier extends Notifier<Settings> {
     return const Settings();
   }
 
+  Future<String> _resolveDeviceName() async {
+    // On Android, Platform.localHostname returns "localhost", so use
+    // the native method channel to get the actual device model.
+    if (Platform.isAndroid) {
+      try {
+        const channel = MethodChannel('privet/device');
+        final name = await channel.invokeMethod<String>('getDeviceName');
+        if (name != null && name.isNotEmpty) return name;
+      } catch (_) {}
+    }
+    try {
+      return Platform.localHostname;
+    } catch (_) {
+      return 'Privet';
+    }
+  }
+
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
     state = Settings(
-      deviceName: prefs.getString('device_name') ?? 'Privet',
+      deviceName: prefs.getString('device_name') ?? await _resolveDeviceName(),
       downloadDir: prefs.getString('download_dir') ?? '',
       securityMode: prefs.getString('security_mode') ?? 'trust_required',
       enableTcpFallback: prefs.getBool('enable_tcp_fallback') ?? true,

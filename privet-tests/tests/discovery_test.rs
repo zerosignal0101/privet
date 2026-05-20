@@ -33,8 +33,10 @@ fn engine_config(name: &str, listen_port: u16, beacon_port: u16) -> PrivetConfig
     // Use a temp download dir
     let tmp = std::env::temp_dir().join(format!("privet-test-{name}-{listen_port}"));
     let _ = std::fs::create_dir_all(&tmp);
-    config.download_dir = tmp;
-    // TrustRequired is the default; no need to set explicitly
+    config.download_dir = tmp.clone();
+    // Isolate certs so test identities don't pollute the real cert directory
+    let cert_dir = tmp.join("certs");
+    config.security.cert_dir = Some(cert_dir);
     config
 }
 
@@ -137,7 +139,8 @@ async fn discover_mdns_mutual() {
     config_a.discovery.enable_mdns = true;
     let tmp_a = std::env::temp_dir().join(format!("privet-mdns-a-{port_a}"));
     let _ = std::fs::create_dir_all(&tmp_a);
-    config_a.download_dir = tmp_a;
+    config_a.download_dir = tmp_a.clone();
+    config_a.security.cert_dir = Some(tmp_a.join("certs"));
 
     // Engine B: mDNS enabled, beacon disabled
     let mut config_b = PrivetConfig::default_with_name("mdns-bob".into());
@@ -146,7 +149,8 @@ async fn discover_mdns_mutual() {
     config_b.discovery.enable_mdns = true;
     let tmp_b = std::env::temp_dir().join(format!("privet-mdns-b-{port_b}"));
     let _ = std::fs::create_dir_all(&tmp_b);
-    config_b.download_dir = tmp_b;
+    config_b.download_dir = tmp_b.clone();
+    config_b.security.cert_dir = Some(tmp_b.join("certs"));
 
     let engine_a = privet_core::PrivetEngine::new(config_a).await.expect("A create");
     engine_a.start().await.expect("A start");
@@ -211,7 +215,8 @@ async fn discover_engine_lifecycle() {
     config.discovery.enable_beacon = true;
     let tmp = std::env::temp_dir().join(format!("privet-lifecycle-{port}"));
     let _ = std::fs::create_dir_all(&tmp);
-    config.download_dir = tmp;
+    config.download_dir = tmp.clone();
+    config.security.cert_dir = Some(tmp.join("certs"));
 
     let engine = privet_core::PrivetEngine::new(config).await.expect("create");
     engine.start().await.expect("start");

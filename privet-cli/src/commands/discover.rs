@@ -21,6 +21,27 @@ pub async fn run(args: DiscoverArgs, config: PrivetConfig) -> privet_core::Resul
     let mut events = engine.subscribe_events().await;
     engine.start().await?;
 
+    // Probe known devices on current networks.
+    // This finds devices that have been paired/transferred before
+    // even when mDNS/beacon broadcasts are blocked.
+    let probed = engine.probe_known_devices().await;
+    for peer in &probed {
+        let addr = peer
+            .primary_address()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        println!(
+            "  Peer: {}  |  addr: {:<21}  |  fp: {}  |  trusted: {}  |  [probed]",
+            peer.name,
+            addr,
+            peer.display_fingerprint(),
+            if peer.is_trusted { "✓" } else { " " },
+        );
+    }
+    if !probed.is_empty() {
+        println!("  ({} known device(s) found via probe)", probed.len());
+    }
+
     println!("Discovering peers for {} seconds...", args.timeout);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
@@ -40,6 +61,22 @@ pub async fn run(args: DiscoverArgs, config: PrivetConfig) -> privet_core::Resul
                             peer.display_fingerprint(),
                             if peer.is_trusted { "✓" } else { " " },
                         );
+                    }
+                    Some(privet_core::PrivetEvent::KnownDeviceProbed { peer }) => {
+                        let addr = peer.primary_address()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "unknown".into());
+                        println!(
+                            "  Peer: {}  |  addr: {:<21}  |  fp: {}  |  trusted: {}  |  [probed]",
+                            peer.name,
+                            addr,
+                            peer.display_fingerprint(),
+                            if peer.is_trusted { "✓" } else { " " },
+                        );
+                    }
+                    None => {
+                        // Channel closed — engine is gone
+                        break;
                     }
                     _ => {}
                 }

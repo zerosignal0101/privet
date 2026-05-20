@@ -96,63 +96,59 @@ pub async fn run(args: SendArgs, mut config: PrivetConfig) -> privet_core::Resul
 
             println!("Looking for peer '{name}' via discovery (timeout: 6s)...");
 
+            // Probe known devices first — catches devices not broadcasting mDNS/beacon
+            let probed = engine.probe_known_devices().await;
+            if let Some(peer) = probed.iter().find(|p| p.name == *name) {
+                println!("Found known peer '{}' at {}",
+                    peer.name,
+                    peer.primary_address().map_or("?".into(), |a| a.to_string()),
+                );
+                return send_name_found(&engine, &mut events, &peer.id, &args).await;
+            }
+
             let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-            let mut found = false;
+            let mut found_peer_id = None;
 
             while tokio::time::Instant::now() < deadline {
-                if let Some(privet_core::PrivetEvent::PeerDiscovered(peer)) = events.recv().await {
-                    if peer.name == *name {
-                        println!("Found peer '{}' at {}", peer.name, peer.primary_address().map_or("?".into(), |a| a.to_string()));
-                        found = true;
-                        println!("Sending {} file(s)...", args.files.len());
-                        match send_to_peer_with_progress(
-                            &engine, &mut events, &peer.id, args.files.clone(), args.non_interactive,
-                        ).await {
-                            Ok(session_id) => {
-                                println!("\nTransfer complete! Session: {session_id}");
+                tokio::select! {
+                    event = events.recv() => {
+                        match event {
+                            Some(privet_core::PrivetEvent::PeerDiscovered(peer))
+                            | Some(privet_core::PrivetEvent::KnownDeviceProbed { peer }) => {
+                                if peer.name == *name {
+                                    println!("Found peer '{}' at {}",
+                                        peer.name,
+                                        peer.primary_address().map_or("?".into(), |a| a.to_string()),
+                                    );
+                                    found_peer_id = Some(peer.id);
+                                    break;
+                                }
                             }
-                            Err(privet_core::PrivetError::TransferCancelled) => {
-                                println!("\nTransfer cancelled by receiver.");
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e),
+                            None => break,
+                            _ => {}
                         }
                     }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {}
                 }
             }
 
-            if !found {
-                let peers = engine.discovered_peers().await;
-                if let Some(peer) = peers.iter().find(|p| p.name == *name) {
-                    found = true;
-                    println!("Sending {} file(s) to '{}'...", args.files.len(), name);
-                    match send_to_peer_with_progress(
-                        &engine, &mut events, &peer.id, args.files.clone(), args.non_interactive,
-                    ).await {
-                        Ok(session_id) => {
-                            println!("\nTransfer complete! Session: {session_id}");
-                        }
-                        Err(privet_core::PrivetError::TransferCancelled) => {
-                            println!("\nTransfer cancelled by receiver.");
-                        }
-                        Err(e) => return Err(e),
-                    }
+            // Fallback: check discovered_peers (in case events were missed)
+            if found_peer_id.is_none() {
+                if let Some(peer) = engine.discovered_peers().await.into_iter().find(|p| p.name == *name) {
+                    println!("Found peer '{}' at {}",
+                        peer.name,
+                        peer.primary_address().map_or("?".into(), |a| a.to_string()),
+                    );
+                    found_peer_id = Some(peer.id);
                 }
             }
 
-            if !found {
-                eprintln!("Peer '{name}' not found via discovery");
-                std::process::exit(1);
+            if let Some(peer_id) = found_peer_id {
+                return send_name_found(&engine, &mut events, &peer_id, &args).await;
             }
 
-            match tokio::time::timeout(std::time::Duration::from_secs(3), engine.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("Shutdown error: {e}"),
-                Err(_) => {
-                    eprintln!("Shutdown timed out, exiting.");
-                    std::process::exit(1);
-                }
-            }
+            eprintln!("Peer '{name}' not found via discovery");
+            std::process::exit(1);
         }
         _ => {
             eprintln!("Either --to-ip <addr:port> or --to-name <name> must be provided");
@@ -312,6 +308,42 @@ async fn handle_pairing_required(
         _ => {
             engine.reject_pairing(&peer.fingerprint).await?;
             eprintln!("  Pairing rejected. Cannot send.");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Send files to a peer resolved by name, then shut down the engine.
+async fn send_name_found(
+    engine: &privet_core::PrivetEngine,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<privet_core::PrivetEvent>,
+    peer_id: &privet_core::PeerId,
+    args: &SendArgs,
+) -> privet_core::Result<()> {
+    println!("Sending {} file(s)...", args.files.len());
+    match send_to_peer_with_progress(
+        engine, events, peer_id, args.files.clone(), args.non_interactive,
+    ).await {
+        Ok(session_id) => {
+            println!("\nTransfer complete! Session: {session_id}");
+        }
+        Err(privet_core::PrivetError::TransferCancelled) => {
+            println!("\nTransfer cancelled by receiver.");
+            let _ = engine.shutdown().await;
+            return Ok(());
+        }
+        Err(e) => {
+            let _ = engine.shutdown().await;
+            return Err(e);
+        }
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(3), engine.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Shutdown error: {e}"),
+        Err(_) => {
+            eprintln!("Shutdown timed out, exiting.");
             std::process::exit(1);
         }
     }

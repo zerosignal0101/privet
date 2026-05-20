@@ -84,7 +84,7 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
                     println!("  Verification code: {code}");
                     let choice = super::prompt_choice(
                         "  Options",
-                        "T=Trust, A=Trust+Accept, R=Reject",
+                        "T=Trust, A=Trust+Auto Accept, R=Reject",
                     );
                     match choice {
                         'T' | 't' => {
