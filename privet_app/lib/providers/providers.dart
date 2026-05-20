@@ -993,6 +993,11 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     state = state.copyWith(filePaths: [], entries: [], fileIdentifiers: {}, sendError: '');
   }
 
+  /// Reset all state for a fresh preparation page.
+  void reset() {
+    state = const SendPreparationState();
+  }
+
   void setPeer(String address, {String? name, String? fingerprint}) {
     state = state.copyWith(
       peerAddress: address,

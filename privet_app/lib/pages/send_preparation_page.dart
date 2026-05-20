@@ -77,8 +77,11 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   }
 
   Future<bool> _onWillPop() async {
-    final state = ref.read(sendPreparationProvider);
-    if (state.filePaths.isEmpty) return true;
+    final s = ref.read(sendPreparationProvider);
+    if (s.filePaths.isEmpty) {
+      ref.read(sendPreparationProvider.notifier).reset();
+      return true;
+    }
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -90,6 +93,9 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
         ],
       ),
     );
+    if (confirmed == true) {
+      ref.read(sendPreparationProvider.notifier).reset();
+    }
     return confirmed ?? false;
   }
 
@@ -341,10 +347,14 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
     if (dirPath != null) {
       ref.read(sendPreparationProvider.notifier).addFiles([dirPath]);
     }
-  }  Future<void> _send(BuildContext context, WidgetRef ref) async {
+  }
+
+  Future<void> _send(BuildContext context, WidgetRef ref) async {
     final sessionId = await ref.read(sendPreparationProvider.notifier).send();
-    if (sessionId != null && context.mounted) {
-      Navigator.pop(context);
+    if (!context.mounted) return;
+    ref.read(sendPreparationProvider.notifier).reset();
+    Navigator.pop(context);
+    if (sessionId != null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Transfer started')),
       );
