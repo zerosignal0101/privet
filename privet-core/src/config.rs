@@ -54,7 +54,10 @@ impl PrivetConfig {
             device_name,
             download_dir,
             transport: TransportConfig::default(),
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                cert_dir: Some(data_dir.join("certs")),
+                ..Default::default()
+            },
             discovery: DiscoveryConfig::default(),
             security_mode: SecurityMode::TrustRequired,
             log_dir: Some(data_dir.join("logs")),

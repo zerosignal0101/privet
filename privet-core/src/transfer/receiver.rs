@@ -752,6 +752,8 @@ pub(crate) fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> { Ok(u
 /// If a top-level directory in the file list already exists in `download_dir`,
 /// computes a unique name (e.g. "colors (1)") and maps the original name to it.
 /// This avoids mixing files from different transfers into the same folder.
+/// Only existing directories are renamed — individual files are not affected
+/// (they use `open_file_atomic` for file-level dedup instead).
 pub(crate) fn build_top_dir_rename_map<'a>(
     files: impl IntoIterator<Item = &'a str>,
     download_dir: &std::path::Path,
@@ -768,7 +770,8 @@ pub(crate) fn build_top_dir_rename_map<'a>(
             continue; // already checked
         }
         let candidate = download_dir.join(top);
-        if !candidate.exists() {
+        // Only rename existing directories — regular files use open_file_atomic dedup
+        if !candidate.is_dir() {
             continue;
         }
         // Find unique name
