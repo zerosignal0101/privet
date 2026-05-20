@@ -430,7 +430,7 @@ impl PrivetEngine {
                                         match crate::transfer::tcp_transport::receive_tcp(
                                             tls_stream, dl, ck, lp, &id, &tf, &aa,
                                             tls_fp.as_deref(), Some(addr), as_, &*pi, &*pp, &ev,
-                                            &cs, &sm,
+                                            &cs, &sm, tl.clone(),
                                         )
                                         .await
                                         {

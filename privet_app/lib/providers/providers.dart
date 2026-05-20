@@ -700,12 +700,15 @@ class TransferHistoryNotifier extends Notifier<List<TransferHistoryRecord>> {
 
   @override
   List<TransferHistoryRecord> build() {
-    // Auto-refresh when a transfer completes or fails
+    // Auto-refresh when a transfer completes, fails, or is cancelled
     final service = ref.read(privetServiceProvider);
     _sub = service.events.listen((event) {
       if (event.type == PrivetEventType.transferComplete ||
           event.type == PrivetEventType.transferFailed) {
+        // Refresh immediately, then again after 200ms to catch any
+        // race between the event and the history log flush on disk.
         refresh();
+        Future.delayed(const Duration(milliseconds: 200), refresh);
       }
     });
     ref.onDispose(() => _sub?.cancel());

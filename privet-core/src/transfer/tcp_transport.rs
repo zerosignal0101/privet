@@ -43,6 +43,7 @@ pub async fn receive_tcp<S>(
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     cancel_signals: &Arc<RwLock<HashMap<SessionId, Arc<AtomicBool>>>>,
     session_meta: &Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>>,
+    transfer_log: Option<crate::storage::records::TransferLog>,
 ) -> Result<(SessionId, String, String, Vec<TransferFileRecord>, Option<std::net::SocketAddr>), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -376,11 +377,48 @@ where
                 tokio::io::AsyncWriteExt::shutdown(&mut stream),
             ).await;
             tracing::info!("[tcp-recv] TLS shutdown result: {:?}", shutdown_result);
-            cleanup_session().await;
+            // Log a Cancelled history record before cleaning up.
+            if let Some(log) = &transfer_log {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).ok();
+                let _ = log.append(&crate::storage::records::TransferRecord {
+                    session_id,
+                    direction: crate::session::TransferDirection::Receiving,
+                    peer_fingerprint: peer_fingerprint.clone(),
+                    peer_name: hello.device_name.clone(),
+                    peer_address: peer_listen_addr.map(|a| a.to_string()),
+                    files: offer.files.files.iter().map(|f| TransferFileRecord {
+                        path: f.relative_path.clone(),
+                        size: f.size,
+                        is_dir: f.is_dir,
+                        relative_path: Some(f.relative_path.clone()),
+                    }).collect(),
+                    total_bytes: offer.total_size,
+                    bytes_transferred: 0,
+                    started_at: None,
+                    completed_at: now,
+                    state: crate::storage::records::TransferRecordState::Cancelled,
+                    error: Some("cancelled by sender".into()),
+                });
+            }
+            // Leave session_meta intact so engine.rs can clean up.
+            // Only remove the cancel signal.
+            cancel_signals.write().await.remove(&session_id);
             tracing::info!("[tcp-recv] cleanup done, returning TransferCancelled");
             return Err(PrivetError::TransferCancelled);
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            // On any error (e.g. sender disconnected without Cancel frame),
+            // emit TransferFailed so the UI is not stuck on "in progress".
+            let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
+                session_id,
+                error: format!("{e}"),
+                direction: crate::session::TransferDirection::Receiving,
+            });
+            cleanup_session().await;
+            return Err(e);
+        }
     };
 
     // 11. Read Complete
@@ -772,6 +810,12 @@ where
                     if let Ok(data) = handshake::serialize(&cancel) {
                         let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &data).await;
                     }
+                    // Graceful TLS shutdown so the receiver gets the Cancel
+                    // frame before the socket is dropped.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        tokio::io::AsyncWriteExt::shutdown(&mut stream),
+                    ).await;
                     let _ = event_tx.send(crate::engine::PrivetEvent::TransferFailed {
                         session_id,
                         error: "cancelled by user".into(),
@@ -1402,6 +1446,7 @@ mod tests {
                 &r_ev,
                 &r_cs,
                 &r_sm,
+                None,
             )
             .await
         });
@@ -1536,6 +1581,7 @@ mod tests {
                 &r_ev,
                 &r_cs,
                 &r_sm,
+                None,
             )
             .await
         });

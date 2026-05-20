@@ -66,6 +66,7 @@ impl TransferLog {
         let json = serde_json::to_string(record)?;
         use std::io::Write;
         writeln!(file, "{json}")?;
+        file.sync_all()?; // Ensure data is on disk before event reaches Flutter
         Ok(())
     }
 
