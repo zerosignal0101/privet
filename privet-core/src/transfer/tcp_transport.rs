@@ -134,10 +134,17 @@ where
             crate::engine::PairDecision::Reject => {
                 let reject = ControlMessage::Reject(handshake::Reject {
                     session_id: SessionId(uuid::Uuid::nil()),
-                    reason: "pairing rejected".into(),
+                    reason: "pairing required".into(),
                 });
-                let reject_data = handshake::serialize(&reject)?;
-                let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &reject_data).await;
+                if let Ok(data) = handshake::serialize(&reject) {
+                    let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &data).await;
+                }
+                // Graceful TLS shutdown so the sender can read the Reject
+                // before the connection is dropped (avoids TCP RST).
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    tokio::io::AsyncWriteExt::shutdown(&mut stream),
+                ).await;
                 return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
             }
         }
@@ -800,6 +807,26 @@ where
     let accept = match resp_msg {
         ControlMessage::Accept(a) => a,
         ControlMessage::Reject(r) => {
+            if r.reason.contains("pairing") {
+                let code = crate::security::trust::TrustStore::pairing_code(
+                    &identity.fingerprint, &peer_fingerprint,
+                );
+                let pairing_addr = peer_listen_addr.unwrap_or(addr);
+                let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
+                    peer: crate::peer::PeerInfo {
+                        id: crate::peer::PeerId(uuid::Uuid::nil()),
+                        name: identity.device_name.clone(),
+                        addresses: vec![pairing_addr],
+                        fingerprint: peer_fingerprint.clone(),
+                        is_trusted: false,
+                        last_seen: std::time::SystemTime::now(),
+                        platform: None,
+                        version: None,
+                    },
+                    code,
+                });
+                return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
+            }
             return Err(PrivetError::TransferRejected(r.reason));
         }
         other => {

@@ -980,6 +980,7 @@ name = "privet-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dirs",
  "eyre",
  "hostname",
  "privet-core",

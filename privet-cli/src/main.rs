@@ -62,7 +62,14 @@ fn load_config(_config_path: &Option<String>) -> privet_core::PrivetConfig {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "privet-device".to_owned());
 
-    privet_core::PrivetConfig::default_with_name(device_name)
+    let mut config = privet_core::PrivetConfig::default_with_name(device_name);
+
+    // 确保证书和密钥持久化到标准数据目录，使 CLI 指纹跨运行稳定
+    if let Some(data_dir) = dirs::data_local_dir() {
+        config.security.cert_dir = Some(data_dir.join("privet").join("certs"));
+    }
+
+    config
 }
 
 async fn run_command(

@@ -24,6 +24,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 eyre = { workspace = true }
 hostname = { workspace = true }
+dirs = { workspace = true }
 
 [lints]
 workspace = true

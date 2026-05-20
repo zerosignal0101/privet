@@ -390,11 +390,13 @@ async fn e2e_resume_partial_transfer() {
     let times = std::fs::FileTimes::new().set_modified(src_mtime);
     let _ = pf.set_times(times);
 
+    let cert_dir = temp_dir.path().join("certs");
     // Start receiver
     let mut recv_config = PrivetConfig::default_with_name("resume-recv".into());
     recv_config.transport.listen_port = port;
     recv_config.download_dir = recv_dir.clone();
     recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    recv_config.security.cert_dir = Some(cert_dir.clone());
     let recv_engine = privet_core::PrivetEngine::new(recv_config)
         .await
         .expect("recv engine");
@@ -408,6 +410,7 @@ async fn e2e_resume_partial_transfer() {
         let mut send_config = PrivetConfig::default_with_name("resume-send".into());
         send_config.transport.listen_port = 0;
         send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        send_config.security.cert_dir = Some(cert_dir);
         let engine = privet_core::PrivetEngine::new(send_config)
             .await
             .expect("send engine");
@@ -453,11 +456,13 @@ async fn e2e_transfer_log_created() {
     let port = pick_port();
     let (file_path, _) = generate_test_file(&send_dir, "log_test.bin", 4096);
 
+    let cert_dir = temp_dir.path().join("certs");
     // Receiver
     let mut rc = PrivetConfig::default_with_name("log-recv".into());
     rc.transport.listen_port = port;
     rc.download_dir = recv_dir.clone();
     rc.security_mode = privet_core::SecurityMode::AllowAll;
+    rc.security.cert_dir = Some(cert_dir.clone());
     rc.log_dir = Some(log_dir.clone());
     let recv_engine = privet_core::PrivetEngine::new(rc).await.expect("recv");
     recv_engine.start().await.expect("recv start");
@@ -468,6 +473,7 @@ async fn e2e_transfer_log_created() {
     let mut sc = PrivetConfig::default_with_name("log-send".into());
     sc.transport.listen_port = 0;
     sc.security_mode = privet_core::SecurityMode::AllowAll;
+    sc.security.cert_dir = Some(cert_dir);
     sc.log_dir = Some(log_dir.clone());
     let send_engine = privet_core::PrivetEngine::new(sc).await.expect("send");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -579,11 +585,13 @@ async fn run_multifile_transfer(sizes: &[usize]) {
 
     // Start receiver
     eprintln!("[multi] starting receiver on port {port}...");
+    let cert_dir = temp_dir.path().join("certs");
     let recv_handle = {
         let mut config = PrivetConfig::default_with_name("multi-recv".into());
         config.transport.listen_port = port;
         config.download_dir = recv_dir.clone();
         config.security_mode = privet_core::SecurityMode::AllowAll;
+        config.security.cert_dir = Some(cert_dir.clone());
         let engine = privet_core::PrivetEngine::new(config)
             .await
             .expect("recv engine");
@@ -600,6 +608,7 @@ async fn run_multifile_transfer(sizes: &[usize]) {
         let mut config = PrivetConfig::default_with_name("multi-send".into());
         config.transport.listen_port = 0;
         config.security_mode = privet_core::SecurityMode::AllowAll;
+        config.security.cert_dir = Some(cert_dir);
         let engine = privet_core::PrivetEngine::new(config)
             .await
             .expect("send engine");
@@ -714,11 +723,13 @@ async fn e2e_directory_nested_structure() {
     ]);
     eprintln!("[dir-nested] generated {} files in mydir/", files.len());
 
+    let cert_dir = temp_dir.path().join("certs");
     // Start receiver
     let mut recv_config = PrivetConfig::default_with_name("dir-recv".into());
     recv_config.transport.listen_port = port;
     recv_config.download_dir = recv_dir.clone();
     recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    recv_config.security.cert_dir = Some(cert_dir.clone());
     let recv_engine = privet_core::PrivetEngine::new(recv_config)
         .await
         .expect("recv engine");
@@ -733,6 +744,7 @@ async fn e2e_directory_nested_structure() {
         let mut send_config = PrivetConfig::default_with_name("dir-send".into());
         send_config.transport.listen_port = 0;
         send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        send_config.security.cert_dir = Some(cert_dir);
         let send_engine = privet_core::PrivetEngine::new(send_config)
             .await
             .expect("send engine");
@@ -797,11 +809,13 @@ async fn e2e_directory_mixed_with_files() {
 
     eprintln!("[dir-mixed] generated files");
 
+    let cert_dir = temp_dir.path().join("certs");
     // Start receiver
     let mut recv_config = PrivetConfig::default_with_name("mixed-recv".into());
     recv_config.transport.listen_port = port;
     recv_config.download_dir = recv_dir.clone();
     recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    recv_config.security.cert_dir = Some(cert_dir.clone());
     let recv_engine = privet_core::PrivetEngine::new(recv_config)
         .await
         .expect("recv engine");
@@ -815,6 +829,7 @@ async fn e2e_directory_mixed_with_files() {
         let mut send_config = PrivetConfig::default_with_name("mixed-send".into());
         send_config.transport.listen_port = 0;
         send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        send_config.security.cert_dir = Some(cert_dir);
         let send_engine = privet_core::PrivetEngine::new(send_config)
             .await
             .expect("send engine");
@@ -876,11 +891,13 @@ async fn e2e_directory_empty_dir_marker() {
     std::fs::create_dir_all(&empty_dir.join("a")).unwrap();
     std::fs::create_dir_all(&empty_dir.join("b").join("c")).unwrap();
 
+    let cert_dir = temp_dir.path().join("certs");
     // Start receiver
     let mut recv_config = PrivetConfig::default_with_name("empty-recv".into());
     recv_config.transport.listen_port = port;
     recv_config.download_dir = recv_dir.clone();
     recv_config.security_mode = privet_core::SecurityMode::AllowAll;
+    recv_config.security.cert_dir = Some(cert_dir.clone());
     let recv_engine = privet_core::PrivetEngine::new(recv_config).await.expect("recv");
     recv_engine.start().await.expect("recv start");
 
@@ -891,6 +908,7 @@ async fn e2e_directory_empty_dir_marker() {
         let mut send_config = PrivetConfig::default_with_name("empty-send".into());
         send_config.transport.listen_port = 0;
         send_config.security_mode = privet_core::SecurityMode::AllowAll;
+        send_config.security.cert_dir = Some(cert_dir);
         let send_engine = privet_core::PrivetEngine::new(send_config).await.expect("send");
         send_files(&send_engine, addr, vec![empty_dir])
             .await
@@ -929,11 +947,13 @@ async fn run_transfer(file_size: usize) {
 
     // Start receiver
     eprintln!("[{file_size}B] starting receiver...");
+    let cert_dir = temp_dir.path().join("certs");
     let recv_handle = {
         let mut config = PrivetConfig::default_with_name("test-recv".into());
         config.transport.listen_port = port;
         config.download_dir = recv_dir.clone();
         config.security_mode = privet_core::SecurityMode::AllowAll;
+        config.security.cert_dir = Some(cert_dir.clone());
         let engine = privet_core::PrivetEngine::new(config).await.expect("receiver engine");
         engine.start().await.expect("receiver start");
         engine
@@ -948,6 +968,7 @@ async fn run_transfer(file_size: usize) {
         let mut config = PrivetConfig::default_with_name("test-sender".into());
         config.transport.listen_port = 0;
         config.security_mode = privet_core::SecurityMode::AllowAll;
+        config.security.cert_dir = Some(cert_dir);
         let engine = privet_core::PrivetEngine::new(config).await.expect("sender engine");
         send_files(&engine, addr, vec![file_path])
             .await

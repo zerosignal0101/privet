@@ -143,9 +143,19 @@ impl Receiver {
         if control::write_control_frame(ctrl_send, &data).await.is_ok() {
             let _ = ctrl_send.finish();
         }
-        // Wait for sender to close the connection after reading the Reject.
-        let mut buf = [0u8; 1];
-        let _ = ctrl_recv.read(&mut buf).await;
+        // Drain the sender's Offer (and any subsequent data) then wait for the
+        // sender to close. This ensures the Reject is delivered before we drop
+        // our end, avoiding a "connection lost" race on the sender side.
+        let mut buf = [0u8; 4096];
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                ctrl_recv.read(&mut buf),
+            ).await {
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => continue,
+            }
+        }
         Ok(())
     }
 
@@ -250,12 +260,12 @@ impl Receiver {
                     self.record_known_device(peer_fingerprint.clone(), &hello.device_name, peer_listen_addr).await;
                 }
                 PairDecision::Reject => {
-                    // Send a Reject so the sender gets a clean rejection,
-                    // then wait for sender to close the connection.
+                    // Send a Reject, then wait for the sender to close so the
+                    // Reject is delivered before the connection drops.
                     let _ = Self::send_reject_and_wait(
                         &mut ctrl_send, &mut ctrl_recv,
                         SessionId(uuid::Uuid::nil()),
-                        "pairing rejected by user",
+                        "pairing required",
                     ).await;
                     return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
                 }

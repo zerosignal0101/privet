@@ -232,6 +232,26 @@ impl Sender {
         let accept = match resp_msg {
             ControlMessage::Accept(a) => a,
             ControlMessage::Reject(r) => {
+                if r.reason.contains("pairing") {
+                    // Receiver rejected because pairing is needed on its side.
+                    // Emit PairRequest so the UI shows the pairing code.
+                    let code = crate::security::trust::TrustStore::pairing_code(&self.fingerprint, &peer_fingerprint);
+                    let pairing_addr = peer_listen_addr.unwrap_or(self.remote_addr);
+                    let _ = event_tx.send(crate::engine::PrivetEvent::PairRequest {
+                        peer: crate::peer::PeerInfo {
+                            id: crate::peer::PeerId(uuid::Uuid::nil()),
+                            name: self.device_name.clone(),
+                            addresses: vec![pairing_addr],
+                            fingerprint: peer_fingerprint.clone(),
+                            is_trusted: false,
+                            last_seen: std::time::SystemTime::now(),
+                            platform: None,
+                            version: None,
+                        },
+                        code,
+                    });
+                    return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
+                }
                 return Err(PrivetError::TransferRejected(r.reason));
             }
             other => {
