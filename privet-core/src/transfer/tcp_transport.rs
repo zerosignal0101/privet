@@ -154,6 +154,11 @@ where
 
     // 4. Read Offer
     let (_, offer_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
+    // Sender may have sent a Reject instead (pairing needed on its side)
+    if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&offer_data) {
+        tracing::info!("[tcp-recv] sender rejected: {} (pairing needed, retry expected)", rej.reason);
+        return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint, hello.device_name.clone(), Vec::new(), peer_listen_addr));
+    }
     let offer_msg = handshake::deserialize(&offer_data)?;
     let offer = match &offer_msg {
         ControlMessage::Offer(o) => o,
@@ -175,6 +180,7 @@ where
         file_relative_paths: offer.files.files.iter().map(|f| f.relative_path.clone()).collect(),
         peer_name: hello.device_name.clone(),
         peer_fingerprint: peer_fingerprint.clone(),
+        peer_address: peer_listen_addr.map(|a| a.to_string()),
         files: offer.files.files.iter().map(|f| TransferFileRecord {
             path: f.relative_path.clone(),
             size: f.size,
@@ -665,6 +671,7 @@ pub async fn send_files_tcp<S>(
     tls_peer_fingerprint: Option<&str>,
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    session_meta: &tokio::sync::RwLock<std::collections::HashMap<SessionId, crate::engine::SessionMeta>>,
 ) -> Result<(SessionId, String, String, Option<std::net::SocketAddr>), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -703,6 +710,16 @@ where
         .map(|port| SocketAddr::new(addr.ip(), port));
     tracing::debug!("[tcp-send] received HelloAck listen_port={:?} → peer_listen_addr={:?}",
         hello_ack.listen_port, peer_listen_addr);
+
+    // Record peer info in session_meta so error/cancel paths have the data.
+    {
+        let mut map = session_meta.write().await;
+        if let Some(meta) = map.get_mut(&session_id) {
+            meta.peer_name = peer_device_name.clone();
+            meta.peer_fingerprint = peer_fingerprint.clone();
+            meta.peer_address = peer_listen_addr.map(|a| a.to_string());
+        }
+    }
 
     // 2b. If TLS is active, verify HelloAck fingerprint matches TLS certificate
     if let Some(tls_fp) = tls_peer_fingerprint {
@@ -1304,6 +1321,8 @@ mod tests {
         let (event_tx, _) = mpsc::unbounded_channel();
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let session_meta: Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let identity = crate::security::identity::DeviceIdentity::generate(
             "test-sender".into(),
@@ -1381,6 +1400,7 @@ mod tests {
             None,
             &event_tx,
             Some(cancel_flag),
+            &session_meta,
         )
         .await;
 
@@ -1487,6 +1507,7 @@ mod tests {
             None,  // no TLS fingerprint
             &event_tx,
             None,  // no cancel flag
+            &session_meta,
         )
         .await;
 
@@ -1633,6 +1654,7 @@ mod tests {
             tls_fingerprint.as_deref(),
             &event_tx,
             None,
+            &session_meta,
         )
         .await;
 

@@ -87,6 +87,8 @@ pub struct SessionMeta {
     pub peer_name: String,
     /// Peer fingerprint (for history records on cancel).
     pub peer_fingerprint: String,
+    /// Peer address (for Resend/Forward from history on cancel).
+    pub peer_address: Option<String>,
     /// File records for history logging on cancel.
     pub files: Vec<crate::storage::records::TransferFileRecord>,
     /// Total transfer size in bytes.
@@ -303,7 +305,9 @@ impl PrivetEngine {
                                         );
                                         match receiver.receive(&event_tx).await {
                                             Ok((session_id, _fp, peer_name, file_records, _peer_addr)) => {
-                                                if let Some(log) = &transfer_log {
+                                                if file_records.is_empty() {
+                                                    tracing::debug!("[quic-recv] empty file records (handshake rejected?), skipping log");
+                                                } else if let Some(log) = &transfer_log {
                                                     let now = std::time::SystemTime::now()
                                                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                                         .map(|d| d.as_secs()).ok();
@@ -435,7 +439,10 @@ impl PrivetEngine {
                                         .await
                                         {
                                             Ok((session_id, fp, peer_name, file_records, peer_addr)) => {
-                                                if let Some(log) = &tl {
+                                                if file_records.is_empty() {
+                                                    // Empty result (e.g. sender rejected the handshake, retry expected)
+                                                    tracing::debug!("[tcp-recv] empty file records (handshake rejected?), skipping log");
+                                                } else if let Some(log) = &tl {
                                                     let now = std::time::SystemTime::now()
                                                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                                         .map(|d| d.as_secs()).ok();
@@ -637,9 +644,11 @@ impl PrivetEngine {
             .map(|d| d.as_secs())
             .ok();
 
-        // Helper to log a failed send
+        // Helper to log a failed or cancelled send.
+        // `state` defaults to Failed; pass Cancelled when the transfer was cancelled by the peer.
         let log_fail = |log: Option<&TransferLog>, session_id: SessionId, error: &str,
-                        peer_fp: &str, peer_name: &str, started_at: Option<u64>| {
+                        peer_fp: &str, peer_name: &str, started_at: Option<u64>,
+                        state: TransferRecordState| {
             if let Some(l) = log {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -655,7 +664,7 @@ impl PrivetEngine {
                     bytes_transferred: 0,
                     started_at,
                     completed_at: now,
-                    state: TransferRecordState::Failed,
+                    state,
                     error: Some(error.to_owned()),
                 });
             }
@@ -684,7 +693,7 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TCP connect failed: {e}");
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None, TransferRecordState::Failed);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -700,7 +709,7 @@ impl PrivetEngine {
                         Ok(c) => c,
                         Err(e) => {
                             let msg = format!("TLS client config error: {e}");
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None, TransferRecordState::Failed);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -714,7 +723,7 @@ impl PrivetEngine {
                         Ok(n) => n,
                         Err(_) => {
                             let msg: String = "invalid TLS server name".into();
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None, TransferRecordState::Failed);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -729,7 +738,7 @@ impl PrivetEngine {
                         Ok(s) => s,
                         Err(e) => {
                             let msg = format!("TLS handshake failed: {e}");
-                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None);
+                            log_fail(self.transfer_log.as_ref(), session_id, &msg, "", "", None, TransferRecordState::Failed);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: msg.clone(),
@@ -756,6 +765,7 @@ impl PrivetEngine {
                             .collect(),
                         peer_name: String::new(),
                         peer_fingerprint: String::new(),
+                        peer_address: Some(addr.to_string()),
                         files: file_records.clone(),
                         total_bytes,
                         started_at: tcp_started_at,
@@ -773,6 +783,7 @@ impl PrivetEngine {
                         tls_fp.as_deref(),
                         &self.event_tx,
                         Some(tcp_cancel_flag),
+                        &self.session_meta,
                     )
                     .await
                     {
@@ -796,15 +807,28 @@ impl PrivetEngine {
                             return Ok(tcp_session);
                         }
                         Err(tcp_err) => {
+                            // Extract peer info from session_meta before cleanup,
+                            // so we can record the known device even on cancel/error.
+                            let meta_peer = self.session_meta.write().await.remove(&session_id);
                             self.cancel_signals.write().await.remove(&session_id);
-                            self.session_meta.write().await.remove(&session_id);
                             // Skip logging for PairingRequired (handshake completed,
                             // PairRequest event carries peer info).
                             if matches!(&tcp_err, PrivetError::Security(crate::error::SecurityError::PairingRequired)) {
                                 return Err(tcp_err);
                             }
+                            // Record as known device if we have peer info from handshake
+                            if let Some(ref m) = meta_peer {
+                                if !m.peer_fingerprint.is_empty() {
+                                    let known_addr = m.peer_address.as_ref()
+                                        .and_then(|a| a.parse::<SocketAddr>().ok())
+                                        .unwrap_or(addr);
+                                    self.record_to_known_devices(&m.peer_fingerprint, &known_addr, &m.peer_name).await;
+                                }
+                            }
+                            let is_cancelled = matches!(&tcp_err, PrivetError::TransferCancelled);
+                            let log_state = if is_cancelled { TransferRecordState::Cancelled } else { TransferRecordState::Failed };
                             let err_msg = tcp_err.to_string();
-                            log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None);
+                            log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None, log_state);
                             let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                                 session_id,
                                 error: err_msg,
@@ -823,8 +847,21 @@ impl PrivetEngine {
                     return Err(quic_err);
                 }
 
+                // Record as known device if we have peer info from handshake
+                let meta_peer = self.session_meta.write().await.remove(&session_id);
+                self.cancel_signals.write().await.remove(&session_id);
+                if let Some(ref m) = meta_peer {
+                    if !m.peer_fingerprint.is_empty() {
+                        let known_addr = m.peer_address.as_ref()
+                            .and_then(|a| a.parse::<SocketAddr>().ok())
+                            .unwrap_or(addr);
+                        self.record_to_known_devices(&m.peer_fingerprint, &known_addr, &m.peer_name).await;
+                    }
+                }
+                let is_cancelled = matches!(&quic_err, PrivetError::TransferCancelled);
+                let log_state = if is_cancelled { TransferRecordState::Cancelled } else { TransferRecordState::Failed };
                 let err_msg = quic_err.to_string();
-                log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None);
+                log_fail(self.transfer_log.as_ref(), session_id, &err_msg, "", "", None, log_state);
                 let _ = self.event_tx.send(PrivetEvent::TransferFailed {
                     session_id,
                     error: err_msg,
@@ -842,6 +879,7 @@ impl PrivetEngine {
                 .collect(),
             peer_name: peer_device_name.clone(),
             peer_fingerprint: peer_fingerprint.clone(),
+            peer_address: Some(peer_listen_addr.unwrap_or(addr).to_string()),
             files: file_records.clone(),
             total_bytes,
             started_at: send_started_at,
@@ -922,6 +960,7 @@ impl PrivetEngine {
                 .collect(),
             peer_name: String::new(),
             peer_fingerprint: String::new(),
+            peer_address: Some(addr.to_string()),
             files: file_records.to_vec(),
             total_bytes,
             started_at: std::time::SystemTime::now()
@@ -940,11 +979,16 @@ impl PrivetEngine {
         );
         sender.set_cancel_flag(cancel_flag);
 
-        let result = sender.send(session_id, files, &self.event_tx, trusted, security_mode).await;
+        let result = sender.send(session_id, files, &self.event_tx, trusted, security_mode, &self.session_meta).await;
 
-        // Clean up session tracking
-        self.cancel_signals.write().await.remove(&session_id);
-        self.session_meta.write().await.remove(&session_id);
+        if result.is_ok() {
+            // Success: clean up session tracking
+            self.cancel_signals.write().await.remove(&session_id);
+            self.session_meta.write().await.remove(&session_id);
+        }
+        // On error: leave session_meta in place so the caller can read
+        // peer info (updated by Sender::send after HelloAck) for
+        // known device recording and logging.
 
         result
     }
@@ -1193,18 +1237,19 @@ impl PrivetEngine {
         });
 
         // 6. Log to transfer log (with peer info and file records from session_meta)
-        let (peer_fp, peer_name, record_files, record_total, record_started) = meta.as_ref()
+        let (peer_fp, peer_name, peer_addr, record_files, record_total, record_started) = meta.as_ref()
             .map(|m| (
                 m.peer_fingerprint.as_str(),
                 m.peer_name.as_str(),
+                m.peer_address.clone(),
                 m.files.clone(),
                 m.total_bytes,
                 m.started_at,
             ))
-            .unwrap_or(("", "", Vec::new(), 0, None));
+            .unwrap_or(("", "", None, Vec::new(), 0, None));
         self.log_transfer(
             *session_id,
-            dir, peer_fp, peer_name, None,
+            dir, peer_fp, peer_name, peer_addr,
             record_files, record_total, 0,
             record_started,
             crate::storage::records::TransferRecordState::Cancelled,

@@ -68,6 +68,7 @@ class ActiveTransfer {
   final String? peerFingerprint;
   final List<FileEntry> files;
   final TransferState state;
+  final String? errorMessage;
 
   const ActiveTransfer({
     required this.sessionId,
@@ -77,6 +78,7 @@ class ActiveTransfer {
     this.peerFingerprint,
     this.files = const [],
     required this.state,
+    this.errorMessage,
   });
 
   ActiveTransfer copyWith({
@@ -84,6 +86,7 @@ class ActiveTransfer {
     TransferState? state,
     String? peerName,
     String? peerFingerprint,
+    String? errorMessage,
   }) =>
       ActiveTransfer(
         sessionId: sessionId,
@@ -93,6 +96,7 @@ class ActiveTransfer {
         peerFingerprint: peerFingerprint ?? this.peerFingerprint,
         files: files,
         state: state ?? this.state,
+        errorMessage: errorMessage ?? this.errorMessage,
       );
 
   String get fileCountText {

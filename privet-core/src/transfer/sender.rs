@@ -59,6 +59,8 @@ impl Sender {
 
     /// Execute the full send flow: handshake → trust check → offer → send data (parallel streams).
     /// Returns (session_id, peer_fingerprint, peer_device_name, peer_listen_addr) on success.
+    /// `session_meta` is updated with peer info from HelloAck so the caller can log accurate
+    /// transfer records even when the transfer fails or is cancelled after the handshake.
     pub async fn send(
         &self,
         session_id: SessionId,
@@ -66,6 +68,7 @@ impl Sender {
         event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
         trusted_fingerprints: &[String],
         security_mode: &crate::config::SecurityMode,
+        session_meta: &tokio::sync::RwLock<std::collections::HashMap<SessionId, crate::engine::SessionMeta>>,
     ) -> Result<(SessionId, String, String, Option<SocketAddr>), PrivetError> {
         if self.is_cancelled() {
             return Err(PrivetError::TransferCancelled);
@@ -117,6 +120,17 @@ impl Sender {
             .map(|port| SocketAddr::new(self.remote_addr.ip(), port));
         tracing::debug!("[sender] received HelloAck listen_port={:?} → peer_listen_addr={:?}",
             hello_ack.listen_port, peer_listen_addr);
+
+        // Record peer info in session_meta so error/cancel paths have the data
+        // even if the send doesn't complete.
+        {
+            let mut map = session_meta.write().await;
+            if let Some(meta) = map.get_mut(&session_id) {
+                meta.peer_name = peer_device_name.clone();
+                meta.peer_fingerprint = peer_fingerprint.clone();
+                meta.peer_address = peer_listen_addr.map(|a| a.to_string());
+            }
+        }
 
         // 3c. Verify HelloAck fingerprint matches TLS certificate (MITM protection)
         // Extract fingerprint eagerly and drop the Box<dyn Any> before any .await.

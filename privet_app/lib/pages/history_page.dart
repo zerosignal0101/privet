@@ -294,19 +294,30 @@ class _HistoryRecordTile extends ConsumerWidget {
   void _resend(BuildContext context, WidgetRef ref) async {
     final bool isReceiveFile = record.direction == TransferDirection.receiving;
 
-    if (isReceiveFile) {
-      // Forward received files
-      final filePaths = record.files.map((f) {
+    // Build SendFileEntry list that preserves the original relativePath
+    // (e.g. "colors/colors.json") so the send preparation page shows
+    // the correct folder hierarchy.
+    List<SendFileEntry> buildEntries(List<TransferFileRecord> files) {
+      return files.map((f) {
         final p = File(f.path).isAbsolute
             ? f.path
             : (downloadDir != null ? '$downloadDir/${f.path}' : null);
-        final exists = p != null ? File(p).existsSync() : false;
-        debugPrint('[history] forward check: path="$p" exists=$exists');
-        return exists ? p : null;
-      }).whereType<String>().toList();
+        if (p == null || !File(p).existsSync()) return null;
+        return SendFileEntry(
+          absolutePath: p,
+          relativePath: f.relativePath ?? p.split(Platform.pathSeparator).last,
+          size: f.size,
+          isDir: f.isDir,
+        );
+      }).whereType<SendFileEntry>().toList();
+    }
+
+    if (isReceiveFile) {
+      // Forward received files
+      final entries = buildEntries(record.files);
 
       if (!context.mounted) return;
-      if (filePaths.isEmpty) {
+      if (entries.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Received files not found on disk')),
         );
@@ -316,7 +327,7 @@ class _HistoryRecordTile extends ConsumerWidget {
         context,
         MaterialPageRoute(
           builder: (_) => SendPreparationPage(
-            initialFilePaths: filePaths.isNotEmpty ? filePaths : null,
+            initialEntries: entries,
             initialPeerAddress: record.peerAddress,
             initialPeerName: record.peerName,
             initialPeerFingerprint: record.peerFingerprint,
@@ -327,7 +338,7 @@ class _HistoryRecordTile extends ConsumerWidget {
     }
 
     // Resend: try to recover original files via identifier (content:// URI)
-    final recoveredPaths = <String>[];
+    final recovered = <SendFileEntry>[];
     int missingCount = 0;
 
     for (final f in record.files) {
@@ -336,7 +347,12 @@ class _HistoryRecordTile extends ConsumerWidget {
         identifier: f.identifier,
       );
       if (path != null) {
-        recoveredPaths.add(path);
+        recovered.add(SendFileEntry(
+          absolutePath: path,
+          relativePath: f.relativePath ?? path.split(Platform.pathSeparator).last,
+          size: f.size,
+          isDir: f.isDir,
+        ));
       } else {
         missingCount++;
       }
@@ -344,7 +360,7 @@ class _HistoryRecordTile extends ConsumerWidget {
 
     if (!context.mounted) return;
 
-    if (missingCount > 0 && recoveredPaths.isEmpty) {
+    if (missingCount > 0 && recovered.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Original files are no longer accessible ($missingCount missing). '
@@ -357,7 +373,7 @@ class _HistoryRecordTile extends ConsumerWidget {
       context,
       MaterialPageRoute(
         builder: (_) => SendPreparationPage(
-          initialFilePaths: recoveredPaths.isNotEmpty ? recoveredPaths : null,
+          initialEntries: recovered.isNotEmpty ? recovered : null,
           initialPeerAddress: record.peerAddress,
           initialPeerName: record.peerName,
           initialPeerFingerprint: record.peerFingerprint,

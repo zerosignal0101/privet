@@ -20,7 +20,13 @@ class SendPreparationPage extends ConsumerStatefulWidget {
   final String? initialPeerFingerprint;
 
   /// Pre-filled file paths (for resend from history).
+  /// Each file/directory is scanned to compute relative paths.
   final List<String>? initialFilePaths;
+
+  /// Pre-built file entries (from history Forward/Resend).
+  /// Preserves original relative paths including folder hierarchy
+  /// (e.g. "colors/colors.json") instead of deriving from file name.
+  final List<SendFileEntry>? initialEntries;
 
   const SendPreparationPage({
     super.key,
@@ -28,6 +34,7 @@ class SendPreparationPage extends ConsumerStatefulWidget {
     this.initialPeerName,
     this.initialPeerFingerprint,
     this.initialFilePaths,
+    this.initialEntries,
   });
 
   @override
@@ -49,14 +56,31 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   void _initFromParams() {
     if (_initialised) return;
     _initialised = true;
-    final state = ref.read(sendPreparationProvider);
+    final n = ref.read(sendPreparationProvider.notifier);
+    final s = ref.read(sendPreparationProvider);
 
-    if (widget.initialFilePaths != null && state.filePaths.isEmpty && widget.initialFilePaths!.isNotEmpty) {
+    // Pre-built entries (from Forward/Resend) — preserves folder hierarchy
+    if (widget.initialEntries != null && widget.initialEntries!.isNotEmpty && s.entries.isEmpty) {
+      final existing = widget.initialEntries!
+          .where((e) => File(e.absolutePath).existsSync())
+          .toList();
+      final missing = widget.initialEntries!.length - existing.length;
+      n.addFileEntries(existing);
+      if (missing > 0) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('$missing file${missing > 1 ? "s were" : " was"} missing and removed')),
+            );
+          }
+        });
+      }
+    } else if (widget.initialFilePaths != null && s.filePaths.isEmpty && widget.initialFilePaths!.isNotEmpty) {
       final existing = widget.initialFilePaths!
           .where((p) => File(p).existsSync())
           .toList();
       final missing = widget.initialFilePaths!.length - existing.length;
-      ref.read(sendPreparationProvider.notifier).addFiles(existing);
+      n.addFiles(existing);
       if (missing > 0) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
@@ -67,7 +91,7 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
         });
       }
     }
-    if (widget.initialPeerAddress != null && state.peerAddress == null) {
+    if (widget.initialPeerAddress != null && s.peerAddress == null) {
       ref.read(sendPreparationProvider.notifier).setPeer(
         widget.initialPeerAddress!,
         name: widget.initialPeerName,
@@ -353,32 +377,25 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
     final sessionId = await ref.read(sendPreparationProvider.notifier).send();
     if (!context.mounted) return;
 
-    // Pop the page and show result
     ref.read(sendPreparationProvider.notifier).reset();
+    // Always switch to Home tab so user can see the transfer result
+    ref.read(shellTabProvider.notifier).select(0);
 
-    // Check error state
-    final err = ref.read(sendPreparationProvider).sendError;
-    if (sessionId != null) {
-      // Success: pop to root (home page) so user can monitor progress
-      if (context.mounted) {
-        Navigator.popUntil(context, (route) => route.isFirst);
-      }
-      if (context.mounted) {
+    if (context.mounted) {
+      Navigator.popUntil(context, (route) => route.isFirst);
+    }
+
+    if (context.mounted) {
+      final err = ref.read(sendPreparationProvider).sendError;
+      if (sessionId != null) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Transfer started')),
         );
-      }
-    } else if (err != null && err.isNotEmpty) {
-      if (context.mounted) {
-        Navigator.pop(context);
-      }
-      if (context.mounted) {
+      } else if (err != null && err.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Send failed: $err')),
         );
       }
-    } else {
-      if (context.mounted) Navigator.pop(context);
     }
   }
 }

@@ -35,6 +35,16 @@ class EngineRunningNotifier extends Notifier<bool> {
 final engineRunningProvider =
     NotifierProvider<EngineRunningNotifier, bool>(EngineRunningNotifier.new);
 
+/// Shell tab index — set to 0 (Home) after send starts so the user sees
+/// the active transfer on the home page.
+class ShellTabNotifier extends Notifier<int> {
+  @override
+  int build() => 0;
+  void select(int index) => state = index;
+}
+
+final shellTabProvider = NotifierProvider<ShellTabNotifier, int>(ShellTabNotifier.new);
+
 // ---------------------------------------------------------------------------
 // Discovery: peer list updated by events
 // ---------------------------------------------------------------------------
@@ -147,7 +157,10 @@ class ActiveTransfersNotifier extends Notifier<Map<String, ActiveTransfer>> {
       if (existing != null) {
         state = {
           ...state,
-          sid: existing.copyWith(state: TransferState.failed),
+          sid: existing.copyWith(
+            state: TransferState.failed,
+            errorMessage: event.error ?? 'Transfer failed',
+          ),
         };
         _startRemoveTimer(sid);
       }
@@ -248,6 +261,14 @@ class ActiveTransfersNotifier extends Notifier<Map<String, ActiveTransfer>> {
       }
     }
     return ok;
+  }
+
+  /// Remove a session from active transfers (e.g. when pairing is needed
+  /// and no TransferFailed event will be emitted).
+  void removeSession(String sessionId) {
+    final map = Map<String, ActiveTransfer>.from(state);
+    map.remove(sessionId);
+    state = map;
   }
 
   /// Clear all — called on engine restart.
@@ -1086,9 +1107,15 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     //   'pair'     → handle pairing → retry
     //   'fail'     → error
     while (true) {
-      // Don't register session yet — only on first progress or retry.
-      // This avoids "Transfer failed" stubs on home page when pairing is needed.
+      // Register session before starting so TransferFailed (e.g. rejection)
+      // is properly tracked. PairingRequired does NOT emit TransferFailed,
+      // so early registration won't produce phantom failure stubs.
       final sessionId = _generateUuid();
+      ref.read(activeTransfersProvider.notifier).registerSendSession(
+        sessionId,
+        peerName: state.peerName,
+        peerFingerprint: state.peerFingerprint,
+      );
 
       final payload = state.entries.isNotEmpty
           ? state.entries.map((e) => {
@@ -1115,6 +1142,9 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
           return sessionId;
 
         case 'pair':
+          // Remove the negotiating session — PairingRequired returns without
+          // TransferFailed, so the session would otherwise be stuck as "Connecting".
+          ref.read(activeTransfersProvider.notifier).removeSession(sessionId);
           print('[send] PairRequest detected, handling pairing');
           state = state.copyWith(sendError: '');
 
@@ -1131,9 +1161,11 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
           continue;
 
         case 'fail':
-          final err = state.sendError;
+          // Read error from the active transfer session
+          final transfers = ref.read(activeTransfersProvider);
+          final err = transfers[sessionId]?.errorMessage ?? state.sendError;
           print('[send] transfer failed: $err');
-          state = state.copyWith(sending: false);
+          state = state.copyWith(sending: false, sendError: err);
           return null;
 
         default:

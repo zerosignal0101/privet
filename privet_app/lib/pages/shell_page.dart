@@ -1,20 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'home_page.dart';
 import 'history_page.dart';
 import 'settings_page.dart';
+import '../providers/providers.dart';
 
 /// Bottom navigation shell with 3 tabs: Home, History, Settings.
-class ShellPage extends StatefulWidget {
+class ShellPage extends ConsumerStatefulWidget {
   const ShellPage({super.key});
 
   @override
-  State<ShellPage> createState() => _ShellPageState();
+  ConsumerState<ShellPage> createState() => _ShellPageState();
 }
 
-class _ShellPageState extends State<ShellPage> {
-  int _currentIndex = 0;
-
+class _ShellPageState extends ConsumerState<ShellPage> {
   final _pages = <Widget>[
     const HomePage(),
     const HistoryPage(),
@@ -23,14 +23,16 @@ class _ShellPageState extends State<ShellPage> {
 
   @override
   Widget build(BuildContext context) {
+    final currentIndex = ref.watch(shellTabProvider);
+
     return Scaffold(
       body: IndexedStack(
-        index: _currentIndex,
+        index: currentIndex,
         children: _pages,
       ),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: _currentIndex,
-        onDestinationSelected: (i) => setState(() => _currentIndex = i),
+        selectedIndex: currentIndex,
+        onDestinationSelected: (i) => ref.read(shellTabProvider.notifier).select(i),
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.home_outlined),

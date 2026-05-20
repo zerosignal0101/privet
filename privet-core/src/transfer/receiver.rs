@@ -356,6 +356,7 @@ impl Receiver {
                     .collect(),
                 peer_name: hello.device_name.clone(),
                 peer_fingerprint: peer_fingerprint.to_owned(),
+                peer_address: peer_listen_addr.map(|a| a.to_string()),
                 files: file_records,
                 total_bytes: offer.total_size,
                 started_at: now,
