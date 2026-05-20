@@ -116,10 +116,10 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
         ),
         const Divider(height: 1),
 
-        // Pairing banner
-        if (state.pairingRequest != null)
+        // Pairing banner — read from pairingProvider directly
+        if (pairing.isNotEmpty)
           _PairingCard(
-            request: state.pairingRequest!,
+            request: pairing.last,
             onTrust: () => ref.read(sendPreparationProvider.notifier).trustPeer(),
             onTrustAndAccept: () =>
                 ref.read(sendPreparationProvider.notifier).trustAndAcceptPeer(),

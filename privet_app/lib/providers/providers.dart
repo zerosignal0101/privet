@@ -286,6 +286,7 @@ class PairRequest {
 class PairingNotifier extends Notifier<List<PairRequest>> {
   StreamSubscription<PrivetEvent>? _sub;
   Completer<void>? _resolutionCompleter;
+  bool _pendingResolution = false;
 
   @override
   List<PairRequest> build() {
@@ -307,24 +308,28 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
     }
   }
 
-  /// Wait for a pending pairing request to be resolved.
-  /// If no request has arrived yet, polls briefly for one.
+  /// Returns a future that completes when the current pairing is resolved.
+  /// If already resolved, returns immediately.
+  /// If no request is pending, waits a short while (acts as poll delay).
   Future<void> get waitForResolution async {
-    if (_resolutionCompleter != null) {
-      await _resolutionCompleter!.future;
+    if (_pendingResolution) {
+      debugPrint('[pairing] waitForResolution: pendingResolution=true, returning immediately');
+      _pendingResolution = false;
       return;
     }
-    for (var i = 0; i < 50; i++) {
-      await Future.delayed(const Duration(milliseconds: 100));
-      if (_resolutionCompleter != null) {
-        await _resolutionCompleter!.future;
-        return;
-      }
+    if (_resolutionCompleter != null) {
+      debugPrint('[pairing] waitForResolution: awaiting completer');
+      await _resolutionCompleter!.future;
+      debugPrint('[pairing] waitForResolution: completer resolved');
+      return;
     }
+    // No pending request yet — wait a minimum interval to avoid busy loop
+    await Future.delayed(const Duration(milliseconds: 100));
   }
 
   void _resolve(String fingerprint) {
     state = state.where((p) => p.peer.fingerprint != fingerprint).toList();
+    _pendingResolution = true;
     if (state.isEmpty && _resolutionCompleter != null) {
       _resolutionCompleter!.complete();
       _resolutionCompleter = null;
@@ -1023,6 +1028,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
   String _hex(int v) => v.toRadixString(16).padLeft(2, '0');
 
   Future<String?> send() async {
+    print('[send] send() called, isReady=${state.isReady} filePaths=${state.filePaths.length} peerAddress=${state.peerAddress}');
     if (!state.isReady) return null;
     state = state.copyWith(sending: true, sendError: '', clearPairing: true);
 
@@ -1045,50 +1051,63 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
           }).toList()
         : state.filePaths; // old format
 
-    // First attempt — non-blocking, uses the pre-generated session_id
+    // First attempt
     var ok = await service.sendFilesStart(
       sessionId,
       state.peerAddress!,
       payload,
     );
+    print('[send] sendFilesStart returned ok=$ok');
 
-    // If failed, handle pairing flow — poll for the PairRequest event
-    if (!ok) {
-      state = state.copyWith(sendError: 'Pairing required');
+    // Wait for pairing resolution. The PairRequest event may arrive with
+    // a delay (FFI event polling), so we cannot rely on !ok being false.
+    // The polling loop covers all cases: no request yet, pending, resolved.
+    state = state.copyWith(sendError: 'Pairing required');
+    print('[send] waiting for pairing resolution...');
 
-      PairRequest? pr;
-      for (int i = 0; i < 50; i++) {
-        await Future.delayed(const Duration(milliseconds: 100));
-        final p = ref.read(pairingProvider);
-        if (p.isNotEmpty) {
-          pr = p.last;
-          state = state.copyWith(pairingRequest: pr);
-          break;
-        }
+    final pairNotifier = ref.read(pairingProvider.notifier);
+    bool hadPairRequest = ref.read(pairingProvider).isNotEmpty;
+    for (int i = 0; i < 150; i++) {
+      final p = ref.read(pairingProvider);
+      if (p.isNotEmpty) hadPairRequest = true;
+      if (hadPairRequest && p.isEmpty) {
+        print('[send] pairing resolved at poll $i');
+        break;
       }
 
-      if (pr == null) {
-        state = state.copyWith(
-          sending: false,
-          sendError: 'No pairing response from peer',
-        );
-        return null;
+      await Future.any([
+        Future.delayed(const Duration(milliseconds: 100)),
+        pairNotifier.waitForResolution,
+      ]);
+    }
+
+    print('[send] poll done: hadPairRequest=$hadPairRequest');
+
+    // If no PairRequest was seen, the first attempt probably succeeded:
+    // return the original session.
+    if (!hadPairRequest) {
+      if (state.fileIdentifiers.isNotEmpty) {
+        FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
       }
+      state = state.copyWith(sending: false, clearPairing: true);
+      return sessionId;
+    }
 
-      await ref.read(pairingProvider.notifier).waitForResolution;
-      // Retry after pairing — new session_id
-      final sessionId2 = _generateUuid();
-      ref.read(activeTransfersProvider.notifier).registerSendSession(
-        sessionId2,
-        peerName: state.peerName,
-        peerFingerprint: state.peerFingerprint,
-      );
-      await service.sendFilesStart(
-        sessionId2,
-        state.peerAddress!,
-        payload,
-      );
+    // Retry after pairing (new connection, both sides should now trust)
+    print('[send] retrying after pairing...');
+    final sessionId2 = _generateUuid();
+    ref.read(activeTransfersProvider.notifier).registerSendSession(
+      sessionId2,
+      peerName: state.peerName,
+      peerFingerprint: state.peerFingerprint,
+    );
+    ok = await service.sendFilesStart(
+      sessionId2,
+      state.peerAddress!,
+      payload,
+    );
 
+    if (ok) {
       if (state.fileIdentifiers.isNotEmpty) {
         FileIdentifierStore.instance.recordIdentifiers(sessionId2, state.fileIdentifiers);
       }
@@ -1096,31 +1115,36 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       return sessionId2;
     }
 
-    if (state.fileIdentifiers.isNotEmpty) {
-      FileIdentifierStore.instance.recordIdentifiers(sessionId, state.fileIdentifiers);
-    }
-    state = state.copyWith(sending: false, clearPairing: true);
-    return sessionId;
+    state = state.copyWith(
+      sending: false,
+      sendError: 'Transfer failed after pairing',
+    );
+    return null;
   }
   Future<bool> trustPeer() async {
-    if (state.pairingRequest == null) return false;
-    final fp = state.pairingRequest!.peer.fingerprint;
+    // Get fingerprint from PairingNotifier (not state.pairingRequest)
+    // to handle the case where send() hasn't set state.pairingRequest yet.
+    final pairing = ref.read(pairingProvider);
+    if (pairing.isEmpty) return false;
+    final fp = pairing.last.peer.fingerprint;
     final ok = await ref.read(pairingProvider.notifier).trust(fp);
     if (ok) state = state.copyWith(clearPairing: true);
     return ok;
   }
 
   Future<bool> trustAndAcceptPeer() async {
-    if (state.pairingRequest == null) return false;
-    final fp = state.pairingRequest!.peer.fingerprint;
+    final pairing = ref.read(pairingProvider);
+    if (pairing.isEmpty) return false;
+    final fp = pairing.last.peer.fingerprint;
     final ok = await ref.read(pairingProvider.notifier).trustAndAccept(fp);
     if (ok) state = state.copyWith(clearPairing: true);
     return ok;
   }
 
   Future<bool> rejectPeer() async {
-    if (state.pairingRequest == null) return false;
-    final fp = state.pairingRequest!.peer.fingerprint;
+    final pairing = ref.read(pairingProvider);
+    if (pairing.isEmpty) return false;
+    final fp = pairing.last.peer.fingerprint;
     final ok = await ref.read(pairingProvider.notifier).reject(fp);
     if (ok) state = state.copyWith(clearPairing: true, sendError: 'Pairing rejected');
     return ok;
