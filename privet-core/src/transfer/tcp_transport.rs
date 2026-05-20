@@ -594,16 +594,36 @@ where
 {
     let mut dest_paths = Vec::with_capacity(files.len());
 
+    // Build top-level directory rename map for folder-level dedup.
+    let dir_rename_map = {
+        let rel_paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        let raw = crate::transfer::receiver::build_top_dir_rename_map(
+            rel_paths.into_iter(),
+            download_dir,
+        );
+        raw.into_iter().map(|(k, v)| (k.to_owned(), v)).collect::<std::collections::HashMap<String, String>>()
+    };
+    let rename_ref = if dir_rename_map.is_empty() { None } else { Some(&dir_rename_map) };
+
     for (file_idx, file_info) in files.iter().enumerate() {
+        // Adjust path if top-level directory was renamed
+        let adjusted_rel = if let Some(map) = rename_ref {
+            let ref_map: std::collections::HashMap<&str, String> =
+                map.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            crate::transfer::receiver::adjust_path(&file_info.relative_path, &ref_map)
+        } else {
+            std::borrow::Cow::Borrowed(file_info.relative_path.as_str())
+        };
+
         // Handle directory marker entries: create the directory, no data to read
         if file_info.is_dir && file_info.size == 0 {
-            let dir_path = download_dir.join(&file_info.relative_path);
+            let dir_path = download_dir.join(&*adjusted_rel);
             tokio::fs::create_dir_all(&dir_path).await?;
             dest_paths.push(dir_path);
             continue;
         }
 
-        let base = download_dir.join(&file_info.relative_path);
+        let base = download_dir.join(&*adjusted_rel);
         let pair = crate::transfer::receiver::open_file_atomic(&base).await?;
         let dest = pair.0;
         let file = pair.1;

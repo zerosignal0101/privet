@@ -465,11 +465,35 @@ impl Receiver {
         // Send Accept
         control::write_control_frame(&mut ctrl_send, &handshake::serialize(&ControlMessage::Accept(Accept { session_id, resume_map }))?).await?;
 
+        // Build top-level directory rename map for folder-level dedup.
+        // If a top-level directory already exists in the download dir, rename
+        // the entire folder (e.g. "colors" → "colors (1)") instead of
+        // renaming individual files inside the existing folder.
+        let dir_rename_map = {
+            let rel_paths: Vec<&str> = offer.files.files.iter()
+                .map(|f| f.relative_path.as_str())
+                .collect();
+            let raw = crate::transfer::receiver::build_top_dir_rename_map(
+                rel_paths.iter().copied(),
+                &self.download_dir,
+            );
+            // Convert from HashMap<&str, String> to HashMap<String, String>
+            raw.into_iter().map(|(k, v)| (k.to_owned(), v)).collect::<std::collections::HashMap<String, String>>()
+        };
+        let rename_ref = if dir_rename_map.is_empty() { None } else { Some(&dir_rename_map) };
+
         // Create directories for directory marker entries (no data stream for these)
         let mut actual_dests: Vec<PathBuf> = Vec::new();
         for file_entry in &offer.files.files {
             if file_entry.is_dir && file_entry.size == 0 {
-                let dir_path = self.download_dir.join(&file_entry.relative_path);
+                let rel_path = if let Some(map) = rename_ref {
+                    let ref_map: std::collections::HashMap<&str, String> =
+                        map.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                    crate::transfer::receiver::adjust_path(&file_entry.relative_path, &ref_map)
+                } else {
+                    std::borrow::Cow::Borrowed(file_entry.relative_path.as_str())
+                };
+                let dir_path = self.download_dir.join(&*rel_path);
                 tokio::fs::create_dir_all(&dir_path).await?;
                 actual_dests.push(dir_path);
             }
@@ -536,7 +560,7 @@ impl Receiver {
             let dests = receive_stream_files(
                 &mut data_stream, &stream_header, &self.download_dir,
                 &tracker, event_tx, session_id, total_size,
-                Some(&cancel_flag),
+                Some(&cancel_flag), rename_ref,
             ).await;
             let dests = match dests {
                 Ok(d) => d,
@@ -614,12 +638,26 @@ async fn receive_stream_files(
     event_tx: &mpsc::UnboundedSender<crate::engine::PrivetEvent>,
     session_id: SessionId, total_size: u64,
     cancel_flag: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // Pre-computed top-level directory rename map for folder-level dedup.
+    // When a top-level directory already exists in download_dir, this map
+    // maps its original name to a unique variant (e.g. "colors" → "colors (1)").
+    rename_map: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<Vec<PathBuf>, PrivetError> {
     let mut actual_dests = Vec::new();
     for file_entry in &stream_header.files {
+        // Adjust path if top-level directory was renamed
+        let adjusted_rel = if let Some(map) = rename_map {
+            let rel = file_entry.relative_path.as_str();
+            let ref_map: std::collections::HashMap<&str, String> =
+                map.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            crate::transfer::receiver::adjust_path(rel, &ref_map)
+        } else {
+            std::borrow::Cow::Borrowed(file_entry.relative_path.as_str())
+        };
+
         // Directory marker: create directory, no data to read
         if file_entry.is_dir && file_entry.total_size == 0 {
-            let dir_path = download_dir.join(&file_entry.relative_path);
+            let dir_path = download_dir.join(&*adjusted_rel);
             tokio::fs::create_dir_all(&dir_path).await?;
             actual_dests.push(dir_path);
             continue;
@@ -631,14 +669,14 @@ async fn receive_stream_files(
         let is_resume = file_entry.start_offset > 0;
         if is_resume {
             // Resume: exact path required (previous partial transfer)
-            dest = download_dir.join(&file_entry.relative_path);
+            dest = download_dir.join(&*adjusted_rel);
             if let Some(parent) = dest.parent() { tokio::fs::create_dir_all(parent).await?; }
             file = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(file_entry.start_offset)).await?;
         } else {
             // New file: atomically create with unique name
-            let base = download_dir.join(&file_entry.relative_path);
+            let base = download_dir.join(&*adjusted_rel);
             let pair = open_file_atomic(&base).await
                 .map_err(PrivetError::Io)?;
             dest = pair.0;
@@ -709,6 +747,61 @@ async fn receive_stream_one_file(
 }
 
 pub(crate) fn fs_available_space(_path: &PathBuf) -> std::io::Result<u64> { Ok(u64::MAX) }
+
+/// Detect top-level directory conflicts and build a rename map.
+/// If a top-level directory in the file list already exists in `download_dir`,
+/// computes a unique name (e.g. "colors (1)") and maps the original name to it.
+/// This avoids mixing files from different transfers into the same folder.
+pub(crate) fn build_top_dir_rename_map<'a>(
+    files: impl IntoIterator<Item = &'a str>,
+    download_dir: &std::path::Path,
+) -> std::collections::HashMap<&'a str, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for path in files {
+        let top = match path.split('/').next() {
+            Some(t) if !t.is_empty() => t,
+            _ => continue,
+        };
+        if !seen.insert(top) {
+            continue; // already checked
+        }
+        let candidate = download_dir.join(top);
+        if !candidate.exists() {
+            continue;
+        }
+        // Find unique name
+        for i in 1..1000 {
+            let new_name = format!("{} ({})", top, i);
+            if !download_dir.join(&new_name).exists() {
+                map.insert(top, new_name);
+                break;
+            }
+        }
+    }
+
+    map
+}
+
+/// Apply a top-level directory rename map to a relative path.
+/// Returns the adjusted path if the top-level directory was renamed.
+pub(crate) fn adjust_path<'a>(
+    relative_path: &'a str,
+    rename_map: &std::collections::HashMap<&'a str, String>,
+) -> std::borrow::Cow<'a, str> {
+    let top = match relative_path.split('/').next() {
+        Some(t) if !t.is_empty() => t,
+        _ => return std::borrow::Cow::Borrowed(relative_path),
+    };
+    match rename_map.get(top) {
+        Some(new_top) => {
+            let suffix = &relative_path[top.len()..]; // includes leading '/' or empty
+            std::borrow::Cow::Owned(format!("{}{}", new_top, suffix))
+        }
+        None => std::borrow::Cow::Borrowed(relative_path),
+    }
+}
 
 /// Atomically create a new file with a unique name using O_CREAT|O_EXCL.
 /// If the base path already exists, appends " (1)", " (2)" etc.

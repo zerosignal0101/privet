@@ -902,7 +902,17 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     if (type == FileSystemEntityType.notFound) return [];
 
     if (type == FileSystemEntityType.directory) {
-      final entries = _scanDirectory(path, path);
+      // Use the parent as root so relative paths include the directory name
+      final parentPath = Directory(path).parent.path;
+      final entries = _scanDirectory(path, parentPath);
+      // Add the top-level directory as a marker entry
+      final dirName = path.split(Platform.pathSeparator).last;
+      entries.insert(0, SendFileEntry(
+        absolutePath: path,
+        relativePath: dirName.replaceAll('\\', '/'),
+        size: 0,
+        isDir: true,
+      ));
       debugPrint('[scanPath] scanned dir "$path": ${entries.length} files');
       return entries;
     }
