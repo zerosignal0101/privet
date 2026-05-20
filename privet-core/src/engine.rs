@@ -223,8 +223,6 @@ impl PrivetEngine {
         tracing::info!("PrivetEngine::start: security_mode={:?}, download_dir={:?}",
             self.config.security_mode, self.config.download_dir);
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
-        let server_config = tls::build_server_config(&self.identity, &trusted)?;
-        let rustls_server: Arc<rustls::ServerConfig> = server_config;
 
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", self.config.transport.listen_port)
             .parse()
@@ -232,13 +230,7 @@ impl PrivetEngine {
                 crate::error::TransportError::Quic(e.to_string())
             ))?;
 
-        let ep = Arc::new(endpoint::build_server_endpoint(
-            &self.config.transport,
-            rustls_server,
-            listen_addr,
-        )?);
-
-        let ep_clone = Arc::clone(&ep);
+        // Shared state clones (used by both QUIC and TCP listener paths)
         let event_tx = self.event_tx.clone();
         let download_dir = self.config.download_dir.clone();
         let chunk_size = self.config.transport.chunk_size;
@@ -260,82 +252,99 @@ impl PrivetEngine {
         let transfer_log = self.transfer_log.clone();
         let transfer_log_tcp = transfer_log.clone();
 
-        let listener = async move {
-            loop {
-                match ep_clone.accept().await {
-                    Some(incoming) => {
-                        match incoming.await {
-                            Ok(conn) => {
-                                let event_tx = event_tx.clone();
-                                let download_dir = download_dir.clone();
-                                let identity = identity.clone();
-                                let trust_store = trust_store.clone();
-                                let accept_store = accept_store.clone();
-                                let known_device_store = known_device_store.clone();
-                                let pending_incoming = pending_incoming.clone();
-                                let pending_pairing = pending_pairing.clone();
-                                let cancel_signals = cancel_signals.clone();
-                                let session_meta = session_meta.clone();
-                                let transfer_log = transfer_log.clone();
-                                tokio::spawn(async move {
-                                    let receiver = crate::transfer::receiver::Receiver::new(
-                                        conn,
-                                        download_dir,
-                                        chunk_size,
-                                        identity.fingerprint.clone(),
-                                        identity.device_name.clone(),
-                                        trust_store,
-                                        security_mode,
-                                        accept_store,
-                                        known_device_store,
-                                        pending_incoming,
-                                        pending_pairing,
-                                        cancel_signals,
-                                        session_meta,
-                                    );
-                                    match receiver.receive(&event_tx).await {
-                                        Ok((session_id, _fp, peer_name, file_records)) => {
-                                            if let Some(log) = &transfer_log {
-                                                let now = std::time::SystemTime::now()
-                                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                                    .map(|d| d.as_secs()).ok();
-                                                let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
-                                                let _ = log.append(&crate::storage::records::TransferRecord {
-                                                    session_id,
-                                                    direction: crate::session::TransferDirection::Receiving,
-                                                    peer_fingerprint: _fp,
-                                                    peer_name,
-                                                    files: file_records,
-                                                    total_bytes,
-                                                    bytes_transferred: total_bytes,
-                                                    started_at: None,
-                                                    completed_at: now,
-                                                    state: crate::storage::records::TransferRecordState::Completed,
-                                                    error: None,
-                                                });
+        // --- Start QUIC endpoint (skipped when force_tcp_fallback is set) ---
+        if !self.config.transport.force_tcp_fallback {
+            let server_config = tls::build_server_config(&self.identity, &trusted)?;
+            let rustls_server: Arc<rustls::ServerConfig> = server_config;
+
+            let ep = Arc::new(endpoint::build_server_endpoint(
+                &self.config.transport,
+                rustls_server,
+                listen_addr,
+            )?);
+
+            let ep_clone = Arc::clone(&ep);
+
+            let listener = async move {
+                loop {
+                    match ep_clone.accept().await {
+                        Some(incoming) => {
+                            match incoming.await {
+                                Ok(conn) => {
+                                    tracing::info!("[quic-recv] QUIC connection accepted from {}", conn.remote_address());
+                                    let event_tx = event_tx.clone();
+                                    let download_dir = download_dir.clone();
+                                    let identity = identity.clone();
+                                    let trust_store = trust_store.clone();
+                                    let accept_store = accept_store.clone();
+                                    let known_device_store = known_device_store.clone();
+                                    let pending_incoming = pending_incoming.clone();
+                                    let pending_pairing = pending_pairing.clone();
+                                    let cancel_signals = cancel_signals.clone();
+                                    let session_meta = session_meta.clone();
+                                    let transfer_log = transfer_log.clone();
+                                    tokio::spawn(async move {
+                                        let receiver = crate::transfer::receiver::Receiver::new(
+                                            conn,
+                                            download_dir,
+                                            chunk_size,
+                                            identity.fingerprint.clone(),
+                                            identity.device_name.clone(),
+                                            trust_store,
+                                            security_mode,
+                                            accept_store,
+                                            known_device_store,
+                                            pending_incoming,
+                                            pending_pairing,
+                                            cancel_signals,
+                                            session_meta,
+                                        );
+                                        match receiver.receive(&event_tx).await {
+                                            Ok((session_id, _fp, peer_name, file_records)) => {
+                                                if let Some(log) = &transfer_log {
+                                                    let now = std::time::SystemTime::now()
+                                                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                                        .map(|d| d.as_secs()).ok();
+                                                    let total_bytes: u64 = file_records.iter().map(|f| f.size).sum();
+                                                    let _ = log.append(&crate::storage::records::TransferRecord {
+                                                        session_id,
+                                                        direction: crate::session::TransferDirection::Receiving,
+                                                        peer_fingerprint: _fp,
+                                                        peer_name,
+                                                        files: file_records,
+                                                        total_bytes,
+                                                        bytes_transferred: total_bytes,
+                                                        started_at: None,
+                                                        completed_at: now,
+                                                        state: crate::storage::records::TransferRecordState::Completed,
+                                                        error: None,
+                                                    });
+                                                }
+                                            }
+                                            Err(PrivetError::TransferCancelled) => {
+                                                tracing::info!("[quic-recv] transfer cancelled");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("[quic-recv] receive error: {e}");
                                             }
                                         }
-                                        Err(PrivetError::TransferCancelled) => {
-                                            tracing::info!("receiver cancelled");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("receive finished: {e}");
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!("incoming connection failed: {e}");
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("incoming connection failed: {e}");
+                                }
                             }
                         }
+                        None => break,
                     }
-                    None => break,
                 }
-            }
-        };
+            };
 
-        *self.listener_handle.write().await = Some(tokio::spawn(listener));
-        *self.endpoint.write().await = Some(ep);
+            *self.listener_handle.write().await = Some(tokio::spawn(listener));
+            *self.endpoint.write().await = Some(ep);
+        } else {
+            tracing::info!("force_tcp_fallback: QUIC endpoint disabled, TCP-only mode");
+        }
 
         // --- Start TCP fallback listener (with TLS) ---
         if self.config.transport.enable_tcp_fallback {
@@ -408,6 +417,9 @@ impl PrivetEngine {
 
                                         // Extract peer's TLS certificate fingerprint for MITM check
                                         let tls_fp = tls_peer_fingerprint!(&tls_stream);
+
+                                        tracing::info!("[tcp-recv] TCP+TLS connection accepted from {addr}, tls_fingerprint={}",
+                                            tls_fp.as_deref().map(|s| &s[..16]).unwrap_or("none"));
 
                                         let tf = ts.lock().await.trusted_fingerprints();
                                         match crate::transfer::tcp_transport::receive_tcp(

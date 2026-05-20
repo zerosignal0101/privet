@@ -143,6 +143,8 @@ impl Receiver {
         let (mut ctrl_send, mut ctrl_recv) = self.conn.accept_bi()
             .await.map_err(|e| TransportError::ConnectionLost(format!("accept-bi: {e}")))?;
 
+        tracing::info!("[quic-recv] incoming QUIC connection from {} (session via Hello)", self.remote_addr);
+
         // 1. Receive Hello
         let hello_data = control::read_control_frame(&mut ctrl_recv)
             .await
@@ -239,7 +241,7 @@ impl Receiver {
             // Note: close_reason() can race with CONNECTION_CLOSE delivery, so
             // also handle the read error gracefully below.
             if self.conn.close_reason().is_some() {
-                tracing::info!("[receiver] pairing resolved but sender closed connection, returning Ok");
+                tracing::info!("[quic-recv] pairing resolved but sender closed connection, returning Ok");
                 return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
             }
 
@@ -252,14 +254,14 @@ impl Receiver {
                 Ok(Ok(data)) => {
                     // Sender sent a Reject (pairing needed) instead of Offer.
                     if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&data) {
-                        tracing::info!("[receiver] sender rejected: {}", rej.reason);
+                        tracing::info!("[quic-recv] sender rejected: {}", rej.reason);
                         return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
                     }
                     // Sender retried with Offer on this same connection
                     return self.handle_offer(data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await;
                 }
                 _ => {
-                    tracing::info!("[receiver] pairing resolved but no Offer (connection dead or timeout), returning Ok");
+                    tracing::info!("[quic-recv] pairing resolved but no Offer (connection dead or timeout), returning Ok");
                     return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
                 }
             }
@@ -267,7 +269,7 @@ impl Receiver {
 
         // AllowAll: silently trust unknown peers
         if !is_trusted && self.security_mode == SecurityMode::AllowAll {
-            tracing::info!("[receiver] AllowAll: silently trusting peer {}", &peer_fingerprint[..16]);
+            tracing::info!("[quic-recv] AllowAll: silently trusting peer {}", &peer_fingerprint[..16]);
             let _ = self.trust_store.lock().await.trust(peer_fingerprint.clone());
         }
 
@@ -275,7 +277,7 @@ impl Receiver {
         let offer_data = control::read_control_frame(&mut ctrl_recv).await?;
         // Sender may have sent a Reject instead (pairing needed on its side)
         if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&offer_data) {
-            tracing::info!("[receiver] sender rejected: {}", rej.reason);
+            tracing::info!("[quic-recv] sender rejected: {}", rej.reason);
             return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new()));
         }
         let (session_id, fp, device_name, file_records) = self.handle_offer(offer_data, &hello, &peer_fingerprint, ctrl_send, ctrl_recv, event_tx).await?;
@@ -370,14 +372,14 @@ impl Receiver {
         // AwaitAccept flow: determine if user prompt is needed
         match self.security_mode {
             SecurityMode::AllowAll | SecurityMode::TrustRequired => {
-                tracing::debug!("[receiver] AllowAll/TrustRequired: auto-accepting session {}", session_id.0);
+                tracing::debug!("[quic-recv] AllowAll/TrustRequired: auto-accepting session {}", session_id.0);
                 // AllowAll: auto-accept all; TrustRequired: trusted = auto-accept
             }
             SecurityMode::Strict => {
                 if !self.accept_store.lock().await.is_accepted(peer_fingerprint) {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.pending_incoming.write().await.insert(session_id, tx);
-            tracing::debug!("[receiver] AwaitingAccept: inserted session {} into pending_incoming", session_id.0);
+            tracing::debug!("[quic-recv] AwaitingAccept: inserted session {} into pending_incoming", session_id.0);
             let _ = event_tx.send(crate::engine::PrivetEvent::AwaitingAccept {
                 session_id,
                 peer: crate::peer::PeerInfo {
@@ -395,9 +397,9 @@ impl Receiver {
                     total_size: offer.total_size,
                 },
             });
-            tracing::debug!("[receiver] AwaitingAccept: waiting for user decision (session {})...", session_id.0);
+            tracing::debug!("[quic-recv] AwaitingAccept: waiting for user decision (session {})...", session_id.0);
             if !rx.await.unwrap_or(false) {
-                tracing::debug!("[receiver] AwaitingAccept: user REJECTED session {}", session_id.0);
+                tracing::debug!("[quic-recv] AwaitingAccept: user REJECTED session {}", session_id.0);
                 let _ = Self::send_reject_and_wait(
                     &mut ctrl_send, &mut ctrl_recv,
                     session_id,
@@ -405,7 +407,7 @@ impl Receiver {
                 ).await;
                 return Err(PrivetError::TransferRejected("transfer rejected by user".into()));
             }
-            tracing::debug!("[receiver] AwaitingAccept: user ACCEPTED session {}", session_id.0);
+            tracing::debug!("[quic-recv] AwaitingAccept: user ACCEPTED session {}", session_id.0);
             self.pending_incoming.write().await.remove(&session_id);
         }
             }
@@ -572,7 +574,7 @@ impl Receiver {
         let mut buf = [0u8; 1];
         let _ = ctrl_recv.read(&mut buf).await;
         let _ = event_tx.send(crate::engine::PrivetEvent::TransferComplete { session_id, direction: crate::session::TransferDirection::Receiving });
-        tracing::info!("[receiver] transfer complete for session {session_id}");
+        tracing::info!("[quic-recv] transfer complete for session {session_id}");
         Ok((session_id, peer_fingerprint.to_owned(), peer_device_name.clone(), actual_file_records))
     }
 }
