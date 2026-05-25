@@ -126,6 +126,10 @@ pub struct PrivetEngine {
     /// Per-session metadata (direction + file paths) for cleanup on cancel.
     session_meta:
         Arc<RwLock<HashMap<SessionId, SessionMeta>>>,
+    /// Externally-provided network info (e.g., from Android ConnectivityManager
+    /// to bypass VPN). When set, [`current_networks`] returns this instead of
+    /// auto-detecting via UDP socket.
+    networks_override: std::sync::Mutex<Option<Vec<NetworkInfo>>>,
 }
 
 impl PrivetEngine {
@@ -217,6 +221,7 @@ impl PrivetEngine {
             discovery_handles: RwLock::new(Vec::new()),
             transfer_log,
             tcp_listener_handle: RwLock::new(None),
+            networks_override: std::sync::Mutex::new(None),
         })
     }
 
@@ -1373,8 +1378,22 @@ impl PrivetEngine {
     }
 
     /// Detect current networks and return their info.
+    /// Returns externally-provided networks (via [`set_networks`]) if set,
+    /// otherwise falls back to auto-detection via UDP socket.
     pub fn current_networks(&self) -> Vec<NetworkInfo> {
+        if let Some(networks) = self.networks_override.lock().unwrap().as_ref() {
+            return networks.clone();
+        }
         crate::network::detect_current_networks_smart()
+    }
+
+    /// Override the current network info with externally-provided values.
+    ///
+    /// On Android, this is used to bypass the VPN virtual interface and supply
+    /// the real Wi-Fi subnet obtained from `ConnectivityManager`.
+    pub fn set_networks(&self, networks: Vec<NetworkInfo>) {
+        tracing::debug!("PrivetEngine::set_networks: {} network(s)", networks.len());
+        *self.networks_override.lock().unwrap() = Some(networks);
     }
 
     /// Probe known devices on the current network(s).

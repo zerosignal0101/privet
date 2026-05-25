@@ -592,6 +592,36 @@ pub extern "C" fn privet_delete_transfer_record(session_id_str: *const c_char) -
 // Known devices / network awareness
 // ---------------------------------------------------------------------------
 
+/// Set the current network info from externally-provided data.
+///
+/// On Android, this supplies the real Wi-Fi subnet from `ConnectivityManager`,
+/// bypassing the VPN virtual interface that would otherwise be detected.
+///
+/// Accepts a JSON array of `NetworkInfo` objects:
+/// `[{"subnet":"192.168.1.0/24","interface_name":"","local_ips":["192.168.1.100"]}]`
+/// Pass an empty JSON array `[]` to reset and re-enable auto-detection.
+/// Returns 0 on success, -1 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_set_networks(json: *const c_char) -> c_int {
+    let engine = engine_or!(-1);
+    let json_str = unsafe {
+        if json.is_null() { return -1; }
+        match CStr::from_ptr(json).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let networks: Vec<privet_core::NetworkInfo> = match serde_json::from_str(json_str) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("privet_set_networks: invalid JSON: {e}");
+            return -1;
+        }
+    };
+    engine.set_networks(networks);
+    0
+}
+
 /// Get the list of current networks as a JSON string.
 /// Each network has "subnet", "interface_name", "local_ips" fields.
 /// Caller must free the returned string with `privet_free_string`.

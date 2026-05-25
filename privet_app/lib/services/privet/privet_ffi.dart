@@ -125,6 +125,9 @@ typedef PrivetPollEventDart = Pointer<Utf8> Function();
 typedef PrivetGetCurrentNetworksNative = Pointer<Utf8> Function();
 typedef PrivetGetCurrentNetworksDart = Pointer<Utf8> Function();
 
+typedef PrivetSetNetworksNative = Int32 Function(Pointer<Utf8> json);
+typedef PrivetSetNetworksDart = int Function(Pointer<Utf8> json);
+
 typedef PrivetProbeKnownDevicesNative = Pointer<Utf8> Function();
 typedef PrivetProbeKnownDevicesDart = Pointer<Utf8> Function();
 
@@ -183,6 +186,7 @@ class PrivetFfi {
   late PrivetGetIdentityDart _getIdentity;
   late PrivetFreeStringDart _freeString;
   late PrivetGetCurrentNetworksDart _getCurrentNetworks;
+  late PrivetSetNetworksDart _setNetworks;
   late PrivetProbeKnownDevicesDart _probeKnownDevices;
   late PrivetGetKnownDevicesDart _getKnownDevices;
   late PrivetAddKnownDeviceIpDart _addKnownDeviceIp;
@@ -246,6 +250,8 @@ class PrivetFfi {
         PrivetFreeStringDart>('privet_free_string');
     _getCurrentNetworks = _lib!.lookupFunction<PrivetGetCurrentNetworksNative,
         PrivetGetCurrentNetworksDart>('privet_get_current_networks');
+    _setNetworks = _lib!.lookupFunction<PrivetSetNetworksNative,
+        PrivetSetNetworksDart>('privet_set_networks');
     _probeKnownDevices = _lib!.lookupFunction<PrivetProbeKnownDevicesNative,
         PrivetProbeKnownDevicesDart>('privet_probe_known_devices');
     _getKnownDevices = _lib!.lookupFunction<PrivetGetKnownDevicesNative,
@@ -340,6 +346,7 @@ class PrivetFfi {
   void freeString(Pointer<Utf8> ptr) => _freeString(ptr);
 
   Pointer<Utf8> getCurrentNetworks() => _getCurrentNetworks();
+  int setNetworks(Pointer<Utf8> json) => _setNetworks(json);
   Pointer<Utf8> probeKnownDevices() => _probeKnownDevices();
   Pointer<Utf8> getKnownDevices() => _getKnownDevices();
   int addKnownDeviceIp(Pointer<Utf8> argsJson) => _addKnownDeviceIp(argsJson);

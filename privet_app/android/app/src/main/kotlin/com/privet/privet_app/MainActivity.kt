@@ -1,6 +1,8 @@
 package com.privet.privet_app
 
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -84,6 +86,37 @@ class MainActivity : FlutterActivity() {
             }
         }
         handleShareIntent(intent)
+
+        // Real network info channel (bypasses VPN detection)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "privet/network").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getRealNetworkInfo" -> {
+                    try {
+                        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                        val realNetworks = mutableListOf<Map<String, Any>>()
+                        for (network in cm.allNetworks) {
+                            val caps = cm.getNetworkCapabilities(network) ?: continue
+                            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                            val lp = cm.getLinkProperties(network) ?: continue
+                            for (addr in lp.linkAddresses) {
+                                val ip = addr.address
+                                if (ip is java.net.Inet4Address && !ip.isLoopbackAddress) {
+                                    realNetworks.add(mapOf(
+                                        "address" to ip.hostAddress,
+                                        "prefixLength" to addr.prefixLength,
+                                    ))
+                                }
+                            }
+                        }
+                        result.success(realNetworks)
+                    } catch (e: Exception) {
+                        Log.e("PrivetNet", "getRealNetworkInfo failed", e)
+                        result.success(emptyList<Map<String, Any>>())
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
 
         // Device info channel
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL).setMethodCallHandler { call, result ->

@@ -204,6 +204,11 @@ class PrivetFfiIsolate {
     return null;
   }
 
+  Future<bool> setNetworks(String networksJson) async {
+    final r = await _call('set_networks', {'networks_json': networksJson});
+    return r['ok'] == true;
+  }
+
   Future<List<Map<String, dynamic>>> getCurrentNetworks() async {
     final r = await _call('get_current_networks', {});
     if (r['ok'] == true && r['data'] != null) {
@@ -406,6 +411,9 @@ void _handleCommand(PrivetFfi ffi, _FfiCommand cmd) {
       case 'get_identity':
         _cmdGetIdentity(ffi, cmd);
         break;
+      case 'set_networks':
+        _cmdSetNetworks(ffi, cmd);
+        break;
       case 'get_current_networks':
         _cmdGetCurrentNetworks(ffi, cmd);
         break;
@@ -601,6 +609,16 @@ void _cmdGetIdentity(PrivetFfi ffi, _FfiCommand cmd) {
 // ---------------------------------------------------------------------------
 // Known devices / network awareness command handlers
 // ---------------------------------------------------------------------------
+
+void _cmdSetNetworks(PrivetFfi ffi, _FfiCommand cmd) {
+  final json = (cmd.args['networks_json'] as String).toNativeUtf8();
+  try {
+    final result = ffi.setNetworks(json);
+    cmd.replyTo.send({'ok': result == 0});
+  } finally {
+    calloc.free(json);
+  }
+}
 
 void _cmdGetCurrentNetworks(PrivetFfi ffi, _FfiCommand cmd) {
   final ptr = ffi.getCurrentNetworks();
