@@ -82,15 +82,23 @@ class _HistoryRecordTile extends ConsumerWidget {
           record.peerName.isNotEmpty ? record.peerName : 'Unknown device',
           style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
         ),
-        subtitle: Row(
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            _stateBadge(record.state, theme),
-            const SizedBox(width: 8),
-            Text(_formatTime(record.completedAt),
-                style: const TextStyle(fontSize: 11, color: Colors.grey)),
-            const Spacer(),
-            Text(record.fileCountText,
-                style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            Row(
+              children: [
+                _stateBadge(record.state, theme),
+                const Spacer(),
+                Text(record.fileCountText,
+                    style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              ],
+            ),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text(_formatTime(record.completedAt),
+                  style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            ),
           ],
         ),
         children: [
