@@ -133,49 +133,53 @@ class _RecordEntry {
 }
 
 List<FileTreeNode> _buildTreeFromMap(Map<String, _RecordEntry> pathMap, String prefix) {
-  final dirs = <String>{};
-  final files = <String>[];
-
+  // Group paths at the current level by their first path component.
+  // e.g. ["colors", "colors/colors.json"] → first="colors", both grouped together.
+  final groups = <String, List<String>>{};
   for (final relPath in pathMap.keys) {
     if (relPath == prefix) continue;
-    if (!relPath.startsWith(prefix)) continue;
+    // Non-empty prefix must match with trailing '/' to avoid treating
+    // sibling paths like "colors.json" as children of "colors".
+    if (prefix.isNotEmpty && !relPath.startsWith('$prefix/')) continue;
     final rest = prefix.isEmpty ? relPath : relPath.substring(prefix.length + 1);
     final first = rest.split('/').first;
-    if (rest.contains('/')) {
-      dirs.add(prefix.isEmpty ? first : '$prefix/$first');
-    } else {
-      files.add(relPath);
-    }
+    groups.putIfAbsent(first, () => []).add(relPath);
   }
 
   final result = <FileTreeNode>[];
-  final sortedDirs = dirs.toList()..sort();
-  for (final dirPath in sortedDirs) {
-    final dirName = dirPath.contains('/') ? dirPath.split('/').last : dirPath;
-    final children = _buildTreeFromMap(pathMap, dirPath);
-    // Calculate dir size from children
-    final dirSize = children.fold(0, (sum, c) => sum + c.size);
-    result.add(FileTreeNode(
-      name: dirName,
-      relativePath: dirPath,
-      fullPath: pathMap[dirPath]?.fullPath,
-      size: dirSize,
-      isDir: true,
-      children: children,
-    ));
-  }
+  // Sort for deterministic order
+  final sortedNames = groups.keys.toList()..sort();
+  for (final name in sortedNames) {
+    final fullPath = prefix.isEmpty ? name : '$prefix/$name';
+    final subPaths = groups[name]!;
+    final entry = pathMap[fullPath];
 
-  files.sort();
-  for (final filePath in files) {
-    final entry = pathMap[filePath]!;
-    final fileName = filePath.contains('/') ? filePath.split('/').last : filePath;
-    result.add(FileTreeNode(
-      name: fileName,
-      relativePath: filePath,
-      fullPath: entry.fullPath,
-      size: entry.size,
-      isDir: entry.isDir,
-    ));
+    // Determine if this is a directory:
+    //   (a) it has children (subPaths differ from itself), OR
+    //   (b) it's explicitly marked as a directory (e.g. an empty dir marker)
+    // If neither, it's a regular file.
+    final isDir = subPaths.any((p) => p != fullPath) || (entry?.isDir == true);
+
+    if (isDir) {
+      final children = _buildTreeFromMap(pathMap, fullPath);
+      final dirSize = children.fold(0, (sum, c) => sum + c.size);
+      result.add(FileTreeNode(
+        name: name,
+        relativePath: fullPath,
+        fullPath: entry?.fullPath,
+        size: dirSize,
+        isDir: true,
+        children: children,
+      ));
+    } else {
+      result.add(FileTreeNode(
+        name: name,
+        relativePath: fullPath,
+        fullPath: entry?.fullPath,
+        size: entry?.size ?? 0,
+        isDir: entry?.isDir ?? false,
+      ));
+    }
   }
 
   return result;
