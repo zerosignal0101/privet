@@ -112,6 +112,17 @@ install(DIRECTORY "${NATIVE_ASSETS_DIR}"
    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
    COMPONENT Runtime)
 
+# Copy the privet_ffi native library into the build output.
+set(PRIVET_FFI_SO "${CMAKE_CURRENT_SOURCE_DIR}/../../target/release/libprivet_ffi.so")
+if(EXISTS "${PRIVET_FFI_SO}")
+  install(FILES "${PRIVET_FFI_SO}"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+  message(STATUS "Privet FFI .so found: ${PRIVET_FFI_SO}")
+else()
+  message(WARNING "libprivet_ffi.so not found at ${PRIVET_FFI_SO}. Run 'cargo build -p privet-ffi --release' first.")
+endif()
+
 # Fully re-copy the assets directory on each build to avoid having stale files
 # from a previous install.
 set(FLUTTER_ASSET_DIR_NAME "flutter_assets")

@@ -32,7 +32,7 @@ cargo test -p privet-tests
 cargo clippy --workspace --all-features
 
 # Rust edition and toolchain
-# Built with Rust 1.88.0 (see rust-toolchain.toml), edition 2024
+# Built with latest stable Rust (see rust-toolchain.toml), edition 2024
 ```
 
 ## Architecture
