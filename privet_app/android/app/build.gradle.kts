@@ -34,6 +34,16 @@ android {
         }
     }
 
+    packaging {
+        jniLibs {
+            excludes += listOf(
+                "lib/armeabi-v7a/*",
+                "lib/x86_64/*",
+                "lib/x86/*"
+            )
+        }
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.
