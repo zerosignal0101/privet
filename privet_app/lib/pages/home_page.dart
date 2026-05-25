@@ -253,8 +253,13 @@ class _ProbedPeerTile extends StatelessWidget {
         children: [
           Icon(Icons.check_circle, size: 12, color: Colors.green.shade600),
           const SizedBox(width: 4),
-          Text('Online',
-              style: TextStyle(fontSize: 11, color: Colors.green.shade700)),
+          Expanded(
+            child: Text(
+              peer.addresses.isNotEmpty ? peer.addresses.first : 'Online',
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: Colors.green.shade700),
+            ),
+          ),
           const SizedBox(width: 8),
           Text(peer.displayFingerprint,
               style: const TextStyle(fontSize: 11, color: Colors.grey)),

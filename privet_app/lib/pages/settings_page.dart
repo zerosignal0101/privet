@@ -150,7 +150,10 @@ class SettingsPage extends ConsumerWidget {
                   ),
                 ),
                 subtitle: name != null
-                    ? Text(fp, style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.grey))
+                    ? Text(
+                        fp.length > 12 ? '${fp.substring(0, 12)}...' : fp,
+                        style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.grey),
+                      )
                     : null,
                 trailing: IconButton(
                   icon: const Icon(Icons.delete_outline, size: 20),
@@ -189,7 +192,10 @@ class SettingsPage extends ConsumerWidget {
                   ),
                 ),
                 subtitle: name != null
-                    ? Text(fp, style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.grey))
+                    ? Text(
+                        fp.length > 12 ? '${fp.substring(0, 12)}...' : fp,
+                        style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.grey),
+                      )
                     : null,
                 trailing: IconButton(
                   icon: const Icon(Icons.delete_outline, size: 20),

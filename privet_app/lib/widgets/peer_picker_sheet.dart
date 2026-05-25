@@ -5,7 +5,7 @@ import '../providers/providers.dart';
 
 /// Bottom sheet for picking a peer to send files to.
 /// Shows: discovered peers, probed devices, known devices, "Send by Address" option.
-class PeerPickerSheet extends ConsumerWidget {
+class PeerPickerSheet extends ConsumerStatefulWidget {
   final void Function(String address, {String? name, String? fingerprint}) onSelected;
 
   const PeerPickerSheet({super.key, required this.onSelected});
@@ -21,7 +21,23 @@ class PeerPickerSheet extends ConsumerWidget {
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<PeerPickerSheet> createState() => _PeerPickerSheetState();
+}
+
+class _PeerPickerSheetState extends ConsumerState<PeerPickerSheet> {
+  bool _isScanning = false;
+
+  Future<void> _scanKnownDevices() async {
+    setState(() => _isScanning = true);
+    try {
+      await ref.read(probedDevicesProvider.notifier).scan();
+    } finally {
+      if (mounted) setState(() => _isScanning = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final peers = ref.watch(peerListProvider);
     final probed = ref.watch(probedDevicesProvider);
 
@@ -49,6 +65,17 @@ class PeerPickerSheet extends ConsumerWidget {
                 _showAddressDialog(context);
               },
             ),
+            ListTile(
+              leading: _isScanning
+                  ? const SizedBox(
+                      width: 20, height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.search),
+              title: const Text('Scan Known Devices'),
+              subtitle: const Text('Probe known devices on current network'),
+              onTap: _isScanning ? null : _scanKnownDevices,
+            ),
             if (peers.isNotEmpty) ...[
               const Padding(
                 padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
@@ -67,7 +94,7 @@ class PeerPickerSheet extends ConsumerWidget {
                     onTap: () {
                       Navigator.pop(context);
                       if (peer.addresses.isNotEmpty) {
-                        onSelected(peer.addresses.first,
+                        widget.onSelected(peer.addresses.first,
                             name: peer.name, fingerprint: peer.fingerprint);
                       }
                     },
@@ -82,11 +109,26 @@ class PeerPickerSheet extends ConsumerWidget {
               ...probed.map((peer) => ListTile(
                     leading: const Icon(Icons.link, size: 20),
                     title: Text(peer.name, style: const TextStyle(fontSize: 14)),
+                    subtitle: RichText(
+                      text: TextSpan(
+                        style: const TextStyle(fontSize: 11, color: Colors.grey),
+                        children: [
+                          TextSpan(
+                            text: peer.addresses.isNotEmpty ? peer.addresses.first : '',
+                            style: const TextStyle(fontWeight: FontWeight.w500),
+                          ),
+                          if (peer.fingerprint.isNotEmpty) ...[
+                            const TextSpan(text: '  ·  '),
+                            TextSpan(text: peer.displayFingerprint),
+                          ],
+                        ],
+                      ),
+                    ),
                     dense: true,
                     onTap: () {
                       Navigator.pop(context);
                       if (peer.addresses.isNotEmpty) {
-                        onSelected(peer.addresses.first,
+                        widget.onSelected(peer.addresses.first,
                             name: peer.name, fingerprint: peer.fingerprint);
                       }
                     },
@@ -129,7 +171,7 @@ class PeerPickerSheet extends ConsumerWidget {
               final addr = controller.text.trim();
               if (addr.isNotEmpty) {
                 Navigator.pop(ctx);
-                onSelected(addr);
+                widget.onSelected(addr);
               }
             },
             child: const Text('Send'),
