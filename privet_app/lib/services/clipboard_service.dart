@@ -1,7 +1,7 @@
 import 'dart:ffi';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 
@@ -48,6 +48,9 @@ class ClipboardService {
               : rawBytes;
         }
       } catch (_) { }
+    } else if (Platform.isLinux) {
+      // Linux: use xclip (X11) or wl-paste (Wayland) for PNG clipboard
+      pngBytes = await _linuxReadClipboardData('image/png');
     }
 
     if (pngBytes != null) {
@@ -112,13 +115,142 @@ class ClipboardService {
     return cleaned.substring(0, 24);
   }
 
-  /// On Windows only: read file paths from the clipboard (e.g. files copied
-  /// via Explorer via Ctrl+C).  Returns `null` on non-Windows or when no
-  /// file paths are present.
-  static List<String>? readFilePaths() {
-    if (!Platform.isWindows) return null;
-    return _readFileListFromClipboard();
+  /// Read file paths from the clipboard (e.g. files copied via file manager
+  /// Ctrl+C).  Supported on Windows (CF_HDROP) and Linux (text/uri-list via
+  /// xclip/wl-paste).  Returns `null` when no file paths are present.
+  static Future<List<String>?> readFilePaths() async {
+    if (Platform.isWindows) {
+      return _readFileListFromClipboard();
+    }
+    if (Platform.isLinux) {
+      return await _linuxReadFilePaths();
+    }
+    return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Linux clipboard helpers (xclip / wl-paste)
+// ---------------------------------------------------------------------------
+
+/// Detect Linux desktop session type.
+/// Returns `'x11'`, `'wayland'`, or `null` if unknown/unset.
+String? _linuxSessionType() {
+  final session = Platform.environment['XDG_SESSION_TYPE'];
+  if (session == 'x11' || session == 'wayland') return session;
+  return null;
+}
+
+/// Run [command] with [args] and return stdout as bytes, or null on failure.
+Future<Uint8List?> _runClipboardTool(
+  String command,
+  List<String> args,
+  String label,
+) async {
+  try {
+    final result = await Process.run(
+      command, args,
+      stdoutEncoding: null,
+    ).timeout(const Duration(seconds: 2));
+    if (result.exitCode == 0 && (result.stdout as List<int>).isNotEmpty) {
+      if (kDebugMode) debugPrint('[clipboard] $label $command: ${(result.stdout as List<int>).length} bytes');
+      return Uint8List.fromList(result.stdout as List<int>);
+    }
+    if (kDebugMode) debugPrint('[clipboard] $label $command exited=${result.exitCode}');
+  } catch (e) {
+    if (kDebugMode) debugPrint('[clipboard] $label $command failed: $e');
+  }
+  return null;
+}
+
+/// Read raw clipboard data in the given [target] format on Linux.
+/// Selects `xclip` (X11) or `wl-paste` (Wayland) based on `$XDG_SESSION_TYPE`.
+Future<Uint8List?> _linuxReadClipboardData(String target) async {
+  final session = _linuxSessionType();
+  if (kDebugMode && session != null) debugPrint('[clipboard] session type: $session');
+
+  if (session == 'x11' || session == null) {
+    final data = await _runClipboardTool(
+      'xclip', ['-selection', 'clipboard', '-t', target, '-o'],
+      'xclip',
+    );
+    if (data != null) return data;
+  }
+
+  if (session == 'wayland' || session == null) {
+    final data = await _runClipboardTool(
+      'wl-paste', ['-t', target],
+      'wl-paste',
+    );
+    if (data != null) return data;
+  }
+
+  // Debug: list available clipboard targets
+  if (kDebugMode) _linuxDebugClipboardTargets(session);
+
+  return null;
+}
+
+/// Debug: list available clipboard targets on Linux.
+void _linuxDebugClipboardTargets(String? session) {
+  if (session == 'x11' || session == null) {
+    try {
+      final result = Process.runSync(
+        'xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'],
+        stdoutEncoding: null,
+      );
+      if (result.exitCode == 0) {
+        final targets = String.fromCharCodes(result.stdout as List<int>);
+        debugPrint('[clipboard] available targets: $targets');
+        return;
+      }
+    } catch (e) {
+      debugPrint('[clipboard] xclip TARGETS failed: $e');
+    }
+  }
+  if (session == 'wayland' || session == null) {
+    try {
+      final result = Process.runSync('wl-paste', ['--list-types']);
+      if (result.exitCode == 0) {
+        debugPrint('[clipboard] available targets: ${result.stdout}');
+      }
+    } catch (e) {
+      debugPrint('[clipboard] wl-paste --list-types failed: $e');
+    }
+  }
+}
+
+/// Parse `text/uri-list` clipboard content into local file paths.
+Future<List<String>?> _linuxReadFilePaths() async {
+  final raw = await _linuxReadClipboardData('text/uri-list');
+  if (raw == null) {
+    if (kDebugMode) debugPrint('[clipboard] no uri-list data available');
+    return null;
+  }
+
+  final text = String.fromCharCodes(raw);
+  if (kDebugMode) debugPrint('[clipboard] uri-list raw: ${text.length} chars');
+
+  final paths = <String>[];
+  for (final line in text.split(RegExp(r'[\r\n]+'))) {
+    final trimmed = line.trim();
+    if (trimmed.isEmpty || trimmed.startsWith('#')) continue;
+    if (trimmed.startsWith('file://')) {
+      try {
+        final uri = Uri.parse(trimmed);
+        if (uri.scheme == 'file') {
+          paths.add(uri.toFilePath());
+        }
+      } catch (e) {
+        if (kDebugMode) debugPrint('[clipboard] failed to parse URI "$trimmed": $e');
+      }
+    } else if (kDebugMode) {
+      debugPrint('[clipboard] skipping non-file URI: $trimmed');
+    }
+  }
+
+  if (kDebugMode) debugPrint('[clipboard] parsed ${paths.length} file path(s): $paths');
+  return paths.isNotEmpty ? paths : null;
 }
 
 // ---------------------------------------------------------------------------

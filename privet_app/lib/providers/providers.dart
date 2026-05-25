@@ -1151,7 +1151,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
   String _hex(int v) => v.toRadixString(16).padLeft(2, '0');
 
   Future<String?> send() async {
-    print('[send] send() called');
+    if (kDebugMode) debugPrint('[send] send() called');
     if (!state.isReady) return null;
     state = state.copyWith(sending: true, sendError: '', clearPairing: true);
 
@@ -1183,7 +1183,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
           : state.filePaths;
 
       await service.sendFilesStart(sessionId, state.peerAddress!, payload);
-      print('[send] sendFilesStart returned (session=$sessionId)');
+      if (kDebugMode) debugPrint('[send] sendFilesStart returned (session=$sessionId)');
 
       final signal = await _pollFirstSignal(sessionId);
 
@@ -1201,7 +1201,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
             peerName: state.peerName,
             peerFingerprint: state.peerFingerprint,
           );
-          print('[send] transfer started (session=$sessionId)');
+          if (kDebugMode) debugPrint('[send] transfer started (session=$sessionId)');
           state = state.copyWith(sending: false, clearPairing: true);
           return sessionId;
 
@@ -1209,7 +1209,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
           // Remove the negotiating session — PairingRequired returns without
           // TransferFailed, so the session would otherwise be stuck as "Connecting".
           ref.read(activeTransfersProvider.notifier).removeSession(sessionId);
-          print('[send] PairRequest detected, handling pairing');
+          if (kDebugMode) debugPrint('[send] PairRequest detected, handling pairing');
           state = state.copyWith(sendError: '');
 
           final pairingOk = await _waitForPairing();
@@ -1221,19 +1221,19 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
             state = state.copyWith(sending: false);
             return null;
           }
-          print('[send] pairing resolved, retrying send...');
+          if (kDebugMode) debugPrint('[send] pairing resolved, retrying send...');
           continue;
 
         case 'fail':
           // Read error from the active transfer session
           final transfers = ref.read(activeTransfersProvider);
           final err = transfers[sessionId]?.errorMessage ?? state.sendError;
-          print('[send] transfer failed: $err');
+          if (kDebugMode) debugPrint('[send] transfer failed: $err');
           state = state.copyWith(sending: false, sendError: err);
           return null;
 
         default:
-          print('[send] timed out waiting for first signal');
+          if (kDebugMode) debugPrint('[send] timed out waiting for first signal');
           state = state.copyWith(sending: false, sendError: 'Connection timed out');
           return null;
       }

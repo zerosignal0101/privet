@@ -7,6 +7,16 @@ import 'package:ffi/ffi.dart';
 
 import 'privet_ffi.dart';
 
+// Debug logging — prints only in debug mode.
+const bool _kDebugMode = !bool.fromEnvironment('dart.vm.product');
+
+void _debugPrint(String message) {
+  if (_kDebugMode) {
+    // ignore: avoid_print
+    print(message);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Isolate command/result protocol
 // ---------------------------------------------------------------------------
@@ -542,11 +552,11 @@ void _cmdTransferAction(
   int Function(Pointer<Utf8>) action,
 ) {
   final sessionId = cmd.args['session_id'] as String;
-  print('[isolate] _cmdTransferAction: cmd=${cmd.cmd} sessionId=$sessionId');
+  _debugPrint('[isolate] _cmdTransferAction: cmd=${cmd.cmd} sessionId=$sessionId');
   final sid = sessionId.toNativeUtf8();
   try {
     final result = action(sid);
-    print('[isolate] _cmdTransferAction: result=$result');
+    _debugPrint('[isolate] _cmdTransferAction: result=$result');
     cmd.replyTo.send({'ok': result == 0});
   } finally {
     calloc.free(sid);

@@ -56,7 +56,7 @@ Privet tackles this with **QUIC** transport, a Rust core engine, and a multi-lay
 
 - **Files and folders** — recursive directory handling with dedup naming
 - **File picker** — multi-file selection
-- **Clipboard paste** — text and images (Windows / Android)
+- **Clipboard paste** — text, images and file paths (Windows / Linux / Android)
 - **Share-to** — Android Intent receive
 - **Transfer history** — browsable log of completed transfers
 - **Drag & drop** — not yet implemented
@@ -65,10 +65,10 @@ Privet tackles this with **QUIC** transport, a Rust core engine, and a multi-lay
 
 | GUI | CLI | Status |
 |---|---|---|
-| Windows | ✅ | Verified |
+| Windows | ✔ | Verified |
 | Android | — | Verified |
-| Linux | ✅ | Not built |
-| macOS | ✅ | Not built |
+| Linux | ✔ | Verified |
+| macOS | ✔ | Not built |
 | iOS | — | Not built |
 
 ---
@@ -122,10 +122,10 @@ See `CLAUDE.md` for detailed module maps and data flow.
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) 1.88+
-- [Flutter](https://flutter.dev/) 3.41+ with desktop support
+- [Rust](https://rustup.rs/) stable
+- [Flutter](https://flutter.dev/)
 - Windows: [Visual Studio 2022](https://visualstudio.microsoft.com/) with C++ toolchain
-- Linux: `gtk+-3.0`, `pkg-config`
+- Linux: `sudo apt install cmake ninja-build clang pkg-config libgtk-3-dev`
 
 ### Build
 
@@ -154,6 +154,17 @@ cargo build --release -p privet-ffi
 flutter build windows --release
 ISCC.exe scripts\innosetup.iss
 ```
+
+### Linux Package (.deb)
+
+```bash
+cargo build -p privet-ffi --release
+cd privet_app && flutter build linux --release && cd ..
+bash scripts/build-deb.sh
+sudo dpkg -i dist/privet_*.deb
+```
+
+> The `.deb` package depends on `xclip` (X11 clipboard file/image paste) and `wl-clipboard` (Wayland clipboard support).
 
 ### CLI Usage
 

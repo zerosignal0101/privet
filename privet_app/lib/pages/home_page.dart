@@ -306,27 +306,30 @@ class _PeerTile extends StatelessWidget {
 // Engine data directory — match CLI path on desktop for shared identity
 // ---------------------------------------------------------------------------
 
-/// Returns the data directory for the Rust engine, matching the CLI's
-/// convention so certificates, trust store, and known devices are shared.
+/// Base directory for engine data (certificates, trust store, known devices,
+/// transfer logs, downloads).
 ///
-/// - Desktop (Windows):  `%LOCALAPPDATA%\privet`
-/// - Desktop (Linux):    `~/.local/share/privet`
-/// - Desktop (macOS):    `~/Library/Application Support/privet`
-/// - Mobile:             `getApplicationDocumentsDirectory()`
+/// Matches `dirs::data_local_dir()` used by privet-cli:
+///   - Windows: `%LOCALAPPDATA%`
+///   - Linux:   `$XDG_DATA_HOME` → `~/.local/share`
+///   - macOS:   `~/Library/Application Support`
+///   - Mobile:  app sandbox documents directory
+///
+/// The caller appends `/privet/...` subdirectories.
 Future<String> _engineDataDir() async {
   if (!Platform.isAndroid && !Platform.isIOS) {
-    // Desktop — match dirs::data_local_dir() used by privet-cli
+    // Desktop — match dirs::data_local_dir()
     if (Platform.isWindows) {
       final localAppData = Platform.environment['LOCALAPPDATA'];
-      if (localAppData != null) return '$localAppData\\privet';
+      if (localAppData != null) return localAppData;
     } else if (Platform.isLinux) {
       final xdg = Platform.environment['XDG_DATA_HOME'];
-      if (xdg != null) return '$xdg/privet';
+      if (xdg != null) return xdg;
       final home = Platform.environment['HOME'];
-      if (home != null) return '$home/.local/share/privet';
+      if (home != null) return '$home/.local/share';
     } else if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
-      if (home != null) return '$home/Library/Application Support/privet';
+      if (home != null) return '$home/Library/Application Support';
     }
   }
   // Mobile fallback — app sandbox

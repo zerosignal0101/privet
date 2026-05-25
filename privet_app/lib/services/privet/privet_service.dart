@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../../models/peer.dart';
@@ -151,7 +152,7 @@ class PrivetService {
       },
       'security_mode': resolvedSecurityMode,
     };
-    print('[privet_service] config JSON: $config');
+    if (kDebugMode) debugPrint('[privet_service] config JSON: $config');
     return jsonEncode(config);
   }
 
@@ -354,9 +355,9 @@ class PrivetService {
 
       if (networkInfos.isEmpty) return;
       await _ffiIsolate.setNetworks(jsonEncode(networkInfos));
-      print('[privet_service] set real networks: $networkInfos');
+      if (kDebugMode) debugPrint('[privet_service] set real networks: $networkInfos');
     } catch (e) {
-      print('[privet_service] failed to get real networks: $e');
+      if (kDebugMode) debugPrint('[privet_service] failed to get real networks: $e');
     }
   }
 
@@ -396,7 +397,7 @@ class PrivetService {
     final sessionId = raw['session_id'] as String?;
     final peerId = raw['peer_id'] as String?;
     final extra = raw['extra'] as Map<String, dynamic>?;
-    print('[privet_service] _onRawEvent: type=$eventType sessionId=$sessionId');
+    if (kDebugMode) debugPrint('[privet_service] _onRawEvent: type=$eventType sessionId=$sessionId');
 
     PrivetEvent event;
     switch (eventType) {

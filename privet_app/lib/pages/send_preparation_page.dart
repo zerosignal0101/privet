@@ -343,16 +343,14 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
 
   Future<void> _pasteFromClipboard(WidgetRef ref) async {
     try {
-      // On Windows: first try file paths (files copied via Explorer)
-      if (Platform.isWindows) {
-        final paths = ClipboardService.readFilePaths();
-        if (paths != null && paths.isNotEmpty) {
-          ref.read(sendPreparationProvider.notifier).addFiles(paths);
-          if (context.mounted) {
-            _showSnackBar('Pasted ${paths.length} file(s) from clipboard');
-          }
-          return;
+      // First try file paths (files copied via file manager Ctrl+C)
+      final paths = await ClipboardService.readFilePaths();
+      if (paths != null && paths.isNotEmpty) {
+        ref.read(sendPreparationProvider.notifier).addFiles(paths);
+        if (context.mounted) {
+          _showSnackBar('Pasted ${paths.length} file(s) from clipboard');
         }
+        return;
       }
 
       // Fall back to text / image content
