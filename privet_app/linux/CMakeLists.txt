@@ -4,7 +4,7 @@ project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "privet_app")
+set(BINARY_NAME "Privet")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
 set(APPLICATION_ID "com.privet.privet_app")
@@ -126,3 +126,19 @@ if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
   install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
     COMPONENT Runtime)
 endif()
+
+# Install desktop file, icons, and AppStream metadata for desktop integration.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/runner/com.privet.privet_app.desktop"
+  DESTINATION "${CMAKE_INSTALL_PREFIX}/share/applications"
+  COMPONENT Runtime)
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/runner/com.privet.privet_app.metainfo.xml"
+  DESTINATION "${CMAKE_INSTALL_PREFIX}/share/metainfo"
+  COMPONENT Runtime)
+
+foreach(icon_size 64 128 256 512)
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/runner/icons/privet_${icon_size}.png"
+    DESTINATION "${CMAKE_INSTALL_PREFIX}/share/icons/hicolor/${icon_size}x${icon_size}/apps"
+    RENAME "com.privet.privet_app.png"
+    COMPONENT Runtime)
+endforeach()

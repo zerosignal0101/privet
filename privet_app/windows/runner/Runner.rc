@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "com.privet" "\0"
-            VALUE "FileDescription", "privet_app" "\0"
+            VALUE "CompanyName", "Privet" "\0"
+            VALUE "FileDescription", "Privet LAN File Transfer" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "privet_app" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 com.privet. All rights reserved." "\0"
-            VALUE "OriginalFilename", "privet_app.exe" "\0"
-            VALUE "ProductName", "privet_app" "\0"
+            VALUE "InternalName", "Privet" "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Privet. All rights reserved." "\0"
+            VALUE "OriginalFilename", "Privet.exe" "\0"
+            VALUE "ProductName", "Privet" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

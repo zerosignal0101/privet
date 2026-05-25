@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.privet.privet_app</id>
+  <name>Privet</name>
+  <summary>LAN file transfer</summary>
+  <description>
+    <p>Privet is a fast, secure LAN file transfer tool using QUIC transport.</p>
+  </description>
+  <project_license>GPL-3.0-or-later</project_license>
+  <metadata_license>CC0-1.0</metadata_license>
+</component>

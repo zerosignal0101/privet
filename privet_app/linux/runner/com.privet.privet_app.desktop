@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Privet
+Comment=LAN file transfer
+Exec=Privet
+Icon=com.privet.privet_app
+Categories=Network;FileTransfer;
+Terminal=false
+StartupNotify=true
