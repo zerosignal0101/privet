@@ -47,6 +47,30 @@ class ShellTabNotifier extends Notifier<int> {
 final shellTabProvider = NotifierProvider<ShellTabNotifier, int>(ShellTabNotifier.new);
 
 // ---------------------------------------------------------------------------
+// Pending share data (Android SEND / SEND_MULTIPLE intent)
+// ---------------------------------------------------------------------------
+
+/// Data received from another app via Android's "Share to" intent.
+class PendingShareData {
+  final List<String> paths;
+  final String? text;
+  const PendingShareData({this.paths = const [], this.text});
+}
+
+/// Holds the most recent share data received from the native side.
+/// Cleared after navigation.
+class PendingShareNotifier extends Notifier<PendingShareData?> {
+  @override
+  PendingShareData? build() => null;
+
+  void set(PendingShareData data) => state = data;
+  void clear() => state = null;
+}
+
+final pendingShareProvider = NotifierProvider<PendingShareNotifier, PendingShareData?>(
+    PendingShareNotifier.new);
+
+// ---------------------------------------------------------------------------
 // Discovery: peer list updated by events
 // ---------------------------------------------------------------------------
 

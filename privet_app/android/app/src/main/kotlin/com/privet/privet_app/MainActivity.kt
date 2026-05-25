@@ -18,7 +18,11 @@ class MainActivity : FlutterActivity() {
 
     private val CHANNEL = "privet/file"
     private val DEVICE_CHANNEL = "privet/device"
+    private val SHARE_CHANNEL = "privet/share"
     private var pendingResult: MethodChannel.Result? = null
+    private var shareChannel: MethodChannel? = null
+    // Store share data for Dart to pull on cold start (handler may not be ready yet)
+    private var pendingShareArgs: Map<String, Any?>? = null
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -52,8 +56,34 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShareIntent(intent)
+        // Push to Dart immediately (handler is already registered).
+        pendingShareArgs?.let { args ->
+            runOnUiThread {
+                shareChannel?.invokeMethod("onShare", args)
+            }
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        // Share channel — Dart pulls pending data on startup via getPendingShare;
+        // onNewIntent deliveries use the onShare push method.
+        shareChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SHARE_CHANNEL).apply {
+            setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getPendingShare" -> {
+                        result.success(pendingShareArgs)
+                        pendingShareArgs = null // consumed
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+        handleShareIntent(intent)
 
         // Device info channel
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL).setMethodCallHandler { call, result ->
@@ -224,6 +254,73 @@ class MainActivity : FlutterActivity() {
             }
         }
         return results
+    }
+
+    // -----------------------------------------------------------------------
+    // Share intent handling (ACTION_SEND / ACTION_SEND_MULTIPLE)
+    // -----------------------------------------------------------------------
+
+    /// Process incoming share intent: copy shared files to cache, extract text,
+    /// then forward the results to Flutter via the share method channel.
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+
+        val paths = mutableListOf<String>()
+        var sharedText: String? = null
+
+        try {
+            when (action) {
+                Intent.ACTION_SEND -> {
+                    if (intent.type?.startsWith("text/") == true) {
+                        sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+                    } else {
+                        val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                        if (uri != null) {
+                            val cached = copyFileToCache(uri)
+                            if (cached != null) paths.add(cached)
+                        }
+                    }
+                }
+                Intent.ACTION_SEND_MULTIPLE -> {
+                    val uris = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+                    if (uris != null) {
+                        for (uri in uris) {
+                            val cached = copyFileToCache(uri)
+                            if (cached != null) paths.add(cached)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("PrivetShare", "handleShareIntent error", e)
+        }
+
+        if (paths.isEmpty() && sharedText == null) return
+
+        val args = mutableMapOf<String, Any?>()
+        if (paths.isNotEmpty()) args["paths"] = paths
+        if (sharedText != null) args["text"] = sharedText
+
+        // Store so Dart can pull via getPendingShare (used on cold start).
+        pendingShareArgs = args
+    }
+
+    /// Copy a content:// URI to the app cache and return the absolute file path.
+    private fun copyFileToCache(uri: Uri): String? {
+        return try {
+            val fileName = getFileName(uri.toString())
+                ?: "shared_${System.currentTimeMillis()}"
+            val outFile = File(cacheDir, "privet_share/$fileName")
+            outFile.parentFile?.mkdirs()
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(outFile).use { output -> input.copyTo(output) }
+            }
+            outFile.absolutePath
+        } catch (e: Exception) {
+            Log.w("PrivetShare", "copyFileToCache failed for $uri", e)
+            null
+        }
     }
 
     private fun getFileName(uri: String?): String? {
