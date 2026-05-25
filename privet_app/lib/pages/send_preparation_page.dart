@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:open_file/open_file.dart';
@@ -247,16 +248,31 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
       ],
     );
 
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) async {
-        if (didPop) return;
-        final shouldPop = await _onWillPop();
-        if (shouldPop && context.mounted) Navigator.pop(context);
+    return Focus(
+      autofocus: true,
+      onKeyEvent: (node, event) {
+        if (event is KeyDownEvent || event is KeyRepeatEvent) {
+          final key = event.logicalKey;
+          if (key == LogicalKeyboardKey.keyV &&
+              (HardwareKeyboard.instance.isControlPressed ||
+               HardwareKeyboard.instance.isMetaPressed)) {
+            _pasteFromClipboard(ref);
+            return KeyEventResult.handled;
+          }
+        }
+        return KeyEventResult.ignored;
       },
-      child: Scaffold(
-        appBar: AppBar(title: const Text('Send Files')),
-        body: body,
+      child: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) async {
+          if (didPop) return;
+          final shouldPop = await _onWillPop();
+          if (shouldPop && context.mounted) Navigator.pop(context);
+        },
+        child: Scaffold(
+          appBar: AppBar(title: const Text('Send Files')),
+          body: body,
+        ),
       ),
     );
   }
@@ -319,6 +335,19 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
 
   Future<void> _pasteFromClipboard(WidgetRef ref) async {
     try {
+      // On Windows: first try file paths (files copied via Explorer)
+      if (Platform.isWindows) {
+        final paths = ClipboardService.readFilePaths();
+        if (paths != null && paths.isNotEmpty) {
+          ref.read(sendPreparationProvider.notifier).addFiles(paths);
+          if (context.mounted) {
+            _showSnackBar('Pasted ${paths.length} file(s) from clipboard');
+          }
+          return;
+        }
+      }
+
+      // Fall back to text / image content
       final settings = ref.read(settingsProvider);
       final dir = settings.downloadDir.isNotEmpty
           ? settings.downloadDir

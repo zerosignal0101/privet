@@ -111,6 +111,14 @@ class ClipboardService {
     if (cleaned.length <= 24) return cleaned.isEmpty ? 'clipboard' : cleaned;
     return cleaned.substring(0, 24);
   }
+
+  /// On Windows only: read file paths from the clipboard (e.g. files copied
+  /// via Explorer via Ctrl+C).  Returns `null` on non-Windows or when no
+  /// file paths are present.
+  static List<String>? readFilePaths() {
+    if (!Platform.isWindows) return null;
+    return _readFileListFromClipboard();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +144,79 @@ final int Function(Pointer<Void>) _globalSize = _kernel32
     .lookupFunction<IntPtr Function(Pointer<Void>), int Function(Pointer<Void>)>('GlobalSize');
 
 const int _cfDib = 8;
+const int _cfHDrop = 15; // CF_HDROP — file list from Explorer copy
 
-/// Read image data from the Windows clipboard (CF_DIB → PNG bytes).
+/// On Windows: read file paths from CF_HDROP clipboard format.
+/// Returns null if no file paths are available.
+List<String>? _readFileListFromClipboard() {
+  if (_openClipboard(nullptr) == 0) return null;
+
+  try {
+    if (_isFormatAvailable(_cfHDrop) == 0) return null;
+
+    final handle = _getClipboardData(_cfHDrop);
+    if (handle == nullptr) return null;
+
+    final locked = _globalLock(handle);
+    if (locked == nullptr) return null;
+
+    try {
+      final size = _globalSize(handle);
+      if (size < 20) return null; // at least DROPFILES header
+
+      final raw = locked.cast<Uint8>().asTypedList(size);
+
+      // DROPFILES layout (all offsets from start of struct):
+      //   0: pFiles  (Uint32) — offset to file list
+      //   4: pt      (POINT, 8 bytes)
+      //  12: fNC     (Int32)
+      //  16: fWide   (Int32) — non-zero = UTF-16 file names
+      final buf = raw.buffer;
+      final pFiles = ByteData.view(buf, 0, 4).getUint32(0, Endian.little);
+      final fWide = ByteData.view(buf, 16, 4).getUint32(0, Endian.little);
+
+      if (pFiles < 20 || pFiles >= size) return null;
+
+      final paths = <String>[];
+      int off = pFiles;
+      if (fWide != 0) {
+        // UTF-16LE null-terminated strings, double-null terminated
+        while (off + 2 <= size) {
+          // Read UTF-16 code units until null terminator
+          final codeUnits = <int>[];
+          while (off + 2 <= size) {
+            final cu = raw[off] | (raw[off + 1] << 8);
+            off += 2;
+            if (cu == 0) break; // null terminator
+            codeUnits.add(cu);
+          }
+          if (codeUnits.isEmpty) break; // double null = end of list
+          paths.add(String.fromCharCodes(codeUnits));
+        }
+      } else {
+        // ANSI (single-byte) null-terminated strings
+        while (off < size) {
+          final bytes = <int>[];
+          while (off < size && raw[off] != 0) {
+            bytes.add(raw[off]);
+            off++;
+          }
+          off++; // skip null
+          if (bytes.isEmpty) break;
+          paths.add(String.fromCharCodes(bytes));
+        }
+      }
+
+      return paths.isNotEmpty ? paths : null;
+    } finally {
+      _globalUnlock(handle);
+    }
+  } finally {
+    _closeClipboard();
+  }
+}
+
+/// Read image data from the Windows clipboard (CF_DIB → BMP → PNG).
 Uint8List? _readImageFromClipboard() {
   if (_openClipboard(nullptr) == 0) return null;
 
