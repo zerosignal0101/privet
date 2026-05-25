@@ -37,7 +37,7 @@ cargo clippy --workspace --all-features
 
 ## Architecture
 
-See PRD.md for product requirements document.
+See README.md for project overview.
 
 ### Workspace Structure
 
