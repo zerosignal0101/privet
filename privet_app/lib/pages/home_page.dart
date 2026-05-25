@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
@@ -34,8 +36,7 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     String? dataDir;
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      dataDir = dir.path;
+      dataDir = await _engineDataDir();
     } catch (_) {}
 
     // Resolve actual download dir and persist it so history can read it
@@ -299,4 +300,36 @@ class _PeerTile extends StatelessWidget {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Engine data directory — match CLI path on desktop for shared identity
+// ---------------------------------------------------------------------------
+
+/// Returns the data directory for the Rust engine, matching the CLI's
+/// convention so certificates, trust store, and known devices are shared.
+///
+/// - Desktop (Windows):  `%LOCALAPPDATA%\privet`
+/// - Desktop (Linux):    `~/.local/share/privet`
+/// - Desktop (macOS):    `~/Library/Application Support/privet`
+/// - Mobile:             `getApplicationDocumentsDirectory()`
+Future<String> _engineDataDir() async {
+  if (!Platform.isAndroid && !Platform.isIOS) {
+    // Desktop — match dirs::data_local_dir() used by privet-cli
+    if (Platform.isWindows) {
+      final localAppData = Platform.environment['LOCALAPPDATA'];
+      if (localAppData != null) return '$localAppData\\privet';
+    } else if (Platform.isLinux) {
+      final xdg = Platform.environment['XDG_DATA_HOME'];
+      if (xdg != null) return '$xdg/privet';
+      final home = Platform.environment['HOME'];
+      if (home != null) return '$home/.local/share/privet';
+    } else if (Platform.isMacOS) {
+      final home = Platform.environment['HOME'];
+      if (home != null) return '$home/Library/Application Support/privet';
+    }
+  }
+  // Mobile fallback — app sandbox
+  final dir = await getApplicationDocumentsDirectory();
+  return dir.path;
 }
