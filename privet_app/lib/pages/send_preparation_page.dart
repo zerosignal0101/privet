@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:open_file/open_file.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../providers/providers.dart';
+import '../services/clipboard_service.dart';
 import '../widgets/peer_picker_sheet.dart';
 import '../widgets/file_tree_view.dart';
 import '../models/file_tree.dart';
@@ -44,6 +46,20 @@ class SendPreparationPage extends ConsumerStatefulWidget {
 class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   bool _initialised = false;
 
+  /// Show a snackbar above the bottom bar so it doesn't block the send button.
+  void _showSnackBar(String message, {Duration duration = const Duration(seconds: 2)}) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      duration: duration,
+      behavior: SnackBarBehavior.floating,
+      margin: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        bottom: MediaQuery.of(context).viewPadding.bottom + 80,
+      ),
+    ));
+  }
+
   @override
   void initState() {
     super.initState();
@@ -69,9 +85,7 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
       if (missing > 0) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('$missing file${missing > 1 ? "s were" : " was"} missing and removed')),
-            );
+            _showSnackBar('$missing file${missing > 1 ? "s were" : " was"} missing and removed');
           }
         });
       }
@@ -84,9 +98,7 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
       if (missing > 0) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('$missing file${missing > 1 ? "s were" : " was"} missing and removed')),
-            );
+            _showSnackBar('$missing file${missing > 1 ? "s were" : " was"} missing and removed');
           }
         });
       }
@@ -197,28 +209,7 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
                         ],
                       ),
                     ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () => _pickFiles(ref),
-                              icon: const Icon(Icons.add, size: 18),
-                              label: const Text('Add files'),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () => _pickFolder(ref),
-                              icon: const Icon(Icons.create_new_folder, size: 18),
-                              label: const Text('Add folder'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
+                    _buildAddButtons(ref),
                   ],
                 )
               : state.entries.isNotEmpty
@@ -230,56 +221,14 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
                           onRemove: (relPath) => ref.read(sendPreparationProvider.notifier).removeByRelativePath(relPath),
                         ),
                         // Add buttons at bottom
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  onPressed: () => _pickFiles(ref),
-                                  icon: const Icon(Icons.add, size: 18),
-                                  label: const Text('Add files'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  onPressed: () => _pickFolder(ref),
-                                  icon: const Icon(Icons.create_new_folder, size: 18),
-                                  label: const Text('Add folder'),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                        _buildAddButtons(ref),
                       ],
                     )
                   : ListView.builder(
                       itemCount: state.filePaths.length + 1,
                       itemBuilder: (_, i) {
                         if (i == state.filePaths.length) {
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: OutlinedButton.icon(
-                                    onPressed: () => _pickFiles(ref),
-                                    icon: const Icon(Icons.add, size: 18),
-                                    label: const Text('Add files'),
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: OutlinedButton.icon(
-                                    onPressed: () => _pickFolder(ref),
-                                    icon: const Icon(Icons.create_new_folder, size: 18),
-                                    label: const Text('Add folder'),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
+                          return _buildAddButtons(ref);
                         }
                         return _FileItem(
                           path: state.filePaths[i],
@@ -316,6 +265,162 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
     PeerPickerSheet.show(context, onSelected: (addr, {name, fingerprint}) {
       ref.read(sendPreparationProvider.notifier).setPeer(addr, name: name, fingerprint: fingerprint);
     });
+  }
+
+  Widget _buildAddButtons(WidgetRef ref) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => _pickFiles(ref),
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('Add files'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => _pickFolder(ref),
+                  icon: const Icon(Icons.create_new_folder, size: 18),
+                  label: const Text('Add folder'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => _pasteFromClipboard(ref),
+                  icon: const Icon(Icons.content_paste, size: 18),
+                  label: const Text('Paste'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => _createTextFile(ref),
+                  icon: const Icon(Icons.text_fields, size: 18),
+                  label: const Text('Create text'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pasteFromClipboard(WidgetRef ref) async {
+    try {
+      final settings = ref.read(settingsProvider);
+      final dir = settings.downloadDir.isNotEmpty
+          ? settings.downloadDir
+          : (await _defaultDownloadDir());
+
+      final saved = await ClipboardService.saveToFile(dir);
+      if (saved == null) {
+        if (context.mounted) {
+          _showSnackBar('Clipboard is empty or contains unsupported content');
+        }
+        return;
+      }
+
+      ref.read(sendPreparationProvider.notifier).addFiles([saved.absolutePath]);
+      if (context.mounted) {
+        _showSnackBar('Pasted: ${saved.relativePath}');
+      }
+    } catch (e) {
+      if (context.mounted) {
+        _showSnackBar('Failed to paste: $e');
+      }
+    }
+  }
+
+  Future<String> _defaultDownloadDir() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return dir.path;
+  }
+
+  Future<void> _createTextFile(WidgetRef ref) async {
+    final nameCtrl = TextEditingController();
+    final contentCtrl = TextEditingController();
+    final settings = ref.read(settingsProvider);
+    final dir = settings.downloadDir.isNotEmpty
+        ? settings.downloadDir
+        : await _defaultDownloadDir();
+
+    final result = await showDialog<({String name, String content})?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Create Text File'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(
+                labelText: 'File name (optional)',
+                hintText: 'Leave empty for auto-name',
+                suffixText: '.txt',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: contentCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Content',
+                border: OutlineInputBorder(),
+              ),
+              maxLines: 6,
+              minLines: 3,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () {
+            final content = contentCtrl.text;
+            if (content.trim().isEmpty) return;
+            Navigator.pop(ctx, (name: nameCtrl.text, content: content));
+          }, child: const Text('Create')),
+        ],
+      ),
+    );
+
+    if (result == null || result.content.trim().isEmpty) return;
+
+    try {
+      // Derive filename
+      final rawName = result.name.trim();
+      final String fileName;
+      if (rawName.isNotEmpty) {
+        // Sanitize: keep only safe chars
+        final clean = rawName.replaceAll(RegExp(r'[^\w\-_. ()]'), '');
+        fileName = clean.isNotEmpty ? clean : 'text';
+      } else {
+        fileName = ClipboardService.textFilename(result.content);
+      }
+
+      final (path: filePath, relativePath: relPath) = ClipboardService.uniqueFile(dir, '$fileName.txt');
+      final file = File(filePath);
+      await file.writeAsString(result.content);
+
+      ref.read(sendPreparationProvider.notifier).addFiles([file.path]);
+      if (context.mounted) {
+        _showSnackBar('Created: $relPath');
+      }
+    } catch (e) {
+      if (context.mounted) {
+        _showSnackBar('Failed to create file: $e');
+      }
+    }
   }
 
   void _pickFiles(WidgetRef ref) async {
@@ -358,9 +463,7 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
         debugPrint('[pickFolder] user cancelled SAF picker');
       } else {
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Could not access folder via SAF. Try selecting files individually.')),
-          );
+          _showSnackBar('Could not access folder via SAF. Try selecting files individually.');
         }
       }
       return;
@@ -388,13 +491,9 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
     if (context.mounted) {
       final err = ref.read(sendPreparationProvider).sendError;
       if (sessionId != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Transfer started')),
-        );
+        _showSnackBar('Transfer started', duration: const Duration(seconds: 1));
       } else if (err != null && err.isNotEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Send failed: $err')),
-        );
+        _showSnackBar('Send failed: $err', duration: const Duration(seconds: 3));
       }
     }
   }

@@ -928,6 +928,9 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     );
   }
 
+  /// Extract the filename (last component) from a path using either / or \.
+  String _basename(String path) => path.split(RegExp(r'[/\\]')).last;
+
   /// Scan a single path (file or directory) and return expanded entries.
   List<SendFileEntry> _scanPath(String path) {
     FileSystemEntityType type;
@@ -945,7 +948,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       final parentPath = Directory(path).parent.path;
       final entries = _scanDirectory(path, parentPath);
       // Add the top-level directory as a marker entry
-      final dirName = path.split(Platform.pathSeparator).last;
+      final dirName = _basename(path);
       entries.insert(0, SendFileEntry(
         absolutePath: path,
         relativePath: dirName.replaceAll('\\', '/'),
@@ -959,7 +962,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     // Single file
     try {
       final size = File(path).lengthSync();
-      final name = path.split(Platform.pathSeparator).last;
+      final name = _basename(path);
       debugPrint('[scanPath] single file "$name" size=$size');
       return [SendFileEntry(absolutePath: path, relativePath: name, size: size)];
     } catch (e) {
@@ -996,7 +999,7 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       final absPath = entity.path;
       final relPath = absPath.startsWith(rootPath)
           ? absPath.substring(rootPath.length + 1)
-          : absPath.split(Platform.pathSeparator).last;
+          : _basename(absPath);
 
       // Check if it's a directory by trying to list it (most reliable on scoped storage)
       bool isDir = false;

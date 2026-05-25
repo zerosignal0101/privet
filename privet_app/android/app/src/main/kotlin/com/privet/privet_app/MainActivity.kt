@@ -127,6 +127,31 @@ class MainActivity : FlutterActivity() {
                         result.error("SAF_ERROR", e.message, null)
                     }
                 }
+                "readClipboardImage" -> {
+                    try {
+                        val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        val clip = clipboard.primaryClip ?: run { result.success(null); return@setMethodCallHandler }
+                        if (clip.itemCount == 0) { result.success(null); return@setMethodCallHandler }
+                        val item = clip.getItemAt(0)
+                        val uri = item.uri
+                        var imageBytes: ByteArray? = null
+                        if (uri != null) {
+                            try {
+                                val inputStream = contentResolver.openInputStream(uri) ?: return@setMethodCallHandler
+                                imageBytes = inputStream.use { it.readBytes() }
+                            } catch (_: Exception) { }
+                        }
+                        if (imageBytes == null) {
+                            // Try raw data (less common on Android for images)
+                            val rawData = try { item.text?.toString()?.toByteArray() } catch (_: Exception) { null }
+                            imageBytes = rawData
+                        }
+                        result.success(imageBytes)
+                    } catch (e: Exception) {
+                        Log.e("PrivetClip", "readClipboardImage failed", e)
+                        result.success(null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
