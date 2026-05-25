@@ -903,6 +903,16 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
   @override
   SendPreparationState build() => const SendPreparationState();
 
+  /// Completer used to cancel an in-progress [send] call from outside.
+  Completer<void>? _sendCanceller;
+
+  /// Cancel the current send operation (if any) without clearing the file list.
+  void cancelSend() {
+    _sendCanceller?.complete();
+    _sendCanceller = null;
+    state = state.copyWith(sending: false, sendError: 'Transfer cancelled');
+  }
+
   /// Add pre-built file entries (from SAF cache, already have relative paths).
   void addFileEntries(List<SendFileEntry> newEntries) {
     state = state.copyWith(
@@ -1121,6 +1131,9 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
     if (!state.isReady) return null;
     state = state.copyWith(sending: true, sendError: '', clearPairing: true);
 
+    // Create a fresh canceller for this send attempt
+    _sendCanceller = Completer<void>();
+
     final service = ref.read(privetServiceProvider);
 
     // Event-driven outer loop: start send → wait for first signal
@@ -1151,6 +1164,12 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
       final signal = await _pollFirstSignal(sessionId);
 
       switch (signal) {
+        case 'cancelled':
+          // User cancelled mid-handshake — clean up session, keep file list
+          ref.read(activeTransfersProvider.notifier).removeSession(sessionId);
+          state = state.copyWith(sending: false, sendError: 'Transfer cancelled');
+          return null;
+
         case 'progress':
           // Data is flowing — register so home page shows progress
           ref.read(activeTransfersProvider.notifier).registerSendSession(
@@ -1198,11 +1217,15 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
   }
 
   /// Poll for the first signal after sendFilesStart: TransferProgress (data
-  /// flowing), PairRequest (pairing needed), or TransferFailed (error).
+  /// flowing), PairRequest (pairing needed), TransferFailed (error), or
+  /// 'cancelled' if [cancelSend] was called.
   Future<String> _pollFirstSignal(String sessionId) async {
     final deadline = DateTime.now().add(const Duration(seconds: 60));
 
     while (DateTime.now().isBefore(deadline)) {
+      // Check for user-initiated cancellation first
+      if (_sendCanceller?.isCompleted == true) return 'cancelled';
+
       await Future.delayed(const Duration(milliseconds: 100));
 
       if (ref.read(pairingProvider).isNotEmpty) return 'pair';

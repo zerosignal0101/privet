@@ -170,17 +170,25 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
                 ref.read(sendPreparationProvider.notifier).rejectPeer(),
           ),
 
-        // Sending indicator
+        // Sending indicator with stop button
         if (state.sending)
-          const Padding(
-            padding: EdgeInsets.all(12),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             child: Row(
               children: [
-                SizedBox(width: 16, height: 16,
+                const SizedBox(width: 16, height: 16,
                     child: CircularProgressIndicator(strokeWidth: 2)),
-                SizedBox(width: 12),
-                Text('Starting transfer...',
-                    style: TextStyle(color: Colors.grey)),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text('Starting transfer...',
+                      style: TextStyle(color: Colors.grey)),
+                ),
+                TextButton.icon(
+                  onPressed: () => ref.read(sendPreparationProvider.notifier).cancelSend(),
+                  icon: const Icon(Icons.stop, size: 16, color: Colors.red),
+                  label: const Text('Stop', style: TextStyle(color: Colors.red, fontSize: 12)),
+                  style: TextButton.styleFrom(padding: EdgeInsets.zero),
+                ),
               ],
             ),
           ),
@@ -508,6 +516,11 @@ class _SendPreparationPageState extends ConsumerState<SendPreparationPage> {
   Future<void> _send(BuildContext context, WidgetRef ref) async {
     final sessionId = await ref.read(sendPreparationProvider.notifier).send();
     if (!context.mounted) return;
+
+    // User cancelled — keep the file list on the page so they can retry.
+    if (sessionId == null && ref.read(sendPreparationProvider).sendError == 'Transfer cancelled') {
+      return;
+    }
 
     ref.read(sendPreparationProvider.notifier).reset();
     // Always switch to Home tab so user can see the transfer result
