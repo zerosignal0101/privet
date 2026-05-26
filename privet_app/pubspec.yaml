@@ -1,7 +1,7 @@
 name: privet_app
 description: "Privet — LAN file transfer"
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.2.0+1
 
 environment:
   sdk: ^3.11.3
@@ -19,6 +19,7 @@ dependencies:
   url_launcher: ^6.3.1
   image: ^4.5.3
   qr_flutter: ^4.1.0
+  package_info_plus: ^8.3.1
 
 dev_dependencies:
   flutter_test:

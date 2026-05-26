@@ -50,6 +50,13 @@ async fn main() {
 
     let config = load_config(&cli.config);
 
+    tracing::info!(
+        "privet v{} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+
     if let Err(e) = run_command(cli.command, config).await {
         eprintln!("Error: {e}");
         std::process::exit(1);

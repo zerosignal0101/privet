@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
@@ -27,11 +28,20 @@ class HomePage extends ConsumerStatefulWidget {
 class _HomePageState extends ConsumerState<HomePage> {
   bool _isScanning = false;
   bool _showQr = false;
+  String _appVersion = '';
 
   @override
   void initState() {
     super.initState();
     _initEngine();
+    _loadVersion();
+  }
+
+  Future<void> _loadVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (mounted) setState(() => _appVersion = info.version);
+    } catch (_) {}
   }
 
   Future<void> _initEngine() async {
@@ -115,14 +125,13 @@ class _HomePageState extends ConsumerState<HomePage> {
       appBar: AppBar(
         title: const Text('Privet'),
         actions: [
-          if (identity.value != null && identity.value!.fingerprint.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(right: 12),
-              child: Text(
-                identity.value!.displayFingerprint,
-                style: const TextStyle(fontSize: 12, color: Colors.grey),
-              ),
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: Text(
+              'v$_appVersion',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
+          ),
         ],
       ),
       body: !isRunning

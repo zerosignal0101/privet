@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "privet-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dirs",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "privet-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "android_logger",
  "bytes",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "privet-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "privet-core",
  "serde",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "privet-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "privet-core",
  "rand 0.8.6",

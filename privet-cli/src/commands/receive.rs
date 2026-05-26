@@ -10,6 +10,10 @@ pub struct ReceiveArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Listen port
+    #[arg(short, long, default_value_t = 53530)]
+    pub port: u16,
+
     /// Run as daemon (background mode)
     #[arg(long)]
     pub daemon: bool,
@@ -52,6 +56,8 @@ pub async fn run(args: ReceiveArgs, mut config: PrivetConfig) -> privet_core::Re
     if args.force_tcp {
         config.transport.force_tcp_fallback = true;
     }
+
+    config.transport.listen_port = args.port;
 
     let engine = privet_core::PrivetEngine::new(config.clone()).await?;
     engine.start().await?;
