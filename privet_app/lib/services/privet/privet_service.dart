@@ -110,12 +110,6 @@ class PrivetService {
         return false;
       }
 
-      // On Android, get the real network info from ConnectivityManager
-      // (bypasses VPN which would otherwise return a virtual subnet).
-      if (Platform.isAndroid) {
-        await _setRealNetworksForAndroid();
-      }
-
       _isRunning = true;
       return true;
     } catch (e) {
@@ -172,10 +166,6 @@ class PrivetService {
       if (!started) {
         _lastError = 'Failed to start engine';
         return false;
-      }
-
-      if (Platform.isAndroid) {
-        await _setRealNetworksForAndroid();
       }
 
       _isRunning = true;
@@ -269,6 +259,10 @@ class PrivetService {
   Future<List<Map<String, dynamic>>> probeKnownDevices() =>
       _ffiIsolate.probeKnownDevices();
 
+  /// Probe a single remote address for identity (fingerprint + device name).
+  Future<Map<String, dynamic>?> probeAddress(String addr) =>
+      _ffiIsolate.probeAddress(addr);
+
   Future<List<Map<String, dynamic>>> getKnownDevices() =>
       _ffiIsolate.getKnownDevices();
 
@@ -325,68 +319,6 @@ class PrivetService {
 
   Future<bool> deleteTransferRecord(String sessionId) =>
       _ffiIsolate.deleteTransferRecord(sessionId);
-
-  // -----------------------------------------------------------------------
-  // Internal: real network detection (bypasses Android VPN)
-  // -----------------------------------------------------------------------
-
-  /// Query Android's ConnectivityManager for the real (non-VPN) network info
-  /// and pass it to the Rust engine so probe scanning uses the correct subnet.
-  Future<void> _setRealNetworksForAndroid() async {
-    try {
-      const channel = MethodChannel('privet/network');
-      final raw = await channel.invokeMethod<List<dynamic>>('getRealNetworkInfo');
-      if (raw == null || raw.isEmpty) return;
-
-      // Map address -> classful subnet to deduplicate
-      final subnetSet = <String>{};
-      final networkInfos = <Map<String, dynamic>>[];
-      for (final entry in raw) {
-        final map = entry as Map<dynamic, dynamic>;
-        final address = map['address'] as String;
-        final subnet = _classfulSubnet(address);
-        if (!subnetSet.add(subnet)) continue; // already added
-        networkInfos.add({
-          'subnet': subnet,
-          'interface_name': '',
-          'local_ips': [address],
-        });
-      }
-
-      if (networkInfos.isEmpty) return;
-      await _ffiIsolate.setNetworks(jsonEncode(networkInfos));
-      if (kDebugMode) debugPrint('[privet_service] set real networks: $networkInfos');
-    } catch (e) {
-      if (kDebugMode) debugPrint('[privet_service] failed to get real networks: $e');
-    }
-  }
-
-  /// Map an IPv4 address to its classful private subnet (mirrors
-  /// Rust's `default_prefix_len` in `privet-core/src/network.rs`).
-  ///
-  ///   - 10.x.x.x        → /8
-  ///   - 172.16-31.x.x    → /12
-  ///   - 192.168.x.x      → /24
-  ///   - anything else    → /24
-  String _classfulSubnet(String address) {
-    final parts = address.split('.').map(int.parse).toList();
-    final prefixLen = _defaultPrefixLen(parts[0], parts[1]);
-    final ip = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
-    final mask = prefixLen == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLen));
-    final net = ip & mask;
-    final a = (net >> 24) & 0xFF;
-    final b = (net >> 16) & 0xFF;
-    final c = (net >> 8) & 0xFF;
-    final d = net & 0xFF;
-    return '$a.$b.$c.$d/$prefixLen';
-  }
-
-  static int _defaultPrefixLen(int a, int b) {
-    if (a == 10) return 8;
-    if (a == 172 && b >= 16 && b <= 31) return 12;
-    if (a == 192 && b == 168) return 24;
-    return 24;
-  }
 
   // -----------------------------------------------------------------------
   // Internal: convert raw events to typed PrivetEvents

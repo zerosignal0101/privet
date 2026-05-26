@@ -13,6 +13,7 @@ import '../models/transfer_history.dart';
 import '../models/device_identity.dart';
 import '../services/privet/privet_service.dart';
 import '../services/privet/file_identifier_store.dart';
+import '../utils/pairing_url.dart';
 
 // ---------------------------------------------------------------------------
 // Service provider
@@ -434,6 +435,153 @@ class PairingNotifier extends Notifier<List<PairRequest>> {
 final pairingProvider =
     NotifierProvider<PairingNotifier, List<PairRequest>>(PairingNotifier.new);
 
+// ---------------------------------------------------------------------------
+// URL Pairing — handle privet://pair? URLs from QR codes
+// ---------------------------------------------------------------------------
+
+enum UrlPairingState { idle, probing, found, failed }
+
+class UrlPairingInfo {
+  final UrlPairingState status;
+  final String deviceName;
+  final String fingerprint;
+  final List<String> hosts;
+  final String? error;
+
+  const UrlPairingInfo({
+    this.status = UrlPairingState.idle,
+    this.deviceName = '',
+    this.fingerprint = '',
+    this.hosts = const [],
+    this.error,
+  });
+
+  UrlPairingInfo copyWith({
+    UrlPairingState? status,
+    String? deviceName,
+    String? fingerprint,
+    List<String>? hosts,
+    String? error,
+  }) => UrlPairingInfo(
+    status: status ?? this.status,
+    deviceName: deviceName ?? this.deviceName,
+    fingerprint: fingerprint ?? this.fingerprint,
+    hosts: hosts ?? this.hosts,
+    error: error,
+  );
+
+  bool get isActive => status == UrlPairingState.probing || status == UrlPairingState.found;
+}
+
+class UrlPairingNotifier extends Notifier<UrlPairingInfo> {
+  @override
+  UrlPairingInfo build() => const UrlPairingInfo();
+
+  /// Address of the host that responded to probing, used for known-device
+  /// recording on trust confirmation.
+  String? _foundHost;
+
+  /// Start the URL pairing flow: probe all hosts concurrently, verify
+  /// fingerprint, and set state to [UrlPairingState.found] on success.
+  Future<void> startPairing(ParsedPairingUrl parsed) async {
+    state = UrlPairingInfo(
+      status: UrlPairingState.probing,
+      deviceName: parsed.deviceName,
+      fingerprint: parsed.fingerprint,
+      hosts: parsed.hosts,
+    );
+
+    final service = ref.read(privetServiceProvider);
+
+    // Probe all hosts concurrently.  Each FFI call is handled sequentially
+    // by the isolate, but a 2s Rust-side timeout per host bounds the total.
+    final results = await Future.wait(parsed.hosts.map((host) async {
+      final result = await service.probeAddress(host);
+      if (result != null) {
+        final remoteFp = result['fingerprint'] as String? ?? '';
+        if (remoteFp.startsWith(parsed.fingerprint)) {
+          return (host: host, fingerprint: remoteFp);
+        }
+      }
+      return null;
+    }));
+
+    final success = results.firstWhere((r) => r != null, orElse: () => null);
+    if (success != null) {
+      _foundHost = success.host;
+      state = state.copyWith(
+        status: UrlPairingState.found,
+        fingerprint: success.fingerprint,
+      );
+    } else {
+      state = state.copyWith(
+        status: UrlPairingState.failed,
+        error: 'Could not find ${parsed.deviceName} on any address',
+      );
+    }
+  }
+
+  /// User confirmed trust — store the fingerprint, record known device,
+  /// and refresh trusted/known-device lists.
+  Future<void> confirmTrust() async {
+    if (state.fingerprint.isEmpty) return;
+    final service = ref.read(privetServiceProvider);
+    await service.trustPeer(state.fingerprint);
+
+    // Record as known device so future scanning can find it by IP
+    if (_foundHost != null) {
+      final ip = _foundHost!.split(':').first;
+      await service.addKnownDeviceIp(
+        fingerprint: state.fingerprint,
+        peerId: '',
+        deviceName: state.deviceName,
+        subnet: _classfulSubnet(ip),
+        addr: '$_foundHost',
+      );
+    }
+
+    // Refresh lists so new trust + known device appear immediately
+    ref.read(trustedListProvider.notifier).refresh();
+    ref.read(knownDevicesProvider.notifier).refresh();
+    ref.read(probedDevicesProvider.notifier).refresh();
+
+    state = const UrlPairingInfo();
+    _foundHost = null;
+  }
+
+  /// User rejected or dismissed — reset.
+  void cancel() {
+    state = const UrlPairingInfo();
+    _foundHost = null;
+  }
+}
+
+/// Derive a classful subnet CIDR from a bare IPv4 address.
+/// Mirrors Rust's `default_prefix_len` in `privet-core/src/network.rs`.
+String _classfulSubnet(String ip) {
+  final parts = ip.split('.').map(int.parse).toList();
+  final a = parts[0], b = parts[1], c = parts[2], d = parts[3];
+  final prefixLen = _defaultPrefixLen(a, b);
+  final ipNum = (a << 24) | (b << 16) | (c << 8) | d;
+  final mask = prefixLen == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLen));
+  final net = ipNum & mask;
+  final na = (net >> 24) & 0xFF;
+  final nb = (net >> 16) & 0xFF;
+  final nc = (net >> 8) & 0xFF;
+  final nd = net & 0xFF;
+  return '$na.$nb.$nc.$nd/$prefixLen';
+}
+
+int _defaultPrefixLen(int a, int b) {
+  if (a == 10) return 8;
+  if (a == 172 && b >= 16 && b <= 31) return 12;
+  if (a == 192 && b == 168) return 24;
+  return 24;
+}
+
+final urlPairingProvider =
+    NotifierProvider<UrlPairingNotifier, UrlPairingInfo>(UrlPairingNotifier.new);
+
 class _CachedPeerInfo {
   final String name;
   final List<String> addresses;
@@ -556,6 +704,9 @@ final acceptedListProvider =
 // ---------------------------------------------------------------------------
 
 final identityProvider = FutureProvider<DeviceIdentity?>((ref) async {
+  // Wait for engine to be running before fetching identity
+  final isRunning = ref.watch(engineRunningProvider);
+  if (!isRunning) return null;
   final service = ref.watch(privetServiceProvider);
   return service.getIdentity();
 });
@@ -749,6 +900,8 @@ class ProbedDevicesNotifier extends Notifier<List<PeerInfo>> {
     final rawList = await service.probeKnownDevices();
     state = rawList.map((e) => PeerInfo.fromJson(e)).toList();
   }
+
+  Future<void> refresh() => scan();
 }
 
 final probedDevicesProvider = NotifierProvider<ProbedDevicesNotifier,

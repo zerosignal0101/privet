@@ -63,6 +63,16 @@ class _ShellPageState extends ConsumerState<ShellPage> with WidgetsBindingObserv
       }
     });
 
+    // Watch for URL pairing (from scanned QR code) and show dialog
+    ref.listen<UrlPairingInfo>(urlPairingProvider, (prev, info) {
+      if (prev?.status == info.status) return;
+      if (info.status == UrlPairingState.found) {
+        _showUrlPairingFoundDialog(info);
+      } else if (info.status == UrlPairingState.failed) {
+        _showUrlPairingFailedDialog(info);
+      }
+    });
+
     return Scaffold(
       body: IndexedStack(
         index: currentIndex,
@@ -163,6 +173,66 @@ class _ShellPageState extends ConsumerState<ShellPage> with WidgetsBindingObserv
       context,
       MaterialPageRoute(
         builder: (_) => SendPreparationPage(initialEntries: entries),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // URL Pairing dialogs (from scanned QR code)
+  // ---------------------------------------------------------------------------
+
+  void _showUrlPairingFoundDialog(UrlPairingInfo info) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Device Found'),
+        content: Text(
+          'Found ${info.deviceName} from QR code.\n\n'
+          'Fingerprint verified. Do you want to trust this device?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              ref.read(urlPairingProvider.notifier).cancel();
+              Navigator.pop(ctx);
+            },
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              await ref.read(urlPairingProvider.notifier).confirmTrust();
+              if (ctx.mounted) Navigator.pop(ctx);
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('${info.deviceName} is now trusted'),
+                    duration: const Duration(seconds: 2),
+                  ),
+                );
+              }
+            },
+            child: const Text('Trust'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showUrlPairingFailedDialog(UrlPairingInfo info) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Pairing Failed'),
+        content: Text(info.error ?? 'Could not connect to the device.'),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              ref.read(urlPairingProvider.notifier).cancel();
+              Navigator.pop(ctx);
+            },
+            child: const Text('OK'),
+          ),
+        ],
       ),
     );
   }

@@ -143,6 +143,9 @@ typedef PrivetRemoveKnownDeviceIpDart = int Function(Pointer<Utf8> argsJson);
 typedef PrivetSetNetworkLabelNative = Int32 Function(Pointer<Utf8> argsJson);
 typedef PrivetSetNetworkLabelDart = int Function(Pointer<Utf8> argsJson);
 
+typedef PrivetProbeAddressNative = Pointer<Utf8> Function(Pointer<Utf8> addr);
+typedef PrivetProbeAddressDart = Pointer<Utf8> Function(Pointer<Utf8> addr);
+
 typedef PrivetGetTransferHistoryNative = Pointer<Utf8> Function(Uint32 limit, Uint32 offset);
 typedef PrivetGetTransferHistoryDart = Pointer<Utf8> Function(int limit, int offset);
 
@@ -192,6 +195,7 @@ class PrivetFfi {
   late PrivetAddKnownDeviceIpDart _addKnownDeviceIp;
   late PrivetRemoveKnownDeviceIpDart _removeKnownDeviceIp;
   late PrivetSetNetworkLabelDart _setNetworkLabel;
+  late PrivetProbeAddressDart _probeAddress;
   late PrivetGetTransferHistoryDart _getTransferHistory;
   late PrivetGetTransferRecordDart _getTransferRecord;
   late PrivetDeleteTransferRecordDart _deleteTransferRecord;
@@ -262,6 +266,8 @@ class PrivetFfi {
         PrivetRemoveKnownDeviceIpDart>('privet_remove_known_device_ip');
     _setNetworkLabel = _lib!.lookupFunction<PrivetSetNetworkLabelNative,
         PrivetSetNetworkLabelDart>('privet_set_network_label');
+    _probeAddress = _lib!.lookupFunction<PrivetProbeAddressNative,
+        PrivetProbeAddressDart>('privet_probe_address');
     _getTransferHistory = _lib!.lookupFunction<PrivetGetTransferHistoryNative,
         PrivetGetTransferHistoryDart>('privet_get_transfer_history');
     _getTransferRecord = _lib!.lookupFunction<PrivetGetTransferRecordNative,
@@ -349,6 +355,7 @@ class PrivetFfi {
   int setNetworks(Pointer<Utf8> json) => _setNetworks(json);
   Pointer<Utf8> probeKnownDevices() => _probeKnownDevices();
   Pointer<Utf8> getKnownDevices() => _getKnownDevices();
+  Pointer<Utf8> probeAddress(Pointer<Utf8> addr) => _probeAddress(addr);
   int addKnownDeviceIp(Pointer<Utf8> argsJson) => _addKnownDeviceIp(argsJson);
   int removeKnownDeviceIp(Pointer<Utf8> argsJson) => _removeKnownDeviceIp(argsJson);
   int setNetworkLabel(Pointer<Utf8> argsJson) => _setNetworkLabel(argsJson);

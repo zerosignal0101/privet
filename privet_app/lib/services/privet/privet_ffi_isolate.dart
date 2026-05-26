@@ -235,6 +235,16 @@ class PrivetFfiIsolate {
     return [];
   }
 
+  /// Probe a single remote address for identity (fingerprint, name).
+  /// Returns a map with peer info keys or null on failure/timeout.
+  Future<Map<String, dynamic>?> probeAddress(String addr) async {
+    final r = await _call('probe_address', {'addr': addr});
+    if (r['ok'] == true && r['data'] != null) {
+      return r['data'] as Map<String, dynamic>;
+    }
+    return null;
+  }
+
   Future<List<Map<String, dynamic>>> getKnownDevices() async {
     final r = await _call('get_known_devices', {});
     if (r['ok'] == true && r['data'] != null) {
@@ -429,6 +439,9 @@ void _handleCommand(PrivetFfi ffi, _FfiCommand cmd) {
         break;
       case 'probe_known_devices':
         _cmdProbeKnownDevices(ffi, cmd);
+        break;
+      case 'probe_address':
+        _cmdProbeAddress(ffi, cmd);
         break;
       case 'get_known_devices':
         _cmdGetKnownDevices(ffi, cmd);
@@ -649,6 +662,21 @@ void _cmdProbeKnownDevices(PrivetFfi ffi, _FfiCommand cmd) {
     cmd.replyTo.send({'ok': true, 'data': data});
   } else {
     cmd.replyTo.send({'ok': true, 'data': []});
+  }
+}
+
+void _cmdProbeAddress(PrivetFfi ffi, _FfiCommand cmd) {
+  final addr = (cmd.args['addr'] as String).toNativeUtf8();
+  try {
+    final ptr = ffi.probeAddress(addr);
+    final json = ffi.readAndFreeJson(ptr);
+    if (json != null) {
+      cmd.replyTo.send({'ok': true, 'data': jsonDecode(json)});
+    } else {
+      cmd.replyTo.send({'ok': false});
+    }
+  } finally {
+    calloc.free(addr);
   }
 }
 

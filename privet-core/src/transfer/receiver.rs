@@ -288,7 +288,7 @@ impl Receiver {
             ).await;
             match offer_data {
                 Ok(Ok(data)) => {
-                    // Sender sent a Reject (pairing needed) instead of Offer.
+                    // Sender sent a Reject instead of Offer.
                     if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&data) {
                         tracing::info!("[quic-recv] sender rejected: {}", rej.reason);
                         return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint.clone(), String::new(), Vec::new(), peer_listen_addr));

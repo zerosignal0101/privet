@@ -21,8 +21,10 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "privet/file"
     private val DEVICE_CHANNEL = "privet/device"
     private val SHARE_CHANNEL = "privet/share"
+    private val DEEPLINK_CHANNEL = "privet/deeplink"
     private var pendingResult: MethodChannel.Result? = null
     private var shareChannel: MethodChannel? = null
+    private var deeplinkChannel: MethodChannel? = null
     // Store share data for Dart to pull on cold start (handler may not be ready yet)
     private var pendingShareArgs: Map<String, Any?>? = null
 
@@ -67,6 +69,7 @@ class MainActivity : FlutterActivity() {
                 shareChannel?.invokeMethod("onShare", args)
             }
         }
+        handleDeeplink(intent)
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -86,6 +89,10 @@ class MainActivity : FlutterActivity() {
             }
         }
         handleShareIntent(intent)
+
+        // Deeplink channel — listen for privet:// pair URLs
+        deeplinkChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEEPLINK_CHANNEL)
+        handleDeeplink(intent)
 
         // Real network info channel (bypasses VPN detection)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "privet/network").setMethodCallHandler { call, result ->
@@ -369,6 +376,22 @@ class MainActivity : FlutterActivity() {
             Uri.parse(uri).lastPathSegment
         } catch (_: Exception) {
             Uri.parse(uri).lastPathSegment
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Deeplink handling (privet:// URLs from QR codes)
+    // -----------------------------------------------------------------------
+
+    /// Process incoming `privet://` URL intent and forward to Dart.
+    private fun handleDeeplink(intent: Intent?) {
+        if (intent == null) return
+        val uri = intent.data ?: return
+        if (uri.scheme != "privet") return
+        val url = uri.toString()
+        Log.d("PrivetDeeplink", "Received deeplink: $url")
+        runOnUiThread {
+            deeplinkChannel?.invokeMethod("onDeeplink", url)
         }
     }
 }

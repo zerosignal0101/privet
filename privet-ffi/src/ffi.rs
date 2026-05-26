@@ -128,6 +128,42 @@ pub extern "C" fn privet_stop() {
     }
 }
 
+/// Probe a remote device's identity by connecting and performing the
+/// Hello/HelloAck handshake. Returns a JSON string of [`PeerInfo`] on
+/// success, or null on failure. Caller must free with `privet_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn privet_probe_address(addr: *const c_char) -> *mut c_char {
+    let rt = runtime::get_runtime();
+    let engine = engine_or!(std::ptr::null_mut());
+
+    let addr_str = unsafe {
+        if addr.is_null() {
+            return std::ptr::null_mut();
+        }
+        match CStr::from_ptr(addr).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+
+    let addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let peer_info = match rt.block_on(engine.probe_identity(addr)) {
+        Ok(info) => info,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let json = match serde_json::to_string(&peer_info) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
 // ---------------------------------------------------------------------------
 // Event polling (instead of callback — NativeCallable.listener can't be
 // safely called from Rust/Tokio threads on all platforms).

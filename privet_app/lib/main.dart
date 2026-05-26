@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'pages/shell_page.dart';
 import 'providers/providers.dart';
+import 'services/deeplink_service.dart';
 
 void main() {
   runApp(const ProviderScope(child: PrivetApp()));
@@ -23,6 +24,7 @@ class _PrivetAppState extends ConsumerState<PrivetApp> {
   void initState() {
     super.initState();
     _initShareChannel();
+    _initDeeplink();
     // Pull any share data that arrived before the handler was registered
     // (cold start via Android SEND intent).
     _pullPendingShare();
@@ -35,6 +37,16 @@ class _PrivetAppState extends ConsumerState<PrivetApp> {
       if (call.method == 'onShare') {
         _handleShareData(call.arguments as Map<String, dynamic>?);
       }
+    });
+  }
+
+  /// Start listening for incoming deeplinks (privet:// URLs from QR codes).
+  void _initDeeplink() {
+    DeeplinkService.instance.start();
+    // Listen for pairing URLs and trigger the pairing flow
+    DeeplinkService.instance.pairingUrls.listen((parsed) {
+      if (!mounted) return;
+      ref.read(urlPairingProvider.notifier).startPairing(parsed);
     });
   }
 

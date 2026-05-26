@@ -52,6 +52,9 @@ mdns-sd = { workspace = true }
 # Socket configuration (SO_REUSEADDR for reliable restart)
 socket2 = { version = "0.5", features = [] }
 
+# Network interface enumeration (detect all local IPs)
+if-addrs = { workspace = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-subscriber = { workspace = true }
 log = { workspace = true }

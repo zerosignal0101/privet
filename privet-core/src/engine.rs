@@ -463,7 +463,7 @@ impl PrivetEngine {
                                         match crate::transfer::tcp_transport::receive_tcp(
                                             tls_stream, dl, ck, lp, &id, &tf, &aa,
                                             tls_fp.as_deref(), Some(addr), as_, &*pi, &*pp, &ev,
-                                            &cs, &sm, tl.clone(),
+                                            &cs, &sm, tl.clone(), &kds,
                                         )
                                         .await
                                         {
@@ -662,6 +662,279 @@ impl PrivetEngine {
             tracing::warn!("skipped path {}: {}", s.path.display(), s.reason);
         }
         self.send_files_to_addr(addr, expanded.files, session_id).await
+    }
+
+    /// Per-address timeout for QUIC handshake during identity probing.
+    /// Much shorter than the config-level [`TransportConfig::handshake_timeout`]
+    /// (5s) so that unreachable hosts (virtual adapters, dead IPs) fail fast
+    /// and TCP+TLS fallback still has time within the probe budget.
+    const PROBE_QUIC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// Per-address timeout for TCP connect + TLS during identity probing.
+    const PROBE_TCP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    pub async fn probe_identity(&self, addr: SocketAddr) -> Result<PeerInfo> {
+        // Try QUIC first with a short handshake timeout.
+        match self.try_probe_identity_quic(addr).await {
+            Ok(info) => return Ok(info),
+            Err(_) => { /* fall through to TCP */ }
+        }
+
+        // TCP+TLS fallback with its own timeout so that unreachable
+        // hosts don't stall the caller (especially important when
+        // probing multiple hosts sequentially).
+        if self.config.transport.enable_tcp_fallback {
+            let tcp_result = tokio::time::timeout(
+                Self::PROBE_TCP_TIMEOUT,
+                self.try_probe_identity_tcp(addr),
+            )
+            .await;
+
+            return match tcp_result {
+                Ok(Ok(info)) => Ok(info),
+                Ok(Err(e)) => Err(e),
+                Err(_) => {
+                    tracing::debug!("probe_identity: TCP fallback timeout for {addr}");
+                    Err(PrivetError::ConnectionTimeout)
+                }
+            };
+        }
+
+        Err(PrivetError::ConnectionTimeout)
+    }
+
+    /// QUIC path for [`probe_identity`].
+    async fn try_probe_identity_quic(&self, addr: SocketAddr) -> Result<PeerInfo> {
+        use crate::protocol::control;
+        use crate::protocol::handshake::{self, ControlMessage, Hello};
+
+        let client_config = tls::build_client_config(&self.identity, &[])?;
+        let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+        let ep = endpoint::build_client_endpoint(
+            &self.config.transport,
+            client_config,
+            listen_addr,
+        )?;
+
+        let connecting = ep
+            .connect(addr, "privet")
+            .map_err(|e| crate::error::TransportError::Quic(format!("connect: {e}")))?;
+
+        let conn = tokio::time::timeout(
+            Self::PROBE_QUIC_TIMEOUT,
+            connecting,
+        )
+        .await
+        .map_err(|_| PrivetError::ConnectionTimeout)?
+        .map_err(|e| crate::error::TransportError::Quic(format!("handshake: {e}")))?;
+
+        // Extract TLS certificate fingerprint
+        let fingerprint = {
+            let tls_identity = conn.peer_identity().ok_or_else(|| {
+                PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                    "no peer certificate".into(),
+                ))
+            })?;
+            let certs = tls_identity
+                .downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok_or_else(|| {
+                    PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                        "unexpected peer identity type".into(),
+                    ))
+                })?;
+            let cert = certs.first().ok_or_else(|| {
+                PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                    "peer certificate chain is empty".into(),
+                ))
+            })?;
+            crate::security::cert::fingerprint_from_der(cert.as_ref())
+        };
+
+        // Open control stream and exchange Hello / HelloAck
+        let (mut ctrl_send, mut ctrl_recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| crate::error::TransportError::ConnectionLost(format!("open bi: {e}")))?;
+
+        let hello = ControlMessage::Hello(Hello {
+            version: handshake::PROTOCOL_VERSION,
+            device_name: self.identity.device_name.clone(),
+            platform: std::env::consts::OS.to_owned(),
+            fingerprint: self.identity.fingerprint.clone(),
+            listen_port: Some(self.config.transport.listen_port),
+        });
+        let hello_data = handshake::serialize(&hello)?;
+        control::write_control_frame(&mut ctrl_send, &hello_data)
+            .await
+            .map_err(|e| {
+                crate::error::TransportError::ConnectionLost(format!("write hello: {e}"))
+            })?;
+
+        let ack_data = control::read_control_frame(&mut ctrl_recv)
+            .await
+            .map_err(|e| {
+                crate::error::TransportError::ConnectionLost(format!("read ack: {e}"))
+            })?;
+        let ack_msg = handshake::deserialize(&ack_data)?;
+        let hello_ack = match ack_msg {
+            ControlMessage::HelloAck(ack) => ack,
+            other => {
+                return Err(crate::error::ProtocolError::UnexpectedMessage {
+                    expected: "HelloAck".into(),
+                    got: format!("{other:?}"),
+                }
+                .into())
+            }
+        };
+
+        // Verify TLS certificate fingerprint matches the HelloAck fingerprint
+        if fingerprint != hello_ack.fingerprint {
+            return Err(PrivetError::Security(
+                crate::error::SecurityError::FingerprintMismatch {
+                    expected: hello_ack.fingerprint.clone(),
+                    got: fingerprint,
+                },
+            ));
+        }
+
+        let peer_listen_addr = hello_ack
+            .listen_port
+            .map(|port| SocketAddr::new(addr.ip(), port));
+
+        Ok(PeerInfo {
+            id: PeerId(uuid::Uuid::nil()),
+            name: hello_ack.device_name,
+            addresses: vec![peer_listen_addr.unwrap_or(addr)],
+            fingerprint: hello_ack.fingerprint,
+            is_trusted: false,
+            last_seen: std::time::SystemTime::now(),
+            platform: None,
+            version: None,
+        })
+    }
+
+    /// TCP+TLS fallback path for [`probe_identity`].
+    /// Always sends a graceful TLS `close_notify` before returning so the
+    /// receiver doesn't log a spurious "peer closed connection without
+    /// sending TLS close_notify".
+    async fn try_probe_identity_tcp(&self, addr: SocketAddr) -> Result<PeerInfo> {
+        use crate::protocol::handshake::{self, ControlMessage, Hello};
+        use crate::transport::tcp_fallback::{connect_tcp, read_frame, write_frame};
+
+        let tcp_stream = connect_tcp(addr).await?;
+
+        let tls_client_cfg = tls::build_client_config(&self.identity, &[])
+            .map_err(PrivetError::Security)?;
+        let connector = tokio_rustls::TlsConnector::from(tls_client_cfg);
+        let tls_name = match rustls::pki_types::ServerName::try_from("privet") {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(PrivetError::Security(
+                    crate::error::SecurityError::Tls("invalid TLS server name".into()),
+                ))
+            }
+        };
+        let mut tls_stream = connector
+            .connect(tls_name, tcp_stream)
+            .await
+            .map_err(|e| {
+                PrivetError::Security(crate::error::SecurityError::Tls(format!(
+                    "handshake: {e}"
+                )))
+            })?;
+
+        // Run the probe logic inside an `async` block so that `?` only exits
+        // the block, not the outer function.  The mutable borrow of
+        // `tls_stream` ends when the block finishes, allowing the shutdown
+        // call below to take ownership.
+        let probe_result: Result<PeerInfo> = async {
+            let (_, session) = tls_stream.get_ref();
+            let fingerprint = session
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| crate::security::cert::fingerprint_from_der(cert.as_ref()))
+                .ok_or_else(|| {
+                    PrivetError::Security(crate::error::SecurityError::NotTrusted(
+                        "no peer certificate".into(),
+                    ))
+                })?;
+
+            let hello = ControlMessage::Hello(Hello {
+                version: handshake::PROTOCOL_VERSION,
+                device_name: self.identity.device_name.clone(),
+                platform: std::env::consts::OS.to_owned(),
+                fingerprint: self.identity.fingerprint.clone(),
+                listen_port: Some(self.config.transport.listen_port),
+            });
+            let hello_data = handshake::serialize(&hello)?;
+            write_frame(&mut tls_stream, 0, &hello_data)
+                .await
+                .map_err(|e| PrivetError::Transport(e.into()))?;
+
+            let (_stream_id, ack_data) = read_frame(&mut tls_stream)
+                .await
+                .map_err(|e| PrivetError::Transport(e.into()))?;
+            let ack_msg = handshake::deserialize(&ack_data)?;
+            let hello_ack = match ack_msg {
+                ControlMessage::HelloAck(ack) => ack,
+                other => {
+                    return Err(crate::error::ProtocolError::UnexpectedMessage {
+                        expected: "HelloAck".into(),
+                        got: format!("{other:?}"),
+                    }
+                    .into())
+                }
+            };
+
+            if fingerprint != hello_ack.fingerprint {
+                return Err(PrivetError::Security(
+                    crate::error::SecurityError::FingerprintMismatch {
+                        expected: hello_ack.fingerprint.clone(),
+                        got: fingerprint,
+                    },
+                ));
+            }
+
+            let peer_listen_addr = hello_ack
+                .listen_port
+                .map(|port| SocketAddr::new(addr.ip(), port));
+
+            Ok(PeerInfo {
+                id: PeerId(uuid::Uuid::nil()),
+                name: hello_ack.device_name,
+                addresses: vec![peer_listen_addr.unwrap_or(addr)],
+                fingerprint: hello_ack.fingerprint,
+                is_trusted: false,
+                last_seen: std::time::SystemTime::now(),
+                platform: None,
+                version: None,
+            })
+        }
+        .await;
+
+        // Before disconnecting, send a Reject so the receiver doesn't wait
+        // for an Offer that will never come.
+        if probe_result.is_ok() {
+            let reject = ControlMessage::Reject(handshake::Reject {
+                session_id: SessionId(uuid::Uuid::nil()),
+                reason: "identity probe".into(),
+            });
+            if let Ok(data) = handshake::serialize(&reject) {
+                let _ = write_frame(&mut tls_stream, 0, &data).await;
+            }
+        }
+
+        // Graceful TLS shutdown — the receiver gets a proper close_notify
+        // instead of an aborted connection.
+        use tokio::io::AsyncWriteExt;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tls_stream.shutdown(),
+        )
+        .await;
+
+        probe_result
     }
 
     /// Send files to a peer by address (IP:port), bypassing discovery.
@@ -1397,38 +1670,68 @@ impl PrivetEngine {
     }
 
     /// Probe known devices on the current network(s).
-    /// Returns a list of probed devices that are online.
-    /// Emits `KnownDeviceProbed` events for each online device.
+    /// Performs a full QUIC/TCP+TLS identity handshake for each known device
+    /// address and only reports devices whose fingerprint matches expectations.
+    /// Emits `KnownDeviceProbed` events for each verified device.
     pub async fn probe_known_devices(&self) -> Vec<PeerInfo> {
         let networks = self.current_networks();
-        let subnets: Vec<String> = networks.iter().map(|n| n.subnet.clone()).collect();
+        // Deduplicate — multiple interfaces may share the same logical subnet.
+        let mut subnets: Vec<String> = networks.iter().map(|n| n.subnet.clone()).collect();
+        subnets.sort();
+        subnets.dedup();
 
         if subnets.is_empty() {
             return Vec::new();
         }
 
-        let store = self.known_device_store.lock().await;
-        let probed = crate::discovery::probe::probe_all_known_devices(&store, &subnets).await;
-        drop(store);
+        // Collect targets while holding the store lock, then release it so
+        // concurrent access is not blocked during the (slow) probes.
+        let targets = {
+            let store = self.known_device_store.lock().await;
+            crate::discovery::probe::known_device_targets(&store, &subnets)
+        };
 
         let trusted = self.trust_store.lock().await.trusted_fingerprints();
         let mut online_peers = Vec::new();
 
-        for device in probed {
-            let is_trusted = trusted.iter().any(|fp| fp == &device.fingerprint);
-            let peer_info = device.to_peer_info(is_trusted);
+        for (expected_fp, _subnet, addr) in &targets {
+            let probe_result = tokio::time::timeout(
+                crate::discovery::probe::PROBE_TIMEOUT,
+                self.probe_identity(*addr),
+            )
+            .await;
 
-            // Add to discovered peers
-            let mut map = self.peers.write().await;
-            map.insert(peer_info.id, peer_info.clone());
-            drop(map);
+            match probe_result {
+                Ok(Ok(peer_info)) => {
+                    if &peer_info.fingerprint == expected_fp {
+                        let is_trusted = trusted.iter().any(|fp| fp == &peer_info.fingerprint);
+                        let mut peer = peer_info;
+                        peer.is_trusted = is_trusted;
 
-            // Emit event
-            let _ = self.event_tx.send(PrivetEvent::KnownDeviceProbed {
-                peer: peer_info.clone(),
-            });
+                        let mut map = self.peers.write().await;
+                        map.insert(peer.id.clone(), peer.clone());
+                        drop(map);
 
-            online_peers.push(peer_info);
+                        let _ = self.event_tx.send(PrivetEvent::KnownDeviceProbed {
+                            peer: peer.clone(),
+                        });
+
+                        online_peers.push(peer);
+                    } else {
+                        tracing::warn!(
+                            "probe_known_devices: fingerprint mismatch at {addr}: \
+                             expected {expected_fp}, got {}",
+                            peer_info.fingerprint,
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("probe_known_devices: probe failed for {addr}: {e}");
+                }
+                Err(_) => {
+                    tracing::debug!("probe_known_devices: timeout probing {addr}");
+                }
+            }
         }
 
         online_peers
@@ -1545,5 +1848,6 @@ impl PrivetEngine {
         Ok(())
     }
 }
+
 
 

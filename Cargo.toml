@@ -50,6 +50,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Utilities
 dirs = "6"
+if-addrs = "0.12"
 hostname = "0.4"
 toml = "0.8"
 ipnet = { version = "2", features = ["serde"] }

@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{PrivetError, TransportError};
+use crate::known_device::KnownDeviceStore;
 use crate::protocol::data::{self, Chunk};
 use crate::protocol::handshake::{self, ControlMessage, HelloAck, ResumePoint};
 use crate::session::{FileManifest, FileToSend, SessionId};
@@ -44,6 +45,7 @@ pub async fn receive_tcp<S>(
     cancel_signals: &Arc<RwLock<HashMap<SessionId, Arc<AtomicBool>>>>,
     session_meta: &Arc<RwLock<HashMap<SessionId, crate::engine::SessionMeta>>>,
     transfer_log: Option<crate::storage::records::TransferLog>,
+    kds: &tokio::sync::Mutex<KnownDeviceStore>,
 ) -> Result<(SessionId, String, String, Vec<TransferFileRecord>, Option<std::net::SocketAddr>), PrivetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -123,14 +125,10 @@ where
             });
         }
 
-        match rx.await.unwrap_or(crate::engine::PairDecision::Reject) {
-            crate::engine::PairDecision::Trust => {
-                is_trusted = true;
-            }
-            crate::engine::PairDecision::TrustAndAccept => {
-                let _ = accept_store.lock().await.accept(peer_fingerprint.clone());
-                is_trusted = true;
-            }
+        let decision = rx.await.unwrap_or(crate::engine::PairDecision::Reject);
+        pending_pairing.write().await.remove(&peer_fingerprint);
+
+        match decision {
             crate::engine::PairDecision::Reject => {
                 let reject = ControlMessage::Reject(handshake::Reject {
                     session_id: SessionId(uuid::Uuid::nil()),
@@ -139,16 +137,44 @@ where
                 if let Ok(data) = handshake::serialize(&reject) {
                     let _ = crate::transport::tcp_fallback::write_frame(&mut stream, CONTROL_STREAM, &data).await;
                 }
-                // Graceful TLS shutdown so the sender can read the Reject
-                // before the connection is dropped (avoids TCP RST).
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     tokio::io::AsyncWriteExt::shutdown(&mut stream),
                 ).await;
                 return Err(PrivetError::Security(crate::error::SecurityError::PairingRequired));
             }
+            crate::engine::PairDecision::Trust => {
+                is_trusted = true;
+            }
+            crate::engine::PairDecision::TrustAndAccept => {
+                let _ = accept_store.lock().await.accept(peer_fingerprint.clone());
+                is_trusted = true;
+            }
         }
-        pending_pairing.write().await.remove(&peer_fingerprint);
+
+        // Record as known device after successful pairing — even if the
+        // sender disconnects immediately (e.g. identity probe), the mapping
+        // is persisted so future scans can find the device by IP.
+        if is_trusted {
+            let record_addr = peer_listen_addr.or(remote_addr);
+            if let Some(ref addr) = record_addr {
+                if let std::net::IpAddr::V4(ref v4) = addr.ip() {
+                    let subnet = crate::network::subnet_from_addr(
+                        &addr.ip(),
+                        crate::network::default_prefix_len(v4),
+                    );
+                    let mut store = kds.lock().await;
+                    let _ = store.add_or_update_device(
+                        peer_fingerprint.clone(),
+                        crate::peer::PeerId(uuid::Uuid::nil()),
+                        hello.device_name.clone(),
+                        subnet,
+                        *addr,
+                        None,
+                    );
+                }
+            }
+        }
 
         // If pairing was resolved (Trust), sender may have closed this connection.
         // read_frame will return error if so — that's fine, sender will retry.
@@ -161,9 +187,9 @@ where
 
     // 4. Read Offer
     let (_, offer_data) = crate::transport::tcp_fallback::read_frame(&mut stream).await?;
-    // Sender may have sent a Reject instead (pairing needed on its side)
+    // Sender may have sent a Reject instead
     if let Ok(ControlMessage::Reject(rej)) = handshake::deserialize(&offer_data) {
-        tracing::info!("[tcp-recv] sender rejected: {} (pairing needed, retry expected)", rej.reason);
+        tracing::info!("[tcp-recv] sender rejected: {}", rej.reason);
         return Ok((SessionId(uuid::Uuid::nil()), peer_fingerprint, hello.device_name.clone(), Vec::new(), peer_listen_addr));
     }
     let offer_msg = handshake::deserialize(&offer_data)?;
@@ -1496,6 +1522,12 @@ mod tests {
         let r_pp = pending_pairing.clone();
         let r_ev = event_tx.clone();
         let r_id = recv_id.clone();
+        // In-memory known device store for the receiver.
+        let r_kds = Arc::new(tokio::sync::Mutex::new(
+            crate::known_device::KnownDeviceStore::load_or_create(
+                dir.path().join("known_devices.json"),
+            ).unwrap(),
+        ));
         let recv_handle = tokio::spawn(async move {
             receive_tcp(
                 server,
@@ -1514,6 +1546,7 @@ mod tests {
                 &r_cs,
                 &r_sm,
                 None,
+                &r_kds,
             )
             .await
         });
@@ -1621,6 +1654,11 @@ mod tests {
         let r_pi = pending_incoming.clone();
         let r_pp = pending_pairing.clone();
         let r_ev = event_tx.clone();
+        let r_kds = Arc::new(tokio::sync::Mutex::new(
+            crate::known_device::KnownDeviceStore::load_or_create(
+                dir.path().join("known_devices.json"),
+            ).unwrap(),
+        ));
 
         let recv_handle = tokio::spawn(async move {
             let (tcp_stream, _) = listener.accept().await.expect("accept");
@@ -1650,6 +1688,7 @@ mod tests {
                 &r_cs,
                 &r_sm,
                 None,
+                &r_kds,
             )
             .await
         });
