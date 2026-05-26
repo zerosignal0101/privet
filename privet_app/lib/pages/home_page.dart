@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
@@ -9,6 +7,7 @@ import '../models/transfer.dart';
 import '../models/transfer_history.dart';
 import '../providers/providers.dart';
 import '../services/privet/privet_service.dart';
+import '../utils/platform.dart';
 import '../widgets/transfer_tile.dart';
 import '../widgets/pairing_banner.dart';
 import 'send_preparation_page.dart';
@@ -36,7 +35,7 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     String? dataDir;
     try {
-      dataDir = await _engineDataDir();
+      dataDir = await engineDataDir();
     } catch (_) {}
 
     // Resolve actual download dir and persist it so history can read it
@@ -302,37 +301,3 @@ class _PeerTile extends StatelessWidget {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Engine data directory — match CLI path on desktop for shared identity
-// ---------------------------------------------------------------------------
-
-/// Base directory for engine data (certificates, trust store, known devices,
-/// transfer logs, downloads).
-///
-/// Matches `dirs::data_local_dir()` used by privet-cli:
-///   - Windows: `%LOCALAPPDATA%`
-///   - Linux:   `$XDG_DATA_HOME` → `~/.local/share`
-///   - macOS:   `~/Library/Application Support`
-///   - Mobile:  app sandbox documents directory
-///
-/// The caller appends `/privet/...` subdirectories.
-Future<String> _engineDataDir() async {
-  if (!Platform.isAndroid && !Platform.isIOS) {
-    // Desktop — match dirs::data_local_dir()
-    if (Platform.isWindows) {
-      final localAppData = Platform.environment['LOCALAPPDATA'];
-      if (localAppData != null) return localAppData;
-    } else if (Platform.isLinux) {
-      final xdg = Platform.environment['XDG_DATA_HOME'];
-      if (xdg != null) return xdg;
-      final home = Platform.environment['HOME'];
-      if (home != null) return '$home/.local/share';
-    } else if (Platform.isMacOS) {
-      final home = Platform.environment['HOME'];
-      if (home != null) return '$home/Library/Application Support';
-    }
-  }
-  // Mobile fallback — app sandbox
-  final dir = await getApplicationDocumentsDirectory();
-  return dir.path;
-}

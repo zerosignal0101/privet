@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../providers/providers.dart';
 import '../services/privet/privet_service.dart';
+import '../utils/platform.dart';
 
 class SettingsPage extends ConsumerWidget {
   const SettingsPage({super.key});
@@ -464,8 +464,7 @@ class SettingsPage extends ConsumerWidget {
 
     String? dataDir;
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      dataDir = dir.path;
+      dataDir = await engineDataDir();
     } catch (_) {}
 
     final settings = ref.read(settingsProvider);
