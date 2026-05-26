@@ -290,8 +290,28 @@ class _PeerTile extends StatelessWidget {
           ? Icon(Icons.verified_user, color: Colors.green.shade700)
           : const Icon(Icons.devices),
       title: Text(peer.name),
-      subtitle: Text(
-        '${peer.displayFingerprint}${peer.platform != null ? ' · ${peer.platform}' : ''}',
+      subtitle: Row(
+        children: [
+          if (peer.isTrusted)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Icon(Icons.check_circle, size: 12, color: Colors.green.shade600),
+            ),
+          Expanded(
+            child: Text(
+              peer.addresses.isNotEmpty ? peer.addresses.first : peer.displayFingerprint,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                color: peer.addresses.isNotEmpty ? Colors.green.shade700 : Colors.grey,
+              ),
+            ),
+          ),
+          if (peer.platform != null) ...[
+            const SizedBox(width: 6),
+            Text(peer.platform!, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+          ],
+        ],
       ),
       trailing: IconButton(
         icon: const Icon(Icons.send),

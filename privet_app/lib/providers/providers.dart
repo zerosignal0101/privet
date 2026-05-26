@@ -1150,6 +1150,27 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
 
   String _hex(int v) => v.toRadixString(16).padLeft(2, '0');
 
+  /// Default port used by the privet engine.
+  static const int _defaultPort = 53530;
+
+  /// Append the default port if [addr] does not already include one.
+  /// Handles both IPv4 (`192.168.1.5`) and bracketed IPv6 (`[::1]`) addresses.
+  String _ensurePort(String addr, int defaultPort) {
+    // Simple heuristic: if the last colon-separated segment is all digits
+    // and not part of an IPv6 literal, the port is already specified.
+    final lastColon = addr.lastIndexOf(':');
+    if (lastColon >= 0) {
+      final afterColon = addr.substring(lastColon + 1);
+      // Bracketed IPv6 like [::1] → after colon is "1]" → contains ']' → no port
+      // IPv4:port like 192.168.1.5:53530 → after colon is "53530" → digits → has port
+      // IPv6:port like [::1]:53530 → after colon is "53530" → digits → has port
+      if (!afterColon.contains(']') && RegExp(r'^\d+$').hasMatch(afterColon)) {
+        return addr; // Already has a port number
+      }
+    }
+    return '$addr:$defaultPort';
+  }
+
   Future<String?> send() async {
     if (kDebugMode) debugPrint('[send] send() called');
     if (!state.isReady) return null;
@@ -1182,7 +1203,8 @@ class SendPreparationNotifier extends Notifier<SendPreparationState> {
             }).toList()
           : state.filePaths;
 
-      await service.sendFilesStart(sessionId, state.peerAddress!, payload);
+      final resolvedAddr = _ensurePort(state.peerAddress!, _defaultPort);
+      await service.sendFilesStart(sessionId, resolvedAddr, payload);
       if (kDebugMode) debugPrint('[send] sendFilesStart returned (session=$sessionId)');
 
       final signal = await _pollFirstSignal(sessionId);
