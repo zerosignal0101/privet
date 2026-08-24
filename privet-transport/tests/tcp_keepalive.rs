@@ -1,4 +1,4 @@
-//! §10: TCP keepalive + clean close verify.
+//! TCP keepalive + clean close verify.
 
 mod common;
 
