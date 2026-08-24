@@ -1,0 +1,33 @@
+[package]
+name = "privet-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+privet-protocol = { path = "../privet-protocol" }
+
+# transport
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+async-trait.workspace = true
+
+# discovery
+socket2.workspace = true
+
+# utils
+bytes.workspace = true
+thiserror.workspace = true
+
+# trace
+tracing.workspace = true
+
+[dev-dependencies]
+# crypto
+rcgen.workspace = true

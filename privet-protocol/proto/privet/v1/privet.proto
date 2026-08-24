@@ -1,0 +1,200 @@
+syntax = "proto3";
+package privet.v1;
+
+// ===== 发现（P1）=====
+message Beacon {
+    uint32 proto_version = 1;
+    string device_fingerprint = 2;
+    string device_name = 3;
+    string platform = 4;
+    repeated string capabilities = 5;
+    uint32 quic_port = 6;
+    uint32 tcp_port = 7;
+    bytes nonce = 8;
+    uint64 ts_ms = 9;
+}
+
+message Probe {
+    bytes nonce = 1;
+    uint64 ts_ms = 2;
+}
+
+message Goodbye {
+    string device_fingerprint = 1;
+}
+
+// ===== 握手 =====
+message Hello {
+    uint32 proto_version = 1;
+    string device_fingerprint = 2;
+    string device_name = 3;
+    string platform = 4;
+    repeated string capabilities = 5;
+}
+
+message HelloAck {
+    uint32 proto_version = 1;
+    string device_fingerprint = 2;
+    string device_name = 3;
+    string platform = 4;
+    repeated string capabilities = 5;
+    bool ok = 6;
+    string error = 7;
+}
+
+// ===== 配对 =====
+message PairingInit {
+    string device_fingerprint = 1;
+    bytes identity_pubkey = 2;
+    bytes spake2_msg = 3;
+    bytes nonce = 4;
+}
+
+message PairingConfirm {
+    string device_fingerprint = 1;
+    bytes spake2_msg = 2;
+    bytes transcript_sig = 3;
+    bytes nonce = 4;
+}
+
+message PairingResult {
+    bool success = 1;
+    string error = 2;
+    bytes identity_pubkey = 3;
+    bytes transcript_sig = 4;
+}
+
+message PairingResultAck {
+    bytes transcript_hash = 1;
+}
+
+// ===== 传送 =====
+message Segment {
+    uint32 segment_id = 1;
+    uint64 offset = 2;
+    uint64 length = 3;
+    uint32 chunk_count = 4;
+    uint32 chunk_size = 6;
+}
+
+message FileEntry {
+    string file_id = 1;
+    string relative_path = 2;
+    string size = 3;
+    uint64 mtime_ms = 4;
+    string hash_type = 5;
+    string hash_value = 6;
+}
+
+message DirEntry {
+    string relative_path = 1;
+}
+
+message FileSetSummary {
+    string root_name = 1;
+    uint64 file_count = 2;
+    uint64 total_bytes = 3;
+    uint64 dir_count = 4;
+}
+
+message FileSetBatch {
+    string transfer_id = 1;
+    repeated FileEntry files = 2;
+    repeated DirEntry dirs = 3;
+    bool is_last = 4;
+}
+
+message TransferOffer {
+    uint32 proto_version = 1;
+    string transfer_id = 2;
+    FileSetSummary summary = 3;
+    bool resume_supported = 4;
+}
+
+message SegmentManifest {
+    string file_id = 1;
+    uint32 segment_id = 2;
+    string hash_type = 3;
+    repeated string chunk_hash_values = 4;
+    string segment_hash_value = 5;
+}
+
+message ChunkBitmask {
+    string file_id = 1;
+    uint32 segment_id = 2;
+    bytes bitmask = 3;
+}
+
+message TransferAccept {
+    bool accept = 1;
+    string reason = 2;
+    reserved 3;
+    repeated ChunkBitmask resume = 4;
+}
+
+message ChunkHeader {
+    string file_id = 1;
+    uint32 segment_id = 2;
+    uint64 chunk_index = 3;
+    uint64 offset = 4;
+    uint64 length = 5;
+}
+
+message ChunkAck {
+    string file_id = 1;
+    uint32 segment_id = 2;
+    repeated uint64 chunk_indices = 3;
+}
+
+message InlineFile {
+    string file_id = 1;
+    string relative_path = 2;
+    uint64 mtime_ms = 3;
+    string hash_type = 4;
+    string hash_value = 5;
+    bytes data = 6;
+}
+
+// ===== 传送控制 =====
+message Cancel { string transfer_id = 1; string reason = 2; }
+message Pause { string transfer_id = 1; }
+message Resume { string transfer_id = 1; }
+message Heartbeat { uint64 ts_ms = 1; }
+message TransferComplete { string transfer_id = 1; }
+message TransferVerified { string transfer_id = 1; bool ok = 2; string error = 3; }
+message ControlMessage {
+    oneof msg {
+        Cancel cancel = 1;
+        Pause pause = 2;
+        Resume resume = 3;
+        Heartbeat heartbeat = 4;
+        TransferComplete complete = 5;
+        TransferVerified verified = 6;
+    }
+}
+
+// ===== 控制流信封 =====
+message ControlFrame {
+    oneof payload {
+        Hello hello = 1;
+        HelloAck hello_ack = 2;
+        PairingInit pairing_init = 3;
+        PairingConfirm pairing_confirm = 4;
+        PairingResult pairing_result = 5;
+        PairingResultAck pairing_result_ack = 13;
+        TransferOffer transfer_offer = 6;
+        TransferAccept transfer_accept = 7;
+        SegmentManifest segment_manifest = 8;
+        ChunkAck chunk_ack = 9;
+        FileSetBatch file_set_batch = 14;
+        ControlMessage control = 15;
+    }
+}
+
+// ===== 数据流信封 =====
+message DataFrame {
+    oneof payload {
+        ChunkHeader chunk_header = 1;
+        InlineFile inline_file = 2;
+    }
+}

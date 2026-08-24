@@ -1,0 +1,12 @@
+[package]
+name = "privet-transfer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+privet-protocol = { path = "../privet-protocol" }
+privet-crypto = { path = "../privet-crypto" }
+privet-storage = { path = "../privet-storage" }
+privet-transport = { path = "../privet-transport" }
