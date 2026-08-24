@@ -24,7 +24,7 @@ pub fn part_meta_path(
 }
 
 /// 追加 `.part` 到文件名。
-/// §8 test 11: 先验 relative_path 安全性，拒绝 traversal。
+/// 先验 relative_path 安全性，拒绝 traversal。
 pub fn part_path(
     save_dir: &Path,
     transfer_id: &str,
@@ -40,7 +40,7 @@ pub fn part_path(
     Ok(PathBuf::from(s))
 }
 
-/// file 级 + 段骨架（derived from size；segment_hash_value/chunk_hash_values 空）（P5 §3.5）。
+/// file 级 + 段骨架（derived from size；segment_hash_value/chunk_hash_values 空）。
 pub fn build_initial_meta(
     transfer_id: &str,
     file_id: &str,
@@ -87,11 +87,11 @@ fn atomic_write_fsync(path: &Path, data: &[u8]) -> Result<(), StorageError> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    fsync_parent(path)?; // §3.5 rename durability
+    fsync_parent(path)?; // rename durability
     Ok(())
 }
 
-/// §3.5 rename durability: fsync 父目录让 rename 的目录项立即可靠落盘。
+/// rename durability: fsync 父目录让 rename 的目录项立即可靠落盘。
 /// Unix: libc::fsync(dir_fd); Windows: File::sync_data (best-effort)。
 pub(crate) fn fsync_parent(path: &Path) -> Result<(), StorageError> {
     let parent = path.parent().ok_or_else(|| {

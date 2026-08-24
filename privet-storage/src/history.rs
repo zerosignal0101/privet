@@ -86,7 +86,7 @@ pub fn insert_history(conn: &rusqlite::Connection, t: &NewTransfer) -> Result<()
     Ok(())
 }
 
-/// 传送完成原子事务：UPDATE status='completed'+finished_ts + 批量 INSERT transfer_files（P5 §5，测试 7）。
+/// 传送完成原子事务：UPDATE status='completed'+finished_ts + 批量 INSERT transfer_files。
 pub fn complete_history(
     conn: &rusqlite::Connection,
     transfer_id: &str,
@@ -170,7 +170,7 @@ pub fn update_send_counts(
     Ok(())
 }
 
-/// DB 仅指针：标 status='partial'（可续传；sidecar 持实际清单）（P5 §3.5）。
+/// DB 仅指针：标 status='partial'（可续传；sidecar 持实际清单）。
 pub fn mark_partial(conn: &rusqlite::Connection, transfer_id: &str) -> Result<(), StorageError> {
     conn.execute(
         "UPDATE transfer_history SET status='partial' WHERE transfer_id=?1",
@@ -237,7 +237,7 @@ pub fn get_send_intent_row(
     }
 }
 
-/// 孤儿对账：DB partial 但目录无文件 -> 标 failed（P5 §3.5 孤儿对账）。
+/// 孤儿对账：DB partial 但目录无文件 -> 标 failed。
 pub fn mark_failed(
     conn: &rusqlite::Connection,
     transfer_id: &str,
@@ -264,7 +264,7 @@ pub struct HistoryRow {
     pub finished_ts: Option<i64>,
 }
 
-/// 列出历史（peer=Some 仅该 peer；limit 限制行数；按 started_ts DESC, transfer_id DESC）。P5 §3.4。
+/// 列出历史（peer=Some 仅该 peer；limit 限制行数；按 started_ts DESC, transfer_id DESC）。
 pub fn list_history(
     conn: &rusqlite::Connection,
     peer: Option<&str>,

@@ -20,7 +20,7 @@ const MAX_REASONABLE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// 最大合理 chunk 数量（防 bitmask 爆内存）。
 const MAX_REASONABLE_CHUNK_COUNT: usize = 1 << 20;
 
-/// 重建已验证位图（§9：抗畸形 sidecar：bound loop + cap alloc）。
+/// 重建已验证位图（抗畸形 sidecar：bound loop + cap alloc）。
 pub fn rebuild_verified_bitmap(
     save_dir: &Path,
     transfer_id: &str,
@@ -38,7 +38,7 @@ pub fn rebuild_verified_bitmap(
 
     let mut out = Vec::with_capacity(meta.segments.len());
     for seg in &meta.segments {
-        // §9 sanity caps before allocation
+        // sanity caps before allocation
         let chunk_size = seg.chunk_size as u64;
         if chunk_size > MAX_REASONABLE_CHUNK_SIZE {
             return Err(StorageError::Corrupt(format!(
@@ -53,7 +53,7 @@ pub fn rebuild_verified_bitmap(
                 seg.chunk_count
             )));
         }
-        // §9 bound loop by available hashes (防 OOB)
+        // bound loop by available hashes (防 OOB)
         if !seg.chunk_hash_values.is_empty() && seg.chunk_hash_values.len() != chunk_count {
             return Err(StorageError::Corrupt(format!(
                 "chunk_count {} != chunk_hash_values.len {}",

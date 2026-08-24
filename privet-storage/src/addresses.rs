@@ -108,12 +108,12 @@ pub fn inc_fail(
     Ok(())
 }
 
-/// 淘汰：fail_count >= EVICT_FAILS 且陈旧（last_seen_ts < now - EVICT_AGING_SECS）-> 删（P5 §6，测试 6）。
+/// 淘汰：fail_count >= EVICT_FAILS 且陈旧（last_seen_ts < now - EVICT_AGING_SECS）-> 删。
 /// 单次失败不删。EVICT_AGING_SECS 自选（仅陈旧地址才淘汰，防瞬时抖动误删）。
 const EVICT_AGING_SECS: i64 = 86_400 * 30; // 30 天
 
 /// 候选选址/单播探测用：某 device 的近邻地址（**无 success_count>0 过滤**，按 last_seen 倒序）。
-/// 含 beacon 刷新的候选；pinning 兜底安全（§8.6/8.7）。
+/// 含 beacon 刷新的候选；pinning 兜底安全。
 pub fn recent_known(
     conn: &rusqlite::Connection,
     device_fingerprint: &str,

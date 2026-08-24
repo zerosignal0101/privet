@@ -1,4 +1,4 @@
-//! DB 连接与 PRAGMA + 桌面默认路径（P5 §2.1）。
+//! DB 连接与 PRAGMA + 桌面默认路径。
 
 use std::path::{Path, PathBuf};
 
@@ -27,12 +27,12 @@ fn apply_pragmas(conn: &rusqlite::Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// 桌面平台默认 DB 目录（P5 §2.1）。无 fs 副作用（仅读 env，不建目录）。
+/// 桌面平台默认 DB 目录。无 fs 副作用（仅读 env，不建目录）。
 pub fn default_db_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_default().join("privet")
 }
 
-/// 桌面平台默认 DB 路径（P5 §2.1）。建 `privet/` 目录。Android 由调用方传显式路径。
+/// 桌面平台默认 DB 路径。建 `privet/` 目录。Android 由调用方传显式路径。
 pub fn default_db_path() -> Result<PathBuf, StorageError> {
     let dir = default_db_dir();
     std::fs::create_dir_all(&dir)?;

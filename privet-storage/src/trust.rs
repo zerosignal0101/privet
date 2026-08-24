@@ -33,7 +33,7 @@ pub struct TrustRecord {
     pub revocation_reason: Option<String>,
 }
 
-/// 配对成功原子事务：INSERT trust_store + INSERT known_device_addresses 同 tx（P5 §5）。
+/// 配对成功原子事务：INSERT trust_store + INSERT known_device_addresses 同 tx。
 pub fn insert_paired(
     conn: &rusqlite::Connection,
     trust: &PeerTrust,
@@ -81,7 +81,7 @@ pub fn insert_paired(
     }
 }
 
-/// 仅写 trust_store 行（不写占位地址行）；地址由 verified-success 路径单独写（§8.4）。
+/// 仅写 trust_store 行（不写占位地址行）；地址由 verified-success 路径单独写。
 pub fn insert_trust(conn: &rusqlite::Connection, trust: &PeerTrust) -> Result<(), StorageError> {
     conn.execute(
         "INSERT INTO trust_store
@@ -140,7 +140,7 @@ pub fn revoke(
     Ok(())
 }
 
-/// 忘记设备：删 trust_store -> CASCADE 删 addresses；transfer_history.peer_device_fingerprint SET NULL（保留 peer_name）（P5 §6）。
+/// 忘记设备：删 trust_store -> CASCADE 删 addresses；transfer_history.peer_device_fingerprint SET NULL（保留 peer_name）。
 pub fn forget(conn: &rusqlite::Connection, device_fingerprint: &str) -> Result<(), StorageError> {
     conn.execute(
         "DELETE FROM trust_store WHERE device_fingerprint=?1",
@@ -149,7 +149,7 @@ pub fn forget(conn: &rusqlite::Connection, device_fingerprint: &str) -> Result<(
     Ok(())
 }
 
-/// 每次 pinning 通过的已认证连接更新 last_seen + name（P5 §3.2 Q5）。
+/// 每次 pinning 通过的已认证连接更新 last_seen + name。
 pub fn refresh_seen(
     conn: &rusqlite::Connection,
     device_fingerprint: &str,
@@ -163,7 +163,7 @@ pub fn refresh_seen(
     Ok(())
 }
 
-/// 陈旧信任 GC 候选：last_seen_ts < now - stale_days*86400（P5 §6，测试 9）。
+/// 陈旧信任 GC 候选：last_seen_ts < now - stale_days*86400。
 pub fn gc_stale_candidates(
     conn: &rusqlite::Connection,
     now_ts: i64,
@@ -179,7 +179,7 @@ pub fn gc_stale_candidates(
     Ok(out)
 }
 
-/// 列出全部信任记录（Trusted + Revoked；P5 §3.2，CLI list-trusted 用）。
+/// 列出全部信任记录（Trusted + Revoked；CLI list-trusted 用）。
 pub fn list_all(conn: &rusqlite::Connection) -> Result<Vec<TrustRecord>, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT device_fingerprint, peer_spki, peer_device_name, trust_state, share_with_peers,

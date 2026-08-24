@@ -1,6 +1,6 @@
 //! 配对密码学层集成：Identity + SPAKE2 + 转录签名。
 //! (1) 合法配对：双方派生相同 K/tag，互验签名通过；
-//! (2) MITM 双腿 exporter 不同 -> 转录不同 -> 一条腿签名无法在另一条腿验过（P3 §4.4 安全核心）。
+//! (2) MITM 双腿 exporter 不同 -> 转录不同 -> 一条腿签名无法在另一条腿验过
 
 use privet_crypto::gen_nonce;
 use privet_crypto::identity::Identity;

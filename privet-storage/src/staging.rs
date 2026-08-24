@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::constants::{PART_META_SUFFIX, PART_SUFFIX, STAGING_DIR_NAME};
 use crate::error::StorageError;
 
-/// 完成：rename `.part` -> 最终（终态已存在 -> InvalidState；碰撞策略由 P4 解析后传最终路径）+ 删 `.part.meta`（P5 §3.5）。
+/// 完成：rename `.part` -> 最终（终态已存在 -> InvalidState；碰撞策略由 P4 解析后传最终路径）+ 删 `.part.meta`。
 pub fn finalize_part_file(part_path: &Path, final_path: &Path) -> Result<(), StorageError> {
     if final_path.exists() {
         return Err(StorageError::InvalidState(format!(
@@ -22,7 +22,7 @@ pub fn finalize_part_file(part_path: &Path, final_path: &Path) -> Result<(), Sto
         pf.sync_all()?;
     }
     std::fs::rename(part_path, final_path)?;
-    crate::sidecar::fsync_parent(final_path)?; // §3.5 parent dir fsync after rename
+    crate::sidecar::fsync_parent(final_path)?; // parent dir fsync after rename
     let meta = meta_path_for_part(part_path);
     if meta.exists() {
         std::fs::remove_file(&meta)?;
@@ -30,7 +30,7 @@ pub fn finalize_part_file(part_path: &Path, final_path: &Path) -> Result<(), Sto
     Ok(())
 }
 
-/// 取消/丢弃：删 `.part` + `.part.meta`（P5 §3.5；保留已落地文件）。容忍缺失。
+/// 取消/丢弃：删 `.part` + `.part.meta`（保留已落地文件）。容忍缺失。
 pub fn delete_part_and_meta(part_path: &Path) -> Result<(), StorageError> {
     let _ = std::fs::remove_file(part_path);
     let _ = std::fs::remove_file(meta_path_for_part(part_path));
@@ -190,7 +190,7 @@ fn has_any_part(transfer_dir: &Path) -> Result<bool, StorageError> {
     Ok(false)
 }
 
-/// 列出 save_dir 下 direction='receive' 且 status='partial' 的 transfer（§3.5 孤儿对账用）。
+/// 列出 save_dir 下 direction='receive' 且 status='partial' 的 transfer（孤儿对账用）。
 /// SEND 和其他 save_dir 的 RECEIVE 被跳过，避免误标记为 failed。
 fn list_partial_receives(
     conn: &rusqlite::Connection,
