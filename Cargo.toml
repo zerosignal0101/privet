@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["privet-protocol", "privet-transport", "privet-crypto", "privet-storage"]
+members = ["privet-protocol", "privet-transport", "privet-crypto", "privet-storage", "privet-security"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,6 +42,7 @@ socket2 = "0.5"
 # utils
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
+base32 = "0.5"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 time = "0.3"

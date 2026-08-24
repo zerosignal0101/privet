@@ -1,0 +1,37 @@
+[package]
+name = "privet-security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+privet-crypto = { path = "../privet-crypto" }
+privet-protocol = { path = "../privet-protocol" }
+
+# protocol
+prost.workspace = true
+
+# crypto
+ed25519-dalek.workspace = true
+x509-cert.workspace = true
+der.workspace = true
+
+# transport
+async-trait.workspace = true
+tokio.workspace = true
+
+# utils
+base32.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+# trace
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
