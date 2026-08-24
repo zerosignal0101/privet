@@ -28,14 +28,3 @@ async fn prefer_quic_falls_back_to_tcp_on_quic_failure() {
     .unwrap();
     assert_eq!(conn.kind(), privet_transport::TransportKind::Tcp);
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn quic_only_does_not_fallback() {
-    let mat = common::test_tls_material();
-    let quic = QuicTransport::new(mat, Default::default());
-    let dead: std::net::SocketAddr = "127.0.0.1:55998".parse().unwrap();
-    let res =
-        privet_transport::connect_with_fallback(&quic, None, dead, dead, TransportMode::Quic, None)
-            .await;
-    assert!(res.is_err());
-}

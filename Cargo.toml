@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["privet-protocol", "privet-transport", "privet-crypto"]
+members = ["privet-protocol", "privet-transport", "privet-crypto", "privet-storage"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +24,10 @@ zeroize = "1"
 
 # hash
 blake3 = "1"
+
+# storage
+rusqlite = { version = "0.40", features = ["bundled"] }
+dirs = "5"
 
 # transport
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
