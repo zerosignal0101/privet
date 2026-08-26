@@ -13,7 +13,7 @@ privet-protocol = { path = "../privet-protocol" }
 privet-crypto = { path = "../privet-crypto" }
 
 # protocol
-prost = "0.14"
+prost.workspace = true
 
 # storage
 rusqlite.workspace = true

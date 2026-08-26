@@ -58,8 +58,9 @@ async fn client_multiplexes_response_and_event_over_unix_socket() {
     server.await.unwrap();
 }
 
-#[test]
-fn live_socket_prevents_second_daemon() {
+// LocalListener::bind uses tokio::net::UnixListener, which needs a reactor.
+#[tokio::test]
+async fn live_socket_prevents_second_daemon() {
     let temp = tempfile::tempdir().unwrap();
     let endpoint = LocalEndpoint::new(temp.path().join("privet.sock"));
     let _listener = LocalListener::bind(endpoint.clone()).unwrap();
@@ -67,8 +68,8 @@ fn live_socket_prevents_second_daemon() {
     assert!(error.to_string().contains("already listening"));
 }
 
-#[test]
-fn stale_socket_path_is_recovered() {
+#[tokio::test]
+async fn stale_socket_path_is_recovered() {
     let temp = tempfile::tempdir().unwrap();
     let endpoint = LocalEndpoint::new(temp.path().join("privet.sock"));
     std::fs::write(endpoint.path(), b"stale").unwrap();

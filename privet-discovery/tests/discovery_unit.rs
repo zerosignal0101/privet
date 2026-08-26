@@ -307,7 +307,7 @@ fn probe_src_is_local_subnet_matches_local_and_rejects_foreign() {
 async fn handle_inbound_replies_to_probe_in_always_mode() {
     let ifaces: Vec<_> = enumerate_interfaces()
         .into_iter()
-        .filter(|(ip, _, _, _)| ip.is_ipv4())
+        .filter(|(ip, prefix, _, _)| ip.is_ipv4() && *prefix < 32)
         .collect();
     if ifaces.is_empty() {
         return;
@@ -321,6 +321,11 @@ async fn handle_inbound_replies_to_probe_in_always_mode() {
         }
         _ => local_ip,
     };
+    // Host routes (/32, e.g. WSL2's 10.255.255.254 alias on lo) or an interface
+    // assigned the subnet broadcast address yield no usable peer; skip then.
+    if !probe_src_is_local_subnet(peer_ip, &ifaces) {
+        return;
+    }
     let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default()); // Always
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());
