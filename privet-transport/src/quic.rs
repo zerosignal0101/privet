@@ -71,6 +71,12 @@ impl QuicTransport {
 pub struct QuicStreamPrivet {
     send: Option<SendStream>,
     recv: Option<RecvStream>,
+    // Bytes read from the RecvStream but not yet returned by recv_exact. Buffering
+    // here (instead of handing a fresh buffer straight to quinn's read_exact) makes
+    // a cancelled recv_exact loss-free: quinn's `read` only consumes bytes once it
+    // returns, so whatever made it into read_buf survives the drop and the next call
+    // continues from there.
+    read_buf: BytesMut,
 }
 
 #[async_trait]
@@ -89,9 +95,14 @@ impl Stream for QuicStreamPrivet {
             .recv
             .as_mut()
             .ok_or(TransportError::Closed("no recv half".into()))?;
-        let mut buf = BytesMut::zeroed(n);
-        r.read_exact(&mut buf).await?;
-        Ok(buf)
+        while self.read_buf.len() < n {
+            let mut chunk = [0u8; 8192];
+            match r.read(&mut chunk).await? {
+                Some(cnt) => self.read_buf.extend_from_slice(&chunk[..cnt]),
+                None => return Err(TransportError::Closed("stream ended".into())),
+            }
+        }
+        Ok(self.read_buf.split_to(n))
     }
 
     async fn reset(self: Box<Self>, code: u32) {
@@ -123,6 +134,7 @@ impl Connection for QuicConnectionPrivet {
         Ok(Box::new(QuicStreamPrivet {
             send: Some(send),
             recv: Some(recv),
+            read_buf: BytesMut::new(),
         }))
     }
 
@@ -131,6 +143,7 @@ impl Connection for QuicConnectionPrivet {
         Ok(Box::new(QuicStreamPrivet {
             send: Some(send),
             recv: Some(recv),
+            read_buf: BytesMut::new(),
         }))
     }
 
@@ -139,6 +152,7 @@ impl Connection for QuicConnectionPrivet {
         Ok(Box::new(QuicStreamPrivet {
             send: None,
             recv: Some(recv),
+            read_buf: BytesMut::new(),
         }))
     }
 
@@ -147,6 +161,7 @@ impl Connection for QuicConnectionPrivet {
         Ok(Box::new(QuicStreamPrivet {
             send: Some(send),
             recv: None,
+            read_buf: BytesMut::new(),
         }))
     }
 
