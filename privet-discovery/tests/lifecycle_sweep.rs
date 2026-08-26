@@ -1,6 +1,6 @@
 //! sweep 任务：30s 周期；Live -> Stale(180s) -> Lost(300s)。
 
-use privet_discovery::config::DiscoveryConfig;
+use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use privet_discovery::peer::{PeerEvent, PeerState, PeerStoreEvent};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ async fn sweep_task_promotes_stale_then_lost() {
     let c = clock.clone();
     let eng = Arc::new(DiscoveryEngine::with_now(
         info(),
-        DiscoveryConfig::default(),
+        DiscoveryConfigPrivet::default(),
         Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed)),
     ));
     // 造一个 Live peer（构造 beacon 字节 inject）

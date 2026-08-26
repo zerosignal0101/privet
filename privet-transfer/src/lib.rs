@@ -34,3 +34,6 @@ pub use state::{PausedReason, TransferFailed, TransferState};
 pub use prepare::{prepare_dir, prepare_dir_streaming, prepare_single_file, PreparedSet};
 pub use channel::{ControlChannel, DataChannel};
 pub use transport_adapter::{StreamControlChannel, StreamDataChannel};
+pub use part_store::FsPartStore;
+pub use sender::{run_sender, ChunkReader, MappedChunkReader, SenderInputs};
+pub use receiver::{run_receiver, ReceiverInputs};

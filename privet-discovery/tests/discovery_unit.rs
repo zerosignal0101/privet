@@ -82,7 +82,7 @@ fn sweep_skips_fresh_live_peer() {
 }
 
 // now_fn 时钟缝：任务用注入时钟，非 SystemTime。
-use privet_discovery::config::DiscoveryConfig;
+use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -104,7 +104,7 @@ fn now_fn_is_injected() {
     let c = clock.clone();
     let eng = DiscoveryEngine::with_now(
         info(),
-        DiscoveryConfig::default(),
+        DiscoveryConfigPrivet::default(),
         Arc::new(move || c.load(Ordering::Relaxed)),
     );
     assert_eq!(eng.now_ms(), 1_700_000_000_000);
@@ -118,7 +118,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 #[test]
 fn should_announce_window_expiry() {
-    let cfg = DiscoveryConfig {
+    let cfg = DiscoveryConfigPrivet {
         mode: DiscoverabilityMode::Window,
         window_secs: 600,
         ..Default::default()
@@ -134,7 +134,7 @@ fn should_announce_window_expiry() {
 fn should_announce_modes() {
     let eng = DiscoveryEngine::new(
         info(),
-        DiscoveryConfig {
+        DiscoveryConfigPrivet {
             mode: DiscoverabilityMode::Always,
             ..Default::default()
         },
@@ -143,7 +143,7 @@ fn should_announce_modes() {
 
     let eng2 = DiscoveryEngine::new(
         info(),
-        DiscoveryConfig {
+        DiscoveryConfigPrivet {
             mode: DiscoverabilityMode::TrustedOnly,
             ..Default::default()
         },
@@ -153,7 +153,7 @@ fn should_announce_modes() {
 
 #[test]
 fn broadcast_targets_includes_lan_fallback() {
-    let eng = DiscoveryEngine::new(info(), DiscoveryConfig::default());
+    let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default());
     let ts = eng.broadcast_targets();
     assert!(
         ts.iter()
@@ -170,7 +170,7 @@ use std::net::SocketAddr;
 
 #[tokio::test]
 async fn reply_to_probe_sends_beacon_to_prober_discovery_port() {
-    let eng = DiscoveryEngine::new(info(), DiscoveryConfig::default());
+    let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default());
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());
     let prober = "10.0.0.9:54321".parse::<SocketAddr>().unwrap();
@@ -199,7 +199,7 @@ use privet_discovery::beacon::decode_probe_tagged;
 
 #[tokio::test]
 async fn refresh_sends_probe_to_all_broadcast_targets() {
-    let cfg = DiscoveryConfig {
+    let cfg = DiscoveryConfigPrivet {
         active_scan: true,
         ..Default::default()
     };
@@ -227,7 +227,7 @@ async fn refresh_sends_probe_to_all_broadcast_targets() {
 
 #[tokio::test]
 async fn refresh_inactive_scan_sends_nothing() {
-    let cfg = DiscoveryConfig {
+    let cfg = DiscoveryConfigPrivet {
         active_scan: false,
         ..Default::default()
     };
@@ -242,7 +242,7 @@ async fn refresh_inactive_scan_sends_nothing() {
 
 #[test]
 fn on_mdns_resolved_feeds_store_as_beacon() {
-    let eng = DiscoveryEngine::new(info(), DiscoveryConfig::default());
+    let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default());
     let v = BeaconView {
         device_name: "alice".into(),
         platform: "linux".into(),
@@ -334,7 +334,7 @@ async fn handle_inbound_replies_to_probe_in_always_mode() {
         }
         _ => local_ip,
     };
-    let eng = DiscoveryEngine::new(info(), DiscoveryConfig::default()); // Always
+    let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default()); // Always
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());
     let probe = encode_probe_tagged(&Probe {
@@ -368,7 +368,7 @@ async fn handle_inbound_suppresses_reply_in_trusted_only() {
         }
         _ => local_ip,
     };
-    let cfg = DiscoveryConfig {
+    let cfg = DiscoveryConfigPrivet {
         mode: DiscoverabilityMode::TrustedOnly,
         ..Default::default()
     };
@@ -399,7 +399,7 @@ async fn handle_inbound_suppresses_reply_for_non_local_src() {
     if probe_src_is_local_subnet(non_local, &ifaces) {
         return; // 罕见的跨网络环境，跳过
     }
-    let eng = DiscoveryEngine::new(info(), DiscoveryConfig::default()); // Always
+    let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default()); // Always
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());
     let probe = encode_probe_tagged(&Probe {
@@ -417,7 +417,7 @@ async fn handle_inbound_suppresses_reply_for_non_local_src() {
 
 #[tokio::test]
 async fn handle_inbound_does_not_reply_to_beacon() {
-    let eng = DiscoveryEngine::new(info(), DiscoveryConfig::default());
+    let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default());
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());
     let beacon = encode_beacon_tagged(&Beacon {

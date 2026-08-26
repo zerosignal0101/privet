@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use privet_protocol::{Beacon, Goodbye, Probe};
 
-use crate::config::{DiscoverabilityMode, DiscoveryConfig};
+use crate::config::{DiscoverabilityMode, DiscoveryConfigPrivet};
 use crate::peer::{PeerEvent, PeerRecord, PeerStore, PeerStoreEvent};
 use crate::udp::{handle_incoming_datagram, NonceCache, Outgoing, RateLimiter, UdpBeacon};
 
@@ -26,7 +26,7 @@ pub struct LocalDeviceInfo {
 
 pub struct DiscoveryEngine {
     info: LocalDeviceInfo,
-    config: DiscoveryConfig,
+    config: DiscoveryConfigPrivet,
     store: Arc<Mutex<PeerStore>>,
     nonce: Arc<Mutex<NonceCache>>,
     rl: Arc<Mutex<RateLimiter>>,
@@ -54,7 +54,7 @@ pub(crate) struct MdnsHandles {
 }
 
 impl DiscoveryEngine {
-    pub fn new(info: LocalDeviceInfo, config: DiscoveryConfig) -> Self {
+    pub fn new(info: LocalDeviceInfo, config: DiscoveryConfigPrivet) -> Self {
         Self::with_now(
             info,
             config,
@@ -68,7 +68,7 @@ impl DiscoveryEngine {
     }
     pub fn with_now(
         info: LocalDeviceInfo,
-        config: DiscoveryConfig,
+        config: DiscoveryConfigPrivet,
         now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         let (cancel, _) = watch::channel(false);

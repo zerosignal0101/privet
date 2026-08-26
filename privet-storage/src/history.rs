@@ -179,21 +179,6 @@ pub fn mark_partial(conn: &rusqlite::Connection, transfer_id: &str) -> Result<()
     Ok(())
 }
 
-// ===== 续传意图存储：send_intent TEXT 列 —— 不透明 blob，core 层 serde_json ====
-
-/// 持久化发送意图 blob（调于 send 发起时）。
-pub fn set_send_intent(
-    conn: &rusqlite::Connection,
-    transfer_id: &str,
-    blob: &str,
-) -> Result<(), StorageError> {
-    conn.execute(
-        "UPDATE transfer_history SET send_intent=?1 WHERE transfer_id=?2",
-        rusqlite::params![blob, transfer_id],
-    )?;
-    Ok(())
-}
-
 /// 续传意图行（含原始 blob，由 core 层解析）。
 pub struct SendIntentRow {
     pub transfer_id: String,
@@ -494,64 +479,6 @@ mod tests {
             .unwrap();
         assert_eq!(s, "failed");
         assert_eq!(e, "no part files on disk");
-    }
-
-    #[test]
-    fn send_intent_round_trip() {
-        let conn = db();
-        // FK 要求: trust_store 行必须存在
-        conn.execute(
-            "INSERT INTO trust_store(device_fingerprint,peer_spki,peer_device_name,first_paired_ts,last_seen_ts) VALUES('d',x'00','n',1,1)",
-            [],
-        )
-        .unwrap();
-        insert_history(
-            &conn,
-            &NewTransfer {
-                transfer_id: "t1",
-                direction: TransferDirection::Send,
-                peer_device_fingerprint: Some("d"),
-                peer_name: Some("p"),
-                root_name: None,
-                file_count: 2,
-                total_bytes: 100,
-                status: TransferStatus::Partial,
-                started_ts: 1,
-                save_dir: None,
-                send_intent: "{}"
-            },
-        )
-        .unwrap();
-        let blob = r#"{"paths":["/a","/b"],"chunk_size":1048576,"segment_max_chunks":1024,"peer_target":{"DeviceId":"d"}}"#;
-        set_send_intent(&conn, "t1", blob).unwrap();
-        let row = get_send_intent_row(&conn, "t1")
-            .unwrap()
-            .expect("row exists");
-        assert_eq!(row.transfer_id, "t1");
-        assert_eq!(row.direction, "send");
-        assert_eq!(row.status, "partial");
-        assert_eq!(row.send_intent.as_deref(), Some(blob));
-        // 不存在的 tid 返回 None
-        assert!(get_send_intent_row(&conn, "ghost").unwrap().is_none());
-    }
-
-    #[test]
-    fn migration_v2_adds_send_intent_column() {
-        let conn = crate::db::open_in_memory().unwrap();
-        crate::migration::run_migrations(&conn, crate::migration::MIGRATIONS).unwrap();
-        // send_intent 列存在（PRAGMA table_info 反映 ALTER TABLE 后结果）
-        let mut stmt = conn
-            .prepare("SELECT name FROM pragma_table_info('transfer_history')")
-            .unwrap();
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert!(
-            cols.contains(&"send_intent".to_string()),
-            "v2 missing send_intent column: {cols:?}"
-        );
     }
 
     #[test]

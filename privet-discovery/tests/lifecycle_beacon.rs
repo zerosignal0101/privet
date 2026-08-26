@@ -1,7 +1,7 @@
 //! beacon 任务时序：立即 + 每 60s。tokio::time::pause 推进虚拟时钟。
 
 use privet_discovery::beacon::message_tag;
-use privet_discovery::config::DiscoveryConfig;
+use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::constants::BEACON_INTERVAL;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use privet_discovery::inject::CapturedSink;
@@ -21,7 +21,7 @@ fn info() -> LocalDeviceInfo {
 
 #[tokio::test(start_paused = true)]
 async fn beacon_task_sends_immediate_then_periodic() {
-    let eng = Arc::new(DiscoveryEngine::new(info(), DiscoveryConfig::default()));
+    let eng = Arc::new(DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default()));
     eng.set_start_ms_for_test(0);
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());

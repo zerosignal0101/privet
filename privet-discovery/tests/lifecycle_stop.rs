@@ -1,7 +1,7 @@
 //! stop：广播 Goodbye + 取消并 join 所有任务 + 关 mDNS。
 
 use privet_discovery::beacon::message_tag;
-use privet_discovery::config::DiscoveryConfig;
+use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use privet_discovery::inject::CapturedSink;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ fn info() -> LocalDeviceInfo {
 
 #[tokio::test(start_paused = true)]
 async fn stop_sends_goodbye_and_joins_tasks() {
-    let eng = Arc::new(DiscoveryEngine::new(info(), DiscoveryConfig::default()));
+    let eng = Arc::new(DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default()));
     eng.set_start_ms_for_test(0);
     let sink = Arc::new(CapturedSink::new());
     eng.set_outgoing(sink.clone());

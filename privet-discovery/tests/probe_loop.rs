@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use privet_discovery::config::DiscoveryConfig;
+use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use privet_discovery::udp::Outgoing;
 
@@ -35,7 +35,7 @@ fn info() -> LocalDeviceInfo {
 
 #[tokio::test]
 async fn spawn_probe_task_sends_repeatedly() {
-    let cfg = DiscoveryConfig {
+    let cfg = DiscoveryConfigPrivet {
         probe_interval: std::time::Duration::from_millis(40),
         ..Default::default()
     };
@@ -67,7 +67,7 @@ async fn spawn_probe_task_sends_repeatedly() {
 async fn send_probe_to_unicasts_tagged_probe() {
     let engine = Arc::new(DiscoveryEngine::with_now(
         info(),
-        DiscoveryConfig::default(),
+        DiscoveryConfigPrivet::default(),
         Arc::new(|| 1_700_000_000_000u64),
     ));
     let sink = CapturedSink::default();

@@ -41,7 +41,7 @@ impl Default for KnownDevicesConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct DiscoveryConfig {
+pub struct DiscoveryConfigPrivet {
     pub mode: DiscoverabilityMode,
     pub window_secs: u64,
     pub beacon_interval: Duration,
@@ -54,7 +54,7 @@ pub struct DiscoveryConfig {
     pub known: KnownDevicesConfig,
 }
 
-impl Default for DiscoveryConfig {
+impl Default for DiscoveryConfigPrivet {
     fn default() -> Self {
         Self {
             mode: DiscoverabilityMode::Always,

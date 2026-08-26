@@ -1,0 +1,42 @@
+[package]
+name = "privet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+privet-protocol = { path = "../privet-protocol" }
+privet-crypto = { path = "../privet-crypto" }
+privet-storage = { path = "../privet-storage" }
+privet-transport = { path = "../privet-transport" }
+privet-discovery = { path = "../privet-discovery" }
+privet-security = { path = "../privet-security" }
+privet-transfer = { path = "../privet-transfer" }
+
+# protocol
+prost.workspace = true
+
+# transport
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# storage
+rusqlite = { workspace = true }
+
+# utils
+bytes = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+
+# trace
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
