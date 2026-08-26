@@ -1,0 +1,221 @@
+//! 对等体状态机（表驱动）+ PeerRecord + CandidateAddress + PeerStore。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerState {
+    Absent,
+    Seen,
+    Resolved,
+    Live,
+    Stale,
+    Lost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerEvent {
+    BeaconRecv,
+    AddrResolved,
+    ConnectOk,
+    ConnectFail,
+    StaleTimeout,
+    LostTimeout,
+    GoodbyeBeacon,
+    ExplicitRemove,
+    KnownAddrConnectOk,
+    KnownAddrConnectFail,
+}
+
+/// 状态迁移。返回 None 表示该 (state,event) 无定义迁移（保持原态或忽略）。
+pub fn transition(state: PeerState, event: PeerEvent) -> Option<PeerState> {
+    use PeerEvent::*;
+    use PeerState::*;
+    Some(match (state, event) {
+        (Absent, BeaconRecv) => Seen,
+        (Absent, KnownAddrConnectOk) => Live,
+        (Seen, AddrResolved) => Resolved,
+        (Resolved, ConnectOk) => Live,
+        (Resolved, ConnectFail) => Resolved,
+        (Live, StaleTimeout) => Stale,
+        (Live, GoodbyeBeacon) => Absent,
+        (Live, ExplicitRemove) => Absent,
+        (Stale, BeaconRecv) => Live,
+        (Stale, KnownAddrConnectOk) => Live,
+        (Stale, LostTimeout) => Lost,
+        (Lost, BeaconRecv) => Live,
+        (Lost, KnownAddrConnectOk) => Live,
+        (Lost, ExplicitRemove) => Absent,
+        _ => return None,
+    })
+}
+
+// ===== PeerRecord + CandidateAddress + PeerStore（Task 5）=====
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+
+use crate::beacon::BeaconView;
+
+/// 一个候选地址：`(ip, quic_port, tcp_port, heard_iface, last_seen)`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateAddress {
+    pub ip: IpAddr,
+    pub quic_port: u16,
+    pub tcp_port: u16,
+    pub heard_iface: Option<IpAddr>,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerRecord {
+    pub device_fingerprint: String,
+    pub state: PeerState,
+    pub candidates: Vec<CandidateAddress>,
+    pub device_name: String,
+    pub last_beacon_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerStoreEvent {
+    Discovered(String), // 新 peer 出现
+    StateChanged(String, PeerState),
+    Lost(String),
+}
+
+pub struct PeerStore {
+    peers: HashMap<String, PeerRecord>,
+    events: Vec<PeerStoreEvent>,
+}
+
+impl PeerStore {
+    pub fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+            events: Vec::new(),
+        }
+    }
+
+    pub fn handle_beacon(
+        &mut self,
+        v: &BeaconView,
+        src: IpAddr,
+        heard_iface: Option<IpAddr>,
+        now_ms: u64,
+    ) {
+        let cand = CandidateAddress {
+            ip: src,
+            quic_port: v.quic_port,
+            tcp_port: v.tcp_port,
+            heard_iface,
+            last_seen_ms: now_ms,
+        };
+        match self.peers.get_mut(&v.device_fingerprint) {
+            Some(rec) => {
+                rec.device_name = v.device_name.clone();
+                rec.last_beacon_ms = now_ms;
+                if let Some(c) = rec.candidates.iter_mut().find(|c| c.ip == src) {
+                    c.last_seen_ms = now_ms;
+                    c.quic_port = v.quic_port;
+                    c.tcp_port = v.tcp_port;
+                } else {
+                    rec.candidates.push(cand);
+                }
+                // 任何 beacon_recv 推进状态机（Stale->Live 等）
+                let prev = rec.state;
+                if let Some(ns) = transition(prev, PeerEvent::BeaconRecv) {
+                    rec.state = ns;
+                    if ns != prev {
+                        self.events
+                            .push(PeerStoreEvent::StateChanged(rec.device_fingerprint.clone(), ns));
+                    }
+                }
+            }
+            None => {
+                let rec = PeerRecord {
+                    device_fingerprint: v.device_fingerprint.clone(),
+                    state: PeerState::Seen,
+                    candidates: vec![cand],
+                    device_name: v.device_name.clone(),
+                    last_beacon_ms: now_ms,
+                };
+                self.events
+                    .push(PeerStoreEvent::Discovered(rec.device_fingerprint.clone()));
+                self.peers.insert(v.device_fingerprint.clone(), rec);
+            }
+        }
+    }
+
+    pub fn handle_goodbye(&mut self, fingerprint: &str) {
+        if let Some(rec) = self.peers.get_mut(fingerprint) {
+            let prev = rec.state;
+            if let Some(ns) = transition(prev, PeerEvent::GoodbyeBeacon) {
+                rec.state = ns;
+                self.events
+                    .push(PeerStoreEvent::StateChanged(rec.device_fingerprint.clone(), ns));
+            }
+        }
+    }
+
+    pub fn transition(&mut self, fingerprint: &str, event: PeerEvent) {
+        if let Some(rec) = self.peers.get_mut(fingerprint) {
+            let prev = rec.state;
+            if let Some(ns) = transition(prev, event) {
+                rec.state = ns;
+                if ns != prev {
+                    self.events
+                        .push(PeerStoreEvent::StateChanged(rec.device_fingerprint.clone(), ns));
+                }
+                if ns == PeerState::Lost {
+                    self.events
+                        .push(PeerStoreEvent::Lost(rec.device_fingerprint.clone()));
+                }
+            }
+        }
+    }
+
+    /// 周期扫描：Live 超 stale -> Stale；Stale 超 lost -> Lost。
+    /// 纯逻辑（无 I/O）；由 sweep 任务按 SWEEP_INTERVAL 调用。
+    pub fn sweep(&mut self, now_ms: u64, stale: std::time::Duration, lost: std::time::Duration) {
+        let stale_ms = stale.as_millis() as u64;
+        let lost_ms = lost.as_millis() as u64;
+        let fps: Vec<String> = self.peers.keys().cloned().collect();
+        for fp in fps {
+            let rec = match self.peers.get(&fp) {
+                Some(r) => r,
+                None => continue,
+            };
+            let state = rec.state;
+            if state == PeerState::Absent || state == PeerState::Lost {
+                continue;
+            }
+            let last = rec.last_beacon_ms;
+            if now_ms < last {
+                continue; // 时钟回退，保守跳过
+            }
+            let age = now_ms - last;
+            if state == PeerState::Live && age > stale_ms {
+                self.transition(&fp, PeerEvent::StaleTimeout);
+            }
+            // 同一轮若已越 lost 阈值（Live 经 Stale 后），继续推 Lost。
+            if let Some(r) = self.peers.get(&fp) {
+                if r.state == PeerState::Stale && age > lost_ms {
+                    self.transition(&fp, PeerEvent::LostTimeout);
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, fingerprint: &str) -> Option<&PeerRecord> {
+        self.peers.get(fingerprint)
+    }
+    pub fn snapshot(&self) -> Vec<&PeerRecord> {
+        self.peers.values().collect()
+    }
+    pub fn drain_events(&mut self) -> Vec<PeerStoreEvent> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+impl Default for PeerStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}

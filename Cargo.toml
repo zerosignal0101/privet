@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["privet-protocol", "privet-transport", "privet-crypto", "privet-storage", "privet-security"]
+members = ["privet-protocol", "privet-transport", "privet-crypto", "privet-storage", "privet-security", "privet-discovery"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,6 +37,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 async-trait = "0.1"
 
 # discovery
+mdns-sd = "0.20"
+if-addrs = "0.15"
+default-net = "0.22"
 socket2 = "0.5"
 
 # utils

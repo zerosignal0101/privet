@@ -1,5 +1,5 @@
 [package]
-name = "privet-security"
+name = "privet-discovery"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,21 +9,22 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-privet-crypto = { path = "../privet-crypto" }
 privet-protocol = { path = "../privet-protocol" }
 
-# crypto
-ed25519-dalek.workspace = true
-x509-cert.workspace = true
-der.workspace = true
+# protocol
+prost.workspace = true
 
 # transport
 async-trait.workspace = true
 tokio.workspace = true
 
+# discovery
+mdns-sd.workspace = true
+if-addrs.workspace = true
+default-net.workspace = true
+socket2.workspace = true
+
 # utils
-base32.workspace = true
-uuid.workspace = true
 thiserror.workspace = true
 
 # trace
@@ -32,3 +33,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
