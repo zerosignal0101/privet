@@ -1,4 +1,3 @@
-//! 周期 Probe 任务：注入时钟 + 捕获 sink，断言持续发 Probe。
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -8,7 +7,6 @@ use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use privet_discovery::udp::Outgoing;
 
-/// 捕获对外发送的字节。
 #[derive(Default, Clone)]
 struct CapturedSink {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -52,7 +50,6 @@ async fn spawn_probe_task_sends_repeatedly() {
     tokio::time::sleep(std::time::Duration::from_millis(110)).await;
     engine.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
-    // 110ms / 40ms 间隔 -> 至少 2 帧 Probe（tag 首字节 = 2）。
     let probes = sink
         .sent
         .lock()

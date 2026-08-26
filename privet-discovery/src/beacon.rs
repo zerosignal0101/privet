@@ -1,4 +1,3 @@
-//! Beacon/Probe/Goodbye 编解码 + 校验。
 
 use std::time::Duration;
 
@@ -8,12 +7,10 @@ use prost::Message;
 use crate::constants::{BEACON_TTL};
 use crate::error::{DiscoveryError, Result};
 
-/// 消息类型标签（UDP 数据报首字节，discriminator）。
 const TAG_BEACON: u8 = 1;
 const TAG_PROBE: u8 = 2;
 const TAG_GOODBYE: u8 = 3;
 
-/// 首字节消息标签（discriminator）；供 recv 任务判别 Probe 后回 beacon。
 pub fn message_tag(bytes: &[u8]) -> Option<u8> {
     bytes.first().copied()
 }
@@ -81,9 +78,7 @@ pub fn decode_goodbye_tagged(bytes: &[u8]) -> Result<Goodbye> {
     Goodbye::decode(&bytes[1..]).map_err(DiscoveryError::Decode)
 }
 
-/// 校验 beacon：device_fingerprint 须为 64 hex（32 字节）；ts_ms 须在 BEACON_TTL 内（防重放）。
 pub fn validate_beacon(b: &Beacon, now_ms: u64) -> Result<()> {
-    // device_fingerprint = 32 字节的 hex = 2*32 字符。
     if b.device_fingerprint.len() != 2 * 32
         || !b.device_fingerprint.chars().all(|c| c.is_ascii_hexdigit())
     {
@@ -99,14 +94,12 @@ pub fn validate_beacon(b: &Beacon, now_ms: u64) -> Result<()> {
     if now_ms > b.ts_ms && now_ms - b.ts_ms > BEACON_TTL.as_millis() as u64 {
         return Err(DiscoveryError::BeaconExpired);
     }
-    // ts 在未来过远亦拒（防时钟游戏）。
     if b.ts_ms > now_ms && b.ts_ms - now_ms > BEACON_TTL.as_millis() as u64 {
         return Err(DiscoveryError::BeaconExpired);
     }
     Ok(())
 }
 
-/// 校验后的解析视图（避免重复解码）。
 #[derive(Debug, Clone, Default)]
 pub struct BeaconView {
     pub device_name: String,
@@ -180,7 +173,6 @@ mod tests {
     #[test]
     fn validate_rejects_expired_beacon() {
         let b = sample_beacon(1_700_000_000_000);
-        // 31s 后 -> 过期（>30s）
         assert!(validate_beacon(&b, 1_700_000_000_000 + 31_000).is_err());
     }
 

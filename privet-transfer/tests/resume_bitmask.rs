@@ -1,5 +1,4 @@
 //! resume bitmask built from existing .part + sidecar is non-empty.
-//! 验证 receiver 能从 staging 目录的已有文件构建续传位图。
 
 use privet_storage::sidecar::{
     build_initial_meta, part_meta_path, part_path, write_part_meta_initial,

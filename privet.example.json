@@ -1,0 +1,21 @@
+{
+  "device_name": "privet-device",
+  "data_dir": "./.privet-data",
+  "save_dir": "./received",
+  "quic_port": 47808,
+  "tcp_port": 47810,
+  "discovery_port": 47809,
+  "accept_all_trusted": false,
+  "collision_policy": "rename",
+  "pairing": {
+    "code_validity_secs": 600,
+    "max_code_attempts": 5,
+    "pairing_concurrency_per_ip": 1,
+    "max_pairing_attempts_per_min": 5,
+    "spake2_group": "edwards25519",
+    "pairing_binding_label": "privet-pairing-binding",
+    "pairing_ack_timeout_secs": 30,
+    "pairing_max_retries": 3,
+    "identity_gc_stale_days": 180
+  }
+}

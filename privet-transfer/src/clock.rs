@@ -1,13 +1,10 @@
-//! 可注入时钟（与 privet-security::code::Now 同形；不跨 crate 复用以免反向依赖）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 毫秒时钟（now_ms）。
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
-/// 系统时钟。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 impl Clock for SystemClock {
@@ -19,7 +16,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// 可设时钟（测过期/RTO/ack-timeout）。
 #[derive(Debug, Default)]
 pub struct MutableClock(AtomicU64);
 impl MutableClock {

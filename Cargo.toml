@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "privet-protocol", "privet-transport", "privet-transfer",
     "privet-crypto", "privet-storage", "privet-security", "privet-discovery",
-    "privet-core"
+    "privet-core", "privet-ipc", "privet-daemon"
 ]
 
 [workspace.package]

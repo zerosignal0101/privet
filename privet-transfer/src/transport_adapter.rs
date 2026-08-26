@@ -1,5 +1,3 @@
-//! Stream 适配器：把 privet_transport::Stream（字节流）包成 ControlChannel/DataChannel（帧级）。
-//! 真实 QUIC/TCP e2e（QuicTransport/TcpTransport）推迟到 privet-core。
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -51,9 +49,6 @@ impl crate::DataChannel for StreamDataChannel {
 
 fn map_te(e: privet_transport::TransportError) -> TransferError {
     use privet_transport::TransportError as TE;
-    // 用 ?e（Debug）记录完整错误链，暴露 quinn 内层 ConnectionError
-    // （TimedOut / ApplicationClosed / Reset / LocallyClosed 等），诊断连接为何死亡。
-    // 可重试（连接/流死亡）-> TransportLost；不可重试（帧解析错等）-> Transport。
     let resumable = matches!(
         &e,
         TE::Closed(_) | TE::Quic(_) | TE::QuicRead(_) | TE::QuicReadExact(_) | TE::QuicWrite(_)

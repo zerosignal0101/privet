@@ -1,9 +1,7 @@
-//! 连接认证（已配对免码）+ 失败关闭告警 + 撤销静默拒。
 use crate::cert::{conn_auth_decision, pin, ConnAuthAction};
 use crate::trust::{TrustState, TrustStore};
 use crate::PairingError;
 
-/// 决策入口：对端 SPKI + device_fingerprint -> 动作。
 pub fn conn_auth(
     peer_spki: &[u8],
     peer_device_fingerprint: &str,
@@ -13,7 +11,6 @@ pub fn conn_auth(
     Ok(conn_auth_decision(d))
 }
 
-/// 失败关闭告警载体（不含私钥；SPKI 为公钥可含）。
 #[derive(Debug, Clone)]
 pub struct KeyMismatchAlert {
     pub device_fingerprint: String,
@@ -22,7 +19,6 @@ pub struct KeyMismatchAlert {
     pub stored_spki: Vec<u8>,
 }
 
-/// 构造密钥不符告警（拒绝 + 状态不动 + 告警）。
 pub fn build_alert(
     peer_spki: &[u8],
     peer_device_fingerprint: &str,

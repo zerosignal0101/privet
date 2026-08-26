@@ -1,4 +1,3 @@
-//! PreferQuic 降级测试。
 
 mod common;
 

@@ -1,6 +1,3 @@
-//! Receiver 状态机：
-//! accept(+resume 位图) -> manifest-store -> chunk 到货三态 -> pwrite .part -> 段根/整文件验 -> 原子落地 -> TransferVerified。
-//! 内联：直接验整文件 hash_value -> 落地终态（无 .part）。
 
 use std::collections::HashMap;
 
@@ -19,43 +16,32 @@ use crate::manifest_store::{ArrivalVerdict, PendingChunk, ReceiverManifestStore}
 use crate::part_store::{FinalizeOutcome, PartStore};
 use crate::state::{TransferFailed, TransferState};
 
-/// 接收方输入（注入）。
 pub struct ReceiverInputs {
     pub control: Box<dyn crate::ControlChannel>,
-    /// 数据流池（≥1）。单流 = vec![...]。
     pub data: Vec<Box<dyn crate::DataChannel>>,
     pub store: Box<dyn PartStore>,
     pub events: Box<dyn TransferEventSink>,
     pub config: TransferEngineConfig,
-    /// 接受策略：AutoAccept 或 Resolver。
     pub accept_policy: crate::control::AcceptPolicy,
-    /// 传输注册表：接收时 register，终态 unregister。
     pub registry: Option<std::sync::Arc<crate::control::TransferRegistry>>,
 }
 
-/// 单文件接收状态。
 #[derive(Default)]
 struct FileRecvState {
     entry: Option<FileEntry>,
     inline_done: bool,
-    /// segment_id -> verified bitmask。
     bitmasks: HashMap<u32, VerifiedBitmask>,
-    /// segment_id -> verified chunk count。
     verified_count: HashMap<u32, u32>,
-    /// segment_id -> 上次 ChunkAck 已确认的 verified_count（去重用）。
     last_acked_count: HashMap<u32, u32>,
-    /// .part.meta sidecar 是否已初始化（init_part_meta 只调一次；防 overwrite）。
     meta_inited: bool,
 }
 
-/// 驱动 receiver 至终态（Completed/Failed/Cancelled）。
 pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
     let mut manifests = ReceiverManifestStore::new();
     let mut files: HashMap<String, FileRecvState> = HashMap::new();
     let mut dir_entries: Vec<privet_protocol::DirEntry> = Vec::new();
     let mut fileset_done = false;
 
-    // 1. 等 offer
     let offer = recv_control(&mut inputs.control).await?;
     let (tid, summary) = match offer.payload {
         Some(CPayload::TransferOffer(o)) => {
@@ -68,6 +54,13 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         None
     } else {
         Some(summary.root_name.clone())
+    };
+    // Register before publishing the offer event so an IPC client can respond immediately.
+    let decision_rx = match &inputs.accept_policy {
+        crate::control::AcceptPolicy::Resolver(resolver) => {
+            Some(resolver.await_decision(&tid))
+        }
+        crate::control::AcceptPolicy::AutoAccept => None,
     };
     tracing::info!(transfer_id = %tid, file_count = summary.file_count, total_bytes = summary.total_bytes, "incoming transfer offered (receiver-side)");
     inputs
@@ -86,13 +79,16 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         })
         .await;
 
-    // 2. accept 裁决（AutoAccept 或 Resolver 决定；resolver 超时=decline）
     let mut cmd_rx = inputs.registry.as_ref().map(|r| r.register(&tid));
     let accepted = match &inputs.accept_policy {
         crate::control::AcceptPolicy::AutoAccept => true,
-        crate::control::AcceptPolicy::Resolver(res) => {
-            let rx = res.await_decision(&tid);
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        crate::control::AcceptPolicy::Resolver(_) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                decision_rx.expect("resolver decision receiver"),
+            )
+            .await
+            {
                 Ok(Ok(d)) => d,
                 _ => false,
             }
@@ -104,7 +100,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
     } else {
         Vec::new()
     };
-    // 保留 resume 副本（TransferAccept 会 consume resume），后续用于合并到 files 的已验块计数。
     let resume_saved = resume.clone();
     let send_accept = TransferAccept {
         accept: accepted,
@@ -122,7 +117,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         })
         .await?;
     if !accepted {
-        // decline —— 清理 + 优雅终态。
         if let Some(r) = &inputs.registry {
             r.unregister(&tid);
         }
@@ -157,7 +151,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         })
         .await;
 
-    // 3. 累积 FileSetBatch
     let mut acc = FileSetAccumulator::new(&summary);
     while !fileset_done {
         let frame = recv_control(&mut inputs.control).await?;
@@ -252,8 +245,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         }
     }
 
-    // 将续传位图合并到 files 中，使后续校验阶段知道已接收的续传块并非缺失。
-    // 必须在主循环之前（主循环靠 bitmasks/verified_count 判断完成度）。
     for bm in &resume_saved {
         if let Some(st) = files.get_mut(&bm.file_id) {
             let seg_id = bm.segment_id;
@@ -270,10 +261,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         }
     }
 
-    // 4. 主循环：收 manifest + data + complete/cancel/pause/resume
-    // 慢链路下数据持续到达，原实现仅在 500ms 空闲时 flush ack，导致
-    // INFLIGHT_TOTAL_CAP(32) < 旧 CHUNK_ACK_INTERVAL(64) 时 ack 永不发 -> 重传爬升 -> ChunkCorrupt。
-    // 现已将 CHUNK_ACK_INTERVAL 降到 16（< 窗口）+ 此处按时间基周期 flush（不依赖空闲）。
     let mut last_flush = std::time::Instant::now();
     let mut last_progress_log = std::time::Instant::now();
     loop {
@@ -295,9 +282,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                     raw,
                 )
                 .await?;
-                // 周期进度日志（诊断接收是否在推进；1s 一次，避免刷屏）
-                // 注意：周期 flush + 控制轮询移至 match 结束后集中处理，
-                // 此分支不再是唯一保证 ack 流动的地方。
                 if last_progress_log.elapsed() >= std::time::Duration::from_secs(1) {
                     let verified: u64 = files
                         .values()
@@ -310,9 +294,7 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
             Ok(Err(TransferError::Transport(_))) => break,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                // 时间基：flush 未确认块
                 flush_pending_chunk_acks(&mut files, &mut inputs.control).await?;
-                // 注入命令
                 if let Some(rx) = cmd_rx.as_mut() {
                     if let Ok(Some(cmd)) =
                         tokio::time::timeout(std::time::Duration::from_millis(0), rx.recv()).await
@@ -409,7 +391,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                         }
                     }
                 }
-                // 超时轮询控制流
                 if let Some(frame) = try_recv_control(&mut inputs.control).await? {
                     match frame.payload {
                         Some(CPayload::SegmentManifest(m)) => {
@@ -498,13 +479,9 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                 }
             }
         }
-        // 周期任务（每 CHUNK_ACK_TIME_BASE）——数据流/空闲均执行。
-        // ack flush 防窗口死锁；控制轮询处理 TransferComplete（原仅在空闲时执行，
-        // 连续数据流使空闲不触发 -> 接收方永远不进 verify -> 死锁）。
         if last_flush.elapsed() >= crate::constants::CHUNK_ACK_TIME_BASE {
             last_flush = std::time::Instant::now();
             flush_pending_chunk_acks(&mut files, &mut inputs.control).await?;
-            // 控制轮询——连续数据流期间也处理清单/Complete/Cancel
             if let Some(frame) = try_recv_control(&mut inputs.control).await? {
                 match frame.payload {
                     Some(CPayload::SegmentManifest(m)) => {
@@ -518,7 +495,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                     Some(CPayload::Control(ControlMessage {
                         msg: Some(privet_protocol::control_message::Msg::Cancel(c)),
                     })) => {
-                        // 参照空闲分支的 Cancel 处理（完整性：事件 + 错误码）
                         if c.reason == "chunk_corrupt" {
                             inputs
                                 .events
@@ -564,16 +540,13 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         }
     }
 
-    // 5. 校验 + 落地 + TransferVerified
     let mut all_ok = true;
     let mut err_msg = String::new();
     for (fid, st) in &files {
         if let Some(e) = &st.entry {
             if !st.inline_done && e.size > 0 {
-                // 遍历各段，检查 bitmask all_set 并验证段根
                 for (&seg_id, bm) in &st.bitmasks {
                     if manifests.has_manifest(fid, seg_id) {
-                        // 对照 manifest 实际块数检查完整性
                         let expected = manifests.segment_chunk_count(fid, seg_id).unwrap_or(0);
                         if expected == 0 || bm.count_set() < expected {
                             all_ok = false;
@@ -585,7 +558,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                             );
                             break;
                         }
-                        // 段已验证完毕 -> verify_segment_root
                         if !manifests.verify_segment_root(fid, seg_id) {
                             all_ok = false;
                             err_msg = format!(
@@ -599,7 +571,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                 if !all_ok {
                     break;
                 }
-                // 检查块计数匹配 manifest
                 let total_verified: u32 = st.verified_count.values().sum();
                 let total_needed = manifests.chunk_count_for_file(fid);
                 if total_needed > 0 && total_verified < total_needed {
@@ -611,7 +582,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                     break;
                 }
             } else if st.inline_done || e.size == 0 {
-                // inline 或空文件：已完成
             } else {
                 all_ok = false;
                 err_msg = format!("file {} not started", e.relative_path);
@@ -620,7 +590,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         }
     }
 
-    // cleanup：注销 registry + 取消待决 offer。
     if let Some(r) = &inputs.registry {
         r.unregister(&tid);
     }
@@ -687,10 +656,6 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
             })),
         })
         .await?;
-    // 等待 Verified 帧实际离开发送缓冲区，防止 quinn 连接过早关闭
-    //（run_receiver 返回后 connection 被 drop，CONNECTION_CLOSE 会冲掉仍在
-    // 发送队列中的 Verified STREAM 帧，导致发送端收不到 Verified 而重新连
-    // 接 / TransportLost）。实测 200ms 足够可靠。
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     inputs
         .events
@@ -731,8 +696,6 @@ async fn on_manifest(
     tid: &str,
     m: &SegmentManifest,
 ) -> Result<()> {
-    // 确保 sidecar 已初始化（init_part_meta 只调一次/文件以避免覆盖已有 chunk_hashes）。
-    // 使用 get_mut 来检查并更新 meta_inited 标志。
     if let Some(st) = files.get_mut(&m.file_id) {
         if !st.meta_inited {
             if let Some(e) = &st.entry {
@@ -748,7 +711,6 @@ async fn on_manifest(
             st.meta_inited = true;
         }
     }
-    // 单独 get 块来写 segment meta（避免借用冲突）。
     if let Some(st) = files.get(&m.file_id) {
         if let Some(e) = &st.entry {
             let _ = store.write_segment_meta(
@@ -771,7 +733,6 @@ async fn on_manifest(
                     store.pwrite_part(tid, &e.relative_path, p.offset, &p.data)?;
                 }
             }
-            // 回灌 pending 块时同步更新 bitmask + verified_count
             if let Some(st) = files.get_mut(&p.file_id) {
                 let bm = st
                     .bitmasks
@@ -840,7 +801,6 @@ async fn handle_data(
                         let cnt = st.verified_count.entry(h.segment_id).or_insert(0);
                         *cnt += 1;
                         let new_count = *cnt;
-                        // 每 64 块发一次 ChunkAck
                         if (new_count as u64) % CHUNK_ACK_INTERVAL == 0 {
                             let indices = bm.set_bits();
                             control
@@ -874,7 +834,6 @@ async fn handle_data(
     Ok(())
 }
 
-/// flush 所有有未确认已验证块的段的 ChunkAck（时间基/Complete 触发）。
 async fn flush_pending_chunk_acks(
     files: &mut HashMap<String, FileRecvState>,
     control: &mut Box<dyn crate::ControlChannel>,
@@ -924,7 +883,6 @@ async fn flush_pending_chunk_acks(
     Ok(())
 }
 
-/// 扫描 staging 目录为已存在的 .part 文件构建续传位图，返回 TransferAccept.resume。
 pub fn build_resume_bitmasks(
     save_dir: &std::path::Path,
     tid: &str,
@@ -934,20 +892,15 @@ pub fn build_resume_bitmasks(
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    // 遍历 staging/<tid>/ 下所有文件，找 .part 后缀
     for entry in std::fs::read_dir(&staging).map_err(TransferError::Io)? {
         let entry = entry.map_err(TransferError::Io)?;
         let path = entry.path();
-        // 只处理 .part 文件
         if path.extension().is_some_and(|e| e == "part") {
-            // 取 .part 前半部分作为 relative_path（去 .part 后缀）
             let rel = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            // 尝试构建续传位图；如果 sidecar 缺失/无效则静默跳过
             if let Ok(bitmasks) =
                 privet_storage::resume::rebuild_verified_bitmap(save_dir, tid, rel)
             {
                 for seg in &bitmasks {
-                    // 从 sidecar 读取 file_id
                     if let Ok(meta) = privet_storage::sidecar::read_part_meta(
                         &privet_storage::sidecar::part_meta_path(save_dir, tid, rel)?,
                     ) {
@@ -964,7 +917,6 @@ pub fn build_resume_bitmasks(
     Ok(out)
 }
 
-/// 流式计算 .part 文件的 BLAKE3 哈希（防 OOM，用固定缓冲）。
 fn blake3_hash_file(path: &std::path::Path) -> Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;

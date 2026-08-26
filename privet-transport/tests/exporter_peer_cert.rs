@@ -1,5 +1,4 @@
 //! TCP exporter keying material agreement + peer_cert_der on both transports.
-//! TCP 两侧导出密钥一致；QUIC 两侧均可持对端证书。
 
 mod common;
 
@@ -17,7 +16,7 @@ async fn tcp_exporter_matches_both_sides() {
     let srv = async {
         let conn = listener.accept().await.unwrap();
         let e = conn
-            .export_keying_material(b"privet-pairing-binding", Some(&[]))
+            .export_keying_material(b"privet-pairing-binding", Some(b"privet-pairing-v1"))
             .expect("tcp server exporter");
         (e, conn.peer_cert_der())
     };
@@ -27,7 +26,7 @@ async fn tcp_exporter_matches_both_sides() {
             .await
             .unwrap();
         let e = conn
-            .export_keying_material(b"privet-pairing-binding", Some(&[]))
+            .export_keying_material(b"privet-pairing-binding", Some(b"privet-pairing-v1"))
             .expect("tcp client exporter");
         (e, conn.peer_cert_der())
     };
@@ -44,7 +43,6 @@ async fn tcp_exporter_matches_both_sides() {
         "TCP both sides agree on exporter (binding)"
     );
     assert!(cli_cert.is_some(), "TCP client must see server certificate");
-    // 服务端 offer_client_auth=true, 客户端 with_client_auth_cert → 服务端可见客户端证书
     assert!(srv_cert.is_some(), "TCP server must see client certificate");
 }
 

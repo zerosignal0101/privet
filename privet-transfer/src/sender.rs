@@ -1,5 +1,3 @@
-//! Sender 状态机：
-//! Preparing(已由调用方 prepare 好传入) -> offer + FileSetBatch 流式 -> SegmentManifest 逐段 -> chunk 发送队列(work-stealing, 窗口+RTO) -> inline -> TransferComplete -> 等 TransferVerified。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,13 +16,10 @@ use crate::inflight::{ChunkKey, InFlightTracker};
 use crate::prepare::PreparedSet;
 use crate::state::TransferState;
 
-/// 源文件块读取（sender 读源数据；大文件测试用合成实现避免写 5GiB）。
 pub trait ChunkReader: Send + Sync {
-    /// 读 (file_id, offset, length) 的源字节。
     fn read_chunk(&self, file_id: &str, offset: u64, length: usize) -> Result<Vec<u8>>;
 }
 
-/// 带路径映射的文件读取器（file_id -> abs_path）。
 pub struct MappedChunkReader {
     map: std::collections::HashMap<String, PathBuf>,
 }
@@ -62,7 +57,6 @@ impl ChunkReader for MappedChunkReader {
     }
 }
 
-/// 合成读取器（按 seed 生成确定性字节，测大文件不写盘）。
 pub struct SyntheticChunkReader {
     size: u64,
     seed: u64,
@@ -90,15 +84,26 @@ impl ChunkReader for SyntheticChunkReader {
 
 pub struct SenderInputs {
     pub control: Box<dyn crate::ControlChannel>,
-    /// 数据流池（≥1）。单流 = vec![...]。
     pub data: Vec<Box<dyn crate::DataChannel>>,
     pub events: Box<dyn TransferEventSink>,
     pub config: TransferEngineConfig,
     pub prepared: PreparedSet,
     pub reader: Box<dyn ChunkReader>,
     pub transfer_id: String,
-    /// 传输控制命令注入端（Engine::cancel/pause/resume 经此）。None = 不可控（旧测试）。
-    pub cmd_rx: Option<tokio::sync::mpsc::Receiver<crate::control::TransferCommand>>,
+    pub cmd_rx: Option<SharedCommandReceiver>,
+}
+
+pub type SharedCommandReceiver = std::sync::Arc<
+    tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::control::TransferCommand>>,
+>;
+
+async fn recv_command(
+    receiver: Option<SharedCommandReceiver>,
+) -> Option<crate::control::TransferCommand> {
+    match receiver {
+        Some(receiver) => receiver.lock().await.recv().await,
+        None => None,
+    }
 }
 
 pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
@@ -136,7 +141,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         })
         .await;
 
-    // 2. FileSetBatch 流式
     let mut batcher = FileSetBatcher::new(tid.clone());
     for f in &inputs.prepared.files {
         batcher.push(f);
@@ -154,7 +158,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
             .await?;
     }
 
-    // 3. 等 accept
     let accept_frame = recv_control(&mut inputs.control).await?;
     let (resume, accepted) = match accept_frame.payload {
         Some(CPayload::TransferAccept(a)) => {
@@ -169,7 +172,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         _ => return Err(TransferError::Protocol("expected TransferAccept".into())),
     };
     if !accepted {
-        // decline —— receiver 拒绝，优雅终态。
         inputs
             .events
             .emit(TransferEvent::StateChanged {
@@ -200,11 +202,9 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         })
         .await;
 
-    // 4. 逐文件发送（inline 直发；分块文件走窗口式 RTO 重传）
     let chunk_size = inputs.config.default_chunk_size;
     let cs = chunk_size as u64;
 
-    // 辅助结构：块工作条目
     struct ChunkWork_ {
         file_id: String,
         segment_id: u32,
@@ -216,7 +216,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
 
     let mut work: Vec<ChunkWork_> = Vec::new();
     let mut work_map: HashMap<ChunkKey, usize> = HashMap::new();
-    // 统计续传（跳过）的已验证块数，作为 verified_count 基线。
     let mut resumed_chunks: u64 = 0;
 
     for f in &inputs.prepared.files {
@@ -240,7 +239,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                 .await?;
             continue;
         }
-        // 发 SegmentManifest（每段）+ 收集块工作
         for seg in &f.segments {
             let manifest = SegmentManifest {
                 file_id: f.file_id.clone(),
@@ -268,7 +266,7 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
             for ci in 0..seg_layout.chunk_count as u64 {
                 if let Some(bm) = prev_bitmask {
                     if is_bit_set(bm, ci as u32) {
-                        resumed_chunks += 1; // 续传基线
+                        resumed_chunks += 1;
                         continue;
                     }
                 }
@@ -292,7 +290,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         }
     }
 
-    // 窗口式发送 + ChunkAck 消费 + RTO 重传
     inputs
         .events
         .emit(TransferEvent::StateChanged {
@@ -302,10 +299,9 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         .await;
     let mut tracker = InFlightTracker::new();
     let mut cursor = 0usize;
-    let mut verified_count: u64 = resumed_chunks; // 续传基线，防重连后进度归零
+    let mut verified_count: u64 = resumed_chunks;
     let mut paused = false;
 
-    // 重连后立即以续传基线更新进度条。
     if resumed_chunks > 0 {
         let baseline_bytes = (resumed_chunks * chunk_size as u64).min(total_bytes);
         inputs
@@ -325,7 +321,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
 
     while cursor < work.len() || tracker.inflight_count() > 0 {
         if !paused {
-            // 填窗口至 INFLIGHT_TOTAL_CAP
             while tracker.inflight_count() < INFLIGHT_TOTAL_CAP && cursor < work.len() {
                 let w = &work[cursor];
                 let chunk_data = inputs.reader.read_chunk(&w.file_id, w.offset, w.length)?;
@@ -356,8 +351,7 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         let deadline = tracker.earliest_deadline(CHUNK_RETRANSMIT_RTO);
         tokio::select! {
             biased;
-            // 本地注入命令（transfer control）
-            cmd = async { match &mut inputs.cmd_rx { Some(rx) => rx.recv().await, None => None } }, if inputs.cmd_rx.is_some() => {
+            cmd = recv_command(inputs.cmd_rx.clone()), if inputs.cmd_rx.is_some() => {
                 match cmd {
                     Some(crate::control::TransferCommand::Cancel) => {
                         let _ = inputs.control.send(ControlFrame {
@@ -395,16 +389,12 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                     None => {}
                 }
             }
-            // 对端控制帧（原逻辑）
             result = inputs.control.recv() => {
                 match result {
                     Ok(frame) => match frame.payload {
                         Some(CPayload::ChunkAck(a)) => {
                             let n = tracker.on_ack(&a.file_id, a.segment_id, &a.chunk_indices);
                             verified_count += n as u64;
-                            // 记录每一条收到的 ack（含空 ack n=0），
-                            // 区分“ack 到达但无已验证块”（对端未处理 manifest / 旧二进制）
-                            // 与“完全无 ack 到达”（链路丢包）。索引/计数非敏感。
                             tracing::debug!(
                                 file_id = %a.file_id,
                                 segment_id = a.segment_id,
@@ -452,9 +442,6 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
             _ = tokio::time::sleep_until(deadline.unwrap_or(
                 tokio::time::Instant::now() + CHUNK_RETRANSMIT_RTO,
             )) => {
-                // 选择性重传--仅重传“落后 ack 前沿”或“首 ack 前全部超时”的块。
-                // 旧 `rto_expired` 在慢链路下会把全部 inflight 块（接收方尚未处理、仍在前沿
-                // 之前）一律判超时 -> 洪泛重传 -> ChunkCorrupt/连接死。
                 let expired = tracker.rto_expired_selective(CHUNK_RETRANSMIT_RTO);
                 for key in &expired {
                     if tracker.retries(key) >= CHUNK_RETRANSMIT_MAX {
@@ -541,11 +528,10 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
         })
         .await?;
 
-    // 6. 等 TransferVerified/Cancel（跳过期间可能插入的 ChunkAck）
     let verified = loop {
         let frame = recv_control(&mut inputs.control).await?;
         match frame.payload {
-            Some(CPayload::ChunkAck(_)) => continue, // 过渡期跳过
+            Some(CPayload::ChunkAck(_)) => continue,
             Some(CPayload::Control(ControlMessage {
                 msg: Some(privet_protocol::control_message::Msg::Verified(v)),
             })) => {

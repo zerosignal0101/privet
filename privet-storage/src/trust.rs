@@ -1,4 +1,3 @@
-//! trust_store 仓库。
 
 use crate::error::StorageError;
 
@@ -33,7 +32,6 @@ pub struct TrustRecord {
     pub revocation_reason: Option<String>,
 }
 
-/// 配对成功原子事务：INSERT trust_store + INSERT known_device_addresses 同 tx。
 pub fn insert_paired(
     conn: &rusqlite::Connection,
     trust: &PeerTrust,
@@ -81,7 +79,6 @@ pub fn insert_paired(
     }
 }
 
-/// 仅写 trust_store 行（不写占位地址行）；地址由 verified-success 路径单独写。
 pub fn insert_trust(conn: &rusqlite::Connection, trust: &PeerTrust) -> Result<(), StorageError> {
     conn.execute(
         "INSERT INTO trust_store
@@ -140,7 +137,6 @@ pub fn revoke(
     Ok(())
 }
 
-/// 忘记设备：删 trust_store -> CASCADE 删 addresses；transfer_history.peer_device_fingerprint SET NULL（保留 peer_name）。
 pub fn forget(conn: &rusqlite::Connection, device_fingerprint: &str) -> Result<(), StorageError> {
     conn.execute(
         "DELETE FROM trust_store WHERE device_fingerprint=?1",
@@ -149,7 +145,6 @@ pub fn forget(conn: &rusqlite::Connection, device_fingerprint: &str) -> Result<(
     Ok(())
 }
 
-/// 每次 pinning 通过的已认证连接更新 last_seen + name。
 pub fn refresh_seen(
     conn: &rusqlite::Connection,
     device_fingerprint: &str,
@@ -163,7 +158,6 @@ pub fn refresh_seen(
     Ok(())
 }
 
-/// 陈旧信任 GC 候选：last_seen_ts < now - stale_days*86400。
 pub fn gc_stale_candidates(
     conn: &rusqlite::Connection,
     now_ts: i64,
@@ -179,7 +173,6 @@ pub fn gc_stale_candidates(
     Ok(out)
 }
 
-/// 列出全部信任记录（Trusted + Revoked；CLI list-trusted 用）。
 pub fn list_all(conn: &rusqlite::Connection) -> Result<Vec<TrustRecord>, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT device_fingerprint, peer_spki, peer_device_name, trust_state, share_with_peers,
@@ -253,7 +246,6 @@ mod tests {
     fn insert_paired_atomic_rollback_on_dup() {
         let conn = db();
         insert_paired(&conn, &sample_trust("dev1"), &sample_addr()).unwrap();
-        // 重复 device_fingerprint -> trust_store PK 冲突 -> 整 tx 回滚（address 也不增）
         let err = insert_paired(&conn, &sample_trust("dev1"), &sample_addr());
         assert!(err.is_err());
         let n: i64 = conn
@@ -261,7 +253,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(n, 1); // 仍只有第一条
+        assert_eq!(n, 1);
     }
 
     #[test]
@@ -279,7 +271,6 @@ mod tests {
     fn forget_cascades_addresses_and_nulls_history_peer() {
         let conn = db();
         insert_paired(&conn, &sample_trust("dev1"), &sample_addr()).unwrap();
-        // 建一条历史引用 dev1
         conn.execute(
             "INSERT INTO transfer_history(transfer_id,direction,peer_device_fingerprint,peer_name,file_count,total_bytes,status,started_ts,send_intent)
              VALUES('t1','receive','dev1','peer',1,10,'partial',100,'{}')",
@@ -287,16 +278,13 @@ mod tests {
         )
         .unwrap();
         forget(&conn, "dev1").unwrap();
-        // addresses 已 CASCADE 删
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM known_device_addresses", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(n, 0);
-        // trust_store 已删
         assert!(get_trust(&conn, "dev1").unwrap().is_none());
-        // 历史保留，peer_device_fingerprint=NULL，peer_name 保留
         let (pid, pname): (Option<String>, String) = conn
             .query_row(
                 "SELECT peer_device_fingerprint, peer_name FROM transfer_history WHERE transfer_id='t1'",
@@ -376,7 +364,6 @@ mod tests {
         insert_trust(&conn, &sample_trust("dev1")).unwrap();
         let r = get_trust(&conn, "dev1").unwrap().unwrap();
         assert_eq!(r.trust_state, "Trusted");
-        // 不再写占位地址行。
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM known_device_addresses WHERE device_fingerprint='dev1'",

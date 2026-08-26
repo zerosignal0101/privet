@@ -47,12 +47,10 @@ async fn happy_path_both_commit_trusted() {
     assert!(matches!(oi, PairingOutcome::Paired { .. }));
     assert!(matches!(or, PairingOutcome::Paired { .. }));
 
-    // I 写了 trust(R)
     let ri = trust_i.get(&r_id.fingerprint()).unwrap().unwrap();
     assert_eq!(ri.trust_state, TrustState::Trusted);
     assert_eq!(ri.peer_spki, r_id.spki_der());
 
-    // R 写了 trust(I)
     let rr = trust_r.get(&i_id.fingerprint()).unwrap().unwrap();
     assert_eq!(rr.trust_state, TrustState::Trusted);
     assert_eq!(rr.peer_spki, i_id.spki_der());

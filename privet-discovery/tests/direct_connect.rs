@@ -37,10 +37,8 @@ fn prefer_same_subnet_then_last_seen() {
         gateway_ip: None,
     };
     let ordered = select_candidates(&rec, &net);
-    // 同子网(192.168.1.x)优先，取 last_seen 最新
     assert_eq!(ordered[0].ip, "192.168.1.9".parse::<IpAddr>().unwrap());
     assert_eq!(ordered[1].ip, "192.168.1.5".parse::<IpAddr>().unwrap());
-    // 跨子网最后
     assert_eq!(ordered[2].ip, "10.0.0.5".parse::<IpAddr>().unwrap());
 }
 

@@ -65,3 +65,15 @@ fn long_code_password_not_short() {
     let c = PairingCode::generate_long(&clk, 16).unwrap();
     assert!(c.as_password().len() >= 26);
 }
+
+#[test]
+fn custom_policy_controls_expiry_and_attempt_budget() {
+    let clk = FixedClock(AtomicU64::new(1_000));
+    let mut code = PairingCode::generate_decimal_with_policy(&clk, 2, 2).unwrap();
+    assert!(!code.is_expired(3_000));
+    assert!(code.is_expired(3_001));
+    code.record_failure();
+    assert!(!code.is_exhausted());
+    code.record_failure();
+    assert!(code.is_exhausted());
+}

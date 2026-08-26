@@ -1,4 +1,3 @@
-//! transfer_history + transfer_files 仓库。
 
 use crate::error::StorageError;
 
@@ -86,7 +85,6 @@ pub fn insert_history(conn: &rusqlite::Connection, t: &NewTransfer) -> Result<()
     Ok(())
 }
 
-/// 传送完成原子事务：UPDATE status='completed'+finished_ts + 批量 INSERT transfer_files。
 pub fn complete_history(
     conn: &rusqlite::Connection,
     transfer_id: &str,
@@ -146,12 +144,10 @@ pub fn clear_history_by_peer(
 }
 
 pub fn vacuum_after_clear(conn: &rusqlite::Connection) -> Result<(), StorageError> {
-    // execute_batch（非 execute）：`PRAGMA incremental_vacuum` 返回结果集，execute 会报 ExecuteReturnedResults。
     conn.execute_batch("PRAGMA incremental_vacuum")?;
     Ok(())
 }
 
-/// 更新 partial 行的文件计数和根名（prepare_paths 后调用）。
 pub fn update_send_counts(
     conn: &rusqlite::Connection,
     transfer_id: &str,
@@ -170,7 +166,6 @@ pub fn update_send_counts(
     Ok(())
 }
 
-/// DB 仅指针：标 status='partial'（可续传；sidecar 持实际清单）。
 pub fn mark_partial(conn: &rusqlite::Connection, transfer_id: &str) -> Result<(), StorageError> {
     conn.execute(
         "UPDATE transfer_history SET status='partial' WHERE transfer_id=?1",
@@ -179,7 +174,6 @@ pub fn mark_partial(conn: &rusqlite::Connection, transfer_id: &str) -> Result<()
     Ok(())
 }
 
-/// 续传意图行（含原始 blob，由 core 层解析）。
 pub struct SendIntentRow {
     pub transfer_id: String,
     pub direction: String,
@@ -192,7 +186,6 @@ pub struct SendIntentRow {
     pub send_intent: Option<String>,
 }
 
-/// 按 tid 查续传意图（含传输列 + 原始 blob；不存在返回 None）。
 pub fn get_send_intent_row(
     conn: &rusqlite::Connection,
     transfer_id: &str,
@@ -222,7 +215,6 @@ pub fn get_send_intent_row(
     }
 }
 
-/// 孤儿对账：DB partial 但目录无文件 -> 标 failed。
 pub fn mark_failed(
     conn: &rusqlite::Connection,
     transfer_id: &str,
@@ -235,7 +227,6 @@ pub fn mark_failed(
     Ok(())
 }
 
-/// 历史行（CLI history 用；仅公开字段，无敏感材料）。
 pub struct HistoryRow {
     pub transfer_id: String,
     pub direction: String,
@@ -249,7 +240,6 @@ pub struct HistoryRow {
     pub finished_ts: Option<i64>,
 }
 
-/// 列出历史（peer=Some 仅该 peer；limit 限制行数；按 started_ts DESC, transfer_id DESC）。
 pub fn list_history(
     conn: &rusqlite::Connection,
     peer: Option<&str>,
@@ -484,7 +474,6 @@ mod tests {
     #[test]
     fn list_history_orders_desc_and_filters_peer_and_limit() {
         let conn = db();
-        // 先植入信任（FK 约束要求 transfer_history.peer_device_fingerprint 指向 trust_store）。
         for d in &["d1", "d2"] {
             conn.execute(
                 "INSERT INTO trust_store(device_fingerprint,peer_spki,peer_device_name,first_paired_ts,last_seen_ts) VALUES(?1,x'00','n',1,1)",

@@ -1,4 +1,3 @@
-//! 到货三态（manifest 已到+命中 / 已到+不符 / 未到缓冲）。
 use privet_transfer::integrity::{chunk_hash, segment_root};
 use privet_transfer::manifest_store::{ArrivalVerdict, PendingChunk, ReceiverManifestStore};
 

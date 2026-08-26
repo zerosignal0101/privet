@@ -1,4 +1,4 @@
-//! 在抽象 Stream 上收发帧（复用 privet-protocol framing）。
+//! Length-delimited protocol frames over a real or test transport stream.
 
 use bytes::BytesMut;
 use privet_protocol::framing;
@@ -8,13 +8,11 @@ use crate::transport::Stream;
 use crate::TransportError;
 use privet_protocol::constants::{DEFAULT_CHUNK_SIZE, MAX_CONTROL_FRAME_BYTES};
 
-/// 发送控制帧：`[varint_len][ControlFrame]`。
 pub async fn send_control(s: &mut dyn Stream, msg: &ControlFrame) -> Result<(), TransportError> {
     let bytes = framing::encode_control(msg)?;
     s.send_all(&bytes).await
 }
 
-/// 读 varint 长度前缀后接 body，返回完整帧 `[varint][body]`。
 async fn recv_raw_frame(s: &mut dyn Stream) -> Result<BytesMut, TransportError> {
     let mut varint_buf = [0u8; 10];
     let mut varint_len = 0;
@@ -28,7 +26,6 @@ async fn recv_raw_frame(s: &mut dyn Stream) -> Result<BytesMut, TransportError> 
     }
     let mut tmp: &[u8] = &varint_buf[..varint_len];
     let len = privet_protocol::varint::decode_varint(&mut tmp)? as usize;
-    // 帧大小上限防 DoS — before alloc
     if len > MAX_CONTROL_FRAME_BYTES {
         return Err(TransportError::TooLarge);
     }
@@ -39,7 +36,6 @@ async fn recv_raw_frame(s: &mut dyn Stream) -> Result<BytesMut, TransportError> 
     Ok(raw)
 }
 
-/// 接收控制帧。
 pub async fn recv_control(s: &mut dyn Stream) -> Result<ControlFrame, TransportError> {
     let raw = recv_raw_frame(s).await?;
     let mut rs: &[u8] = &raw;
@@ -47,17 +43,24 @@ pub async fn recv_control(s: &mut dyn Stream) -> Result<ControlFrame, TransportE
     Ok(frame)
 }
 
-/// 发送数据帧 `[varint_len][DataFrame][? raw bytes]`。
 pub async fn send_data(
     s: &mut dyn Stream,
     frame: &DataFrame,
     raw: Option<&[u8]>,
 ) -> Result<(), TransportError> {
+    match (&frame.payload, raw) {
+        (Some(privet_protocol::data_frame::Payload::ChunkHeader(header)), Some(bytes))
+            if header.length == bytes.len() as u64 => {}
+        (Some(privet_protocol::data_frame::Payload::ChunkHeader(_)), _) => {
+            return Err(privet_protocol::error::FrameError::Malformed.into());
+        }
+        (_, Some(_)) => return Err(privet_protocol::error::FrameError::Malformed.into()),
+        (_, None) => {}
+    }
     let bytes = framing::encode_data(frame, raw);
     s.send_all(&bytes).await
 }
 
-/// 收数据帧：(DataFrame, Option<Chunk raw bytes>)。
 pub async fn recv_data(
     s: &mut dyn Stream,
 ) -> Result<(DataFrame, Option<BytesMut>), TransportError> {
@@ -66,7 +69,6 @@ pub async fn recv_data(
     let frame = framing::decode_data_frame(&mut rs)?;
     match &frame.payload {
         Some(privet_protocol::data_frame::Payload::ChunkHeader(h)) => {
-            // 块大小上限防 OOM — before recv_exact
             if h.length > DEFAULT_CHUNK_SIZE as u64 {
                 return Err(TransportError::TooLarge);
             }

@@ -1,4 +1,3 @@
-//! 乱序到达（test 3）/ 大文件分段清单（test 9）/ 海量小文件（test 10）/ 64KB 边界（test 1）。
 use privet_transfer::channel::{LoopbackControlChannel, LoopbackDataChannel, ReorderDataChannel};
 use privet_transfer::config::TransferEngineConfig;
 use privet_transfer::events::NoopEventSink;

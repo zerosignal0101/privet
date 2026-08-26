@@ -1,4 +1,3 @@
-//! Preparing 进度 + rename 前篡改 + staging 清理
 use privet_transfer::config::CollisionPolicy;
 use privet_transfer::part_store::{FsPartStore, PartStore};
 use tempfile::tempdir;

@@ -1,11 +1,4 @@
-//! Task C13/C15：真实 QUIC/TCP 上的传送 e2e（分块路径 / 内联快路径 / TCP 降级）。
-//!
-//! 关键点：
-//! - QUIC 单向数据流（open_uni）仅本地分配，**不发送 STREAM frame**；
-//!   sender 须写至少 1 字节数据后方发 STREAM frame，receiver 的 accept_uni 才能解析。
-//!   → sender 在 run_sender 之前写一空 DataFrame（payload=None），receiver 的
-//!   handle_data 遇到 None payload 为 no-op 跳过。
-//! - TCP 单连接多路（stream_id 1 共享），无此问题，open_data_stream 即可。
+//! End-to-end transfer orchestration tests.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +16,6 @@ use privet_transfer::{
 use privet_transport::{send_data, QuicTransport, TcpTransport, Transport, TransportMode};
 use tempfile::TempDir;
 
-/// 分块文件（>64KiB，单段单块）经 QUIC 单向数据流传送 e2e。
 #[tokio::test]
 async fn send_chunked_file_over_quic() {
     let srv_id = Identity::generate().unwrap();
@@ -42,7 +34,6 @@ async fn send_chunked_file_over_quic() {
     let listener = srv_quic.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 源文件：>64KiB -> 走分块路径（非内联）。
     let src = TempDir::new().unwrap();
     let payload: Vec<u8> = (0..70_000).map(|i| (i % 251) as u8).collect();
     std::fs::write(src.path().join("big.bin"), &payload).unwrap();
@@ -76,7 +67,6 @@ async fn send_chunked_file_over_quic() {
             registry: None,
         };
         let result = run_receiver(inputs).await;
-        // 保持 conn 不 drop（配对 e2e 同模式）：防止 premature close 破坏 sender 侧操作。
         (result, conn)
     };
 
@@ -91,8 +81,6 @@ async fn send_chunked_file_over_quic() {
         let mut data = acquire_data(conn.as_ref(), DataRole::Initiator)
             .await
             .unwrap();
-        // QUIC 单向流：open_uni 仅本地分配，不发送 STREAM frame。
-        // 须写数据后方发 STREAM frame，receiver 的 accept_uni 才能解析。
         send_data(data.as_mut(), &DataFrame { payload: None }, None)
             .await
             .unwrap();
@@ -108,7 +96,6 @@ async fn send_chunked_file_over_quic() {
             cmd_rx: None,
         };
         let result = run_sender(inputs).await;
-        // 保持 conn 不 drop，与 accept 对称。
         (result, conn)
     };
 
@@ -128,7 +115,6 @@ async fn send_chunked_file_over_quic() {
     );
 }
 
-/// 内联文件（≤64KiB 快路径）经 TCP 单连接多路传送 e2e（TCP 降级路径）。
 #[tokio::test]
 async fn send_inline_file_over_tcp() {
     let srv_id = Identity::generate().unwrap();
@@ -144,7 +130,6 @@ async fn send_inline_file_over_tcp() {
     let listener = srv_tcp.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 源文件：≤64KiB -> 走内联快路径（单数据帧，不分块）。
     let src = TempDir::new().unwrap();
     let payload = b"hello privet core over tcp";
     std::fs::write(src.path().join("hi.txt"), payload).unwrap();
@@ -217,7 +202,6 @@ async fn send_inline_file_over_tcp() {
     assert_eq!(landed, payload, "landed file must match source");
 }
 
-/// 目录结构（含嵌套子目录）经 QUIC 单向数据流传送 e2e。
 #[tokio::test]
 async fn send_directory_over_quic() {
     let srv_id = Identity::generate().unwrap();
@@ -236,7 +220,6 @@ async fn send_directory_over_quic() {
     let listener = srv_quic.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 源目录：根文件 + 子目录文件。
     let src = TempDir::new().unwrap();
     let payload_a = b"file a content";
     let payload_b = b"file b content in subdir";
@@ -321,7 +304,6 @@ async fn send_directory_over_quic() {
     assert_eq!(landed_b, payload_b, "nested file mismatch");
 }
 
-/// 64KiB 边界：内联（≤65536 字节，快路径单帧）与分块（≥65537 字节，首块）经 QUIC 传送 e2e。
 #[tokio::test]
 async fn inline_boundary_64kib_and_plus1() {
     let srv_id = Identity::generate().unwrap();
@@ -340,7 +322,6 @@ async fn inline_boundary_64kib_and_plus1() {
     let listener = srv_quic.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 两个文件：65536 字节（内联）和 65537 字节（1 块）。
     let src = TempDir::new().unwrap();
     let inline_payload: Vec<u8> = (0..65536).map(|i| i as u8).collect();
     let chunked_payload: Vec<u8> = (0..65537).map(|i| (i ^ 0xaa) as u8).collect();
@@ -426,7 +407,6 @@ async fn inline_boundary_64kib_and_plus1() {
     );
 }
 
-/// 分块文件经 TCP 单连接多路传送 e2e（TCP 降级路径 + 大分块）。
 #[tokio::test]
 async fn send_chunked_file_over_tcp() {
     let srv_id = Identity::generate().unwrap();
@@ -442,7 +422,6 @@ async fn send_chunked_file_over_tcp() {
     let listener = srv_tcp.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 源文件：>64KiB -> 走分块路径。
     let src = TempDir::new().unwrap();
     let payload: Vec<u8> = (0..70_000).map(|i| (i % 251) as u8).collect();
     std::fs::write(src.path().join("tcp_big.bin"), &payload).unwrap();
@@ -518,10 +497,6 @@ async fn send_chunked_file_over_tcp() {
     );
 }
 
-/// 大文件（64MiB = 2 发送窗口）经真实 QUIC 传送 e2e。
-/// 验证选择性重传修复在真实 QUIC 链路上不退化：多段多窗口下无洪泛、无 ChunkCorrupt、
-/// 无停滞。loopback 虽然快（RTO 不触发），但完整的协议路径（流打开/控制通道/数据通道/
-/// 选段布局/位图）均被覆盖。
 #[tokio::test]
 async fn large_file_over_quic() {
     let srv_id = Identity::generate().unwrap();
@@ -540,7 +515,6 @@ async fn large_file_over_quic() {
     let listener = srv_quic.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 64 MiB = 2 个发送窗口（64 chunks × 1 MiB），跨 window boundary。
     let src = TempDir::new().unwrap();
     let payload: Vec<u8> = (0..64u64 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     std::fs::write(src.path().join("qlarge.bin"), &payload).unwrap();
@@ -564,7 +538,6 @@ async fn large_file_over_quic() {
         let data = acquire_data(conn.as_ref(), DataRole::Responder)
             .await
             .unwrap();
-        // QUIC 单向流：须先发一空帧触发 receiver accept_uni 响应
         let inputs = ReceiverInputs {
             control: Box::new(StreamControlChannel::new(ctrl)),
             data: vec![Box::new(StreamDataChannel::new(data))],
@@ -620,11 +593,6 @@ async fn large_file_over_quic() {
     assert_eq!(landed, payload, "QUIC large file must match source");
 }
 
-/// 大文件（64MiB = 2 发送窗口）经真实 TCP 传送 e2e。
-/// TCP 使用单连接双通道多路（stream_id 0 控制 / stream_id 1 数据），大文件下验证：
-/// - 帧编解码无 desync（原为 33 块时 protobuf decode error / invalid key value）
-/// - 控制/数据通道无互相阻塞
-/// - 选择性重传在 TCP 路径上不引入退化
 #[tokio::test]
 async fn large_file_over_tcp() {
     let srv_id = Identity::generate().unwrap();

@@ -1,4 +1,3 @@
-//! StateChanged 事件 + transition guard；R6: Progress{verified_bytes}。
 
 use privet_transfer::channel::{LoopbackControlChannel, LoopbackDataChannel};
 use privet_transfer::config::TransferEngineConfig;
@@ -10,7 +9,6 @@ use privet_transfer::state::{TransferFailed, TransferState};
 use std::time::Duration;
 use tempfile::tempdir;
 
-// transition 合法
 #[test]
 fn legal_transitions_succeed() {
     use TransferState::*;
@@ -33,7 +31,6 @@ fn legal_transitions_succeed() {
     .is_ok());
 }
 
-// transition 非法
 #[test]
 fn illegal_transition_returns_err() {
     use TransferState::*;
@@ -42,7 +39,6 @@ fn illegal_transition_returns_err() {
     assert!(TransferState::transition(&Offered, Completed).is_err());
 }
 
-// R5: sender 完整路径产生 StateChanged(Transferring) 事件
 #[tokio::test]
 async fn sender_emits_state_changed_events() {
     let dir = tempdir().unwrap();
@@ -80,13 +76,11 @@ async fn sender_emits_state_changed_events() {
     let _sr = tokio::spawn(run_sender(s));
     let _rr = tokio::spawn(run_receiver(r));
 
-    // 收集事件
     let mut events: Vec<TransferEvent> = Vec::new();
     while let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(5), rx_a.recv()).await {
         events.push(e);
     }
 
-    // 断言至少看到 StateChanged Transferring、SendingDone、Verified{ok}、Completed
     let states: Vec<&TransferState> = events
         .iter()
         .filter_map(|e| match e {

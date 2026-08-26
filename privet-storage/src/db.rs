@@ -1,4 +1,3 @@
-//! DB 连接与 PRAGMA + 桌面默认路径。
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +10,6 @@ pub fn open(path: impl AsRef<Path>) -> Result<rusqlite::Connection, StorageError
     Ok(conn)
 }
 
-/// 内存 DB + 全 PRAGMA（测试用）。`foreign_keys=ON` 使 CASCADE/SET NULL 在测试中生效。
 pub fn open_in_memory() -> Result<rusqlite::Connection, StorageError> {
     let conn = rusqlite::Connection::open_in_memory()?;
     apply_pragmas(&conn)?;
@@ -27,12 +25,10 @@ fn apply_pragmas(conn: &rusqlite::Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// 桌面平台默认 DB 目录。无 fs 副作用（仅读 env，不建目录）。
 pub fn default_db_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_default().join("privet")
 }
 
-/// 桌面平台默认 DB 路径。建 `privet/` 目录。Android 由调用方传显式路径。
 pub fn default_db_path() -> Result<PathBuf, StorageError> {
     let dir = default_db_dir();
     std::fs::create_dir_all(&dir)?;
@@ -71,7 +67,6 @@ mod tests {
 
     #[test]
     fn default_db_dir_under_privet() {
-        // 仅查路径名，无 fs 副作用（不创建用户数据目录）。
         let p = default_db_dir();
         assert!(p.ends_with("privet"));
     }

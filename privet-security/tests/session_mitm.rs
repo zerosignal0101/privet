@@ -154,7 +154,6 @@ async fn code_expiry_checked_fails() {
 
 #[tokio::test]
 async fn attempts_exhausted_after_five_failures() {
-    // 错 5 次 -> 码作废
     let clk = Arc::new(MutableClock::new());
     clk.set(1000);
     let mut code = PairingCode::generate_decimal(&*clk).unwrap();
@@ -172,7 +171,6 @@ async fn attempts_exhausted_after_five_failures() {
 
 #[tokio::test]
 async fn long_key_code_128bit_pairs_success() {
-    // 128bit 长码 -> happy path 配对成功
     let clk = Arc::new(MutableClock::new());
     clk.set(1000);
     let code_str = {
@@ -227,7 +225,6 @@ async fn long_key_code_128bit_pairs_success() {
 
 #[tokio::test]
 async fn consumed_code_rejected_by_check_valid() {
-    // 单次性: 消费后 check_valid 返回 AlreadyPaired.
     let clk = Arc::new(MutableClock::new());
     clk.set(1000);
     let mut code = PairingCode::generate_decimal(&*clk).unwrap();
@@ -245,7 +242,6 @@ async fn consumed_code_rejected_by_check_valid() {
 
 #[tokio::test]
 async fn initiator_checked_consumes_code_on_paired() {
-    // run_initiator_checked 成功配对后消费码.
     let i_id = Arc::new(Identity::generate().unwrap());
     let r_id = Arc::new(Identity::generate().unwrap());
     let (mut ci, mut cr) = LoopbackChannel::pair(16);

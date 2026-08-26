@@ -1,4 +1,3 @@
-//! 暂停/恢复 + 重连
 use privet_transfer::channel::{LoopbackControlChannel, LoopbackDataChannel};
 use privet_transfer::config::TransferEngineConfig;
 use privet_transfer::events::NoopEventSink;
@@ -10,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
-/// 包裹 ChunkReader 并计数 read_chunk 调用次数（测试续传跳过）。
 struct CountingReader {
     inner: Box<dyn ChunkReader>,
     count: Arc<AtomicU64>,
@@ -34,7 +32,6 @@ async fn reconnect_resumes_from_bitmask() {
     std::fs::write(dir.path().join("rc.bin"), &data).unwrap();
     let save = tempdir().unwrap();
 
-    // 第一轮：发 1 块后 abort（模拟断连）
     let prepared1 =
         privet_transfer::prepare::prepare_dir(dir.path(), None, 0, 1024 * 1024, 1024).unwrap();
     let reader1 = MappedChunkReader::from_prepared(&prepared1);
@@ -73,7 +70,6 @@ async fn reconnect_resumes_from_bitmask() {
     })
     .await;
 
-    // 第二轮：续传（同 transfer_id + 同 save_dir -> resume 位图从 .part 重建）
     let prepared2 =
         privet_transfer::prepare::prepare_dir(dir.path(), None, 0, 1024 * 1024, 1024).unwrap();
     let reader2 = MappedChunkReader::from_prepared(&prepared2);
@@ -119,9 +115,6 @@ async fn reconnect_skips_via_resume_bitmask() {
     std::fs::write(dir.path().join("rc.bin"), &data).unwrap();
     let save = tempdir().unwrap();
 
-    // 直接通过 FsPartStore 构造已收块 0 的 staging 状态（避免 ~500ms 接收完成+清理时序竞赛）。
-    // 步骤：init_part_meta 建 sidecar → write_segment_meta 写段哈希 → pwrite_part 写块0 数据。
-    // 注意：chunk_size 为 DEFAULT_CHUNK_SIZE(1 MiB)，块0 须写精确 1 MiB 以便 rebuild_verified_bitmap 验证通过。
     let store = FsPartStore::new(save.path().to_path_buf());
     let cs = privet_protocol::constants::DEFAULT_CHUNK_SIZE;
     let chunk0_hash = hex::encode(privet_crypto::hash::blake3(&data[..cs]));
@@ -141,14 +134,12 @@ async fn reconnect_skips_via_resume_bitmask() {
         .unwrap();
     store.pwrite_part("t2", "rc.bin", 0, &data[..cs]).unwrap();
 
-    // 断言续传位图非空（直接回归 root cause：sidecar 已建且含已验证块）。
     let bitmasks = privet_transfer::receiver::build_resume_bitmasks(save.path(), "t2").unwrap();
     assert!(
         !bitmasks.is_empty(),
         "resume bitmask must be non-empty after partial receive"
     );
 
-    // 第二轮：计数 read_chunk + InMemoryEventSink 验证续传跳过与进度基线。
     let prepared2 =
         privet_transfer::prepare::prepare_dir(dir.path(), None, 0, 1024 * 1024, 1024).unwrap();
     let reader2 = MappedChunkReader::from_prepared(&prepared2);
@@ -189,14 +180,12 @@ async fn reconnect_skips_via_resume_bitmask() {
     .await
     .unwrap();
 
-    // 断言续传跳过了块0（已收块不重新读取）。
     let reads = read_count.load(Ordering::SeqCst);
     assert!(
         reads < 2,
         "expected read_chunk < 2 (resume skipped chunk 0), got {reads}"
     );
 
-    // 断言首个 Progress 事件携带续传基线（≥1 MiB，非 0）。
     let has_baseline = tokio::time::timeout(Duration::from_secs(1), async {
         use privet_transfer::events::TransferEvent;
         while let Some(ev) = event_rx.recv().await {

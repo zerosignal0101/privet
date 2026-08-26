@@ -1,4 +1,3 @@
-//! Identity -> TlsMaterial -> QuicTransport/TcpTransport 拼装
 use std::sync::Arc;
 
 use privet_crypto::identity::Identity;
@@ -8,7 +7,6 @@ use privet_transport::{QuicTransport, TcpTransport};
 use crate::config::EngineConfig;
 use crate::Result;
 
-/// 从 Identity 拼装 TLS 材料：证书 DER + PKCS8 私钥。
 pub fn build_tls_material(identity: &Identity) -> Result<TlsMaterial> {
     let stored = identity.to_stored()?;
     Ok(TlsMaterial::new(
@@ -17,15 +15,25 @@ pub fn build_tls_material(identity: &Identity) -> Result<TlsMaterial> {
     ))
 }
 
-/// 构造 QUIC + TCP 传输（共享同一 TLS 材料 = 同一身份证书）。
 pub fn build_transports(
     config: &EngineConfig,
     material: TlsMaterial,
 ) -> Result<(Arc<QuicTransport>, Arc<TcpTransport>)> {
+    config
+        .pairing
+        .validate()
+        .map_err(crate::CoreError::Internal)?;
+    let mut transport_config = config.transport.clone();
+    transport_config.pairing_exporter = Some(privet_transport::config::PairingExporterLabel {
+        label: config.pairing.pairing_binding_label.as_bytes().to_vec(),
+        context: privet_security::constants::PAIRING_CONTEXT_STRING
+            .as_bytes()
+            .to_vec(),
+    });
     let quic = Arc::new(QuicTransport::new(
         material.clone(),
-        config.transport.clone(),
+        transport_config.clone(),
     ));
-    let tcp = Arc::new(TcpTransport::new(material, config.transport.clone()));
+    let tcp = Arc::new(TcpTransport::new(material, transport_config));
     Ok((quic, tcp))
 }

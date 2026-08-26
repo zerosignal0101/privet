@@ -1,4 +1,3 @@
-//! crypto 错误类型。
 
 use thiserror::Error;
 

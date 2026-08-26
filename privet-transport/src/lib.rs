@@ -1,4 +1,4 @@
-//! privet-transport：QUIC + TCP 降级，统一 Transport trait。不知文件语义。
+//! QUIC and TLS-over-TCP transports behind a shared stream interface.
 
 #![allow(rustdoc::invalid_html_tags)]
 

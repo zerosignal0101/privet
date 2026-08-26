@@ -1,16 +1,13 @@
-//! 存储层路径纵深防御：入库前用 protocol 清洗器复验
 
 use crate::error::StorageError;
 use privet_protocol::path::{sanitize_relative_path, sanitize_root_name};
 
-/// 复验 relative_path，返回规范化串（`/` 分隔）。拒 -> StorageError::Path。
 pub fn guard_relative_path(p: &str) -> Result<String, StorageError> {
     sanitize_relative_path(p)
         .map(|s| s.into_string())
         .map_err(|e| StorageError::Path(format!("relative_path: {e:?}")))
 }
 
-/// 复验 root_name：空 -> None；非空 -> Some(规范化)。
 pub fn guard_root_name(p: &str) -> Result<Option<String>, StorageError> {
     sanitize_root_name(p)
         .map(|opt| opt.map(|s| s.into_string()))

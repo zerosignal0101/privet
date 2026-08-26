@@ -1,4 +1,3 @@
-//! mDNS 通告 + 浏览。
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -11,7 +10,6 @@ use crate::error::{DiscoveryError, Result};
 
 pub const SERVICE_TYPE: &str = "_privet._udp.local.";
 
-/// TXT 映射。
 pub fn to_txt(v: &BeaconView) -> Vec<(String, String)> {
     let mut t = vec![
         ("proto_version".to_string(), v.proto_version.to_string()),
@@ -24,7 +22,6 @@ pub fn to_txt(v: &BeaconView) -> Vec<(String, String)> {
     t
 }
 
-/// 从已解析 mDNS 服务还原 BeaconView（cap 列表/端口）。
 pub fn from_service(
     device_name: &str,
     txt: &HashMap<String, String>,
@@ -48,7 +45,6 @@ pub fn from_service(
     })
 }
 
-/// 规范化实例名：替换非法字符为 `-`，截断 63 字节。
 pub fn normalize_instance_name(device_name: &str, max_bytes: usize) -> String {
     let cleaned: String = device_name
         .chars()
@@ -62,7 +58,6 @@ pub fn normalize_instance_name(device_name: &str, max_bytes: usize) -> String {
     String::from_utf8(out).unwrap_or_else(|_| "privet".to_string())
 }
 
-/// mDNS 通告器。
 pub struct MdnsAnnouncer {
     daemon: Arc<ServiceDaemon>,
 }
@@ -106,7 +101,6 @@ impl MdnsAnnouncer {
     }
 }
 
-/// mDNS 浏览器：发现服务 -> 经 channel 推 (BeaconView, Vec\<IpAddr\>)。
 pub struct MdnsBrowser {
     daemon: Arc<ServiceDaemon>,
 }

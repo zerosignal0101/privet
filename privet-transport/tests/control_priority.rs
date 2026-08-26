@@ -1,5 +1,4 @@
 //! Control-stream priority + TCP cancel-responsiveness under backpressure.
-//! TCP 数据通道满时，Cancel 控制帧必须在前 200ms 内送达。
 
 mod common;
 
@@ -14,14 +13,12 @@ async fn cancel_arrives_while_data_backpressure() {
     let listener = tcp.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().await.unwrap();
 
-    // 服务端：accept 后得到控制流+数据流，但不 drain 数据通道
     let accept = async {
         let conn = listener.accept().await.unwrap();
         let ctrl = conn.control_stream().unwrap();
         let data = conn.open_data_stream().await.unwrap();
         (ctrl, data)
     };
-    // 客户端：connect 后得到控制流+数据流
     let connect = async {
         let conn = tcp
             .connect(addr, privet_transport::TransportMode::Tcp, None)
@@ -39,7 +36,6 @@ async fn cancel_arrives_while_data_backpressure() {
         .await
         .unwrap();
 
-    // Flood: 100 个数据帧填满 data_tx（cap=64），不 drain 服务端数据通道
     for _ in 0..100 {
         let df = privet_protocol::DataFrame {
             payload: Some(privet_protocol::data_frame::Payload::ChunkHeader(
@@ -57,7 +53,6 @@ async fn cancel_arrives_while_data_backpressure() {
             .unwrap();
     }
 
-    // 数据通道已满 — 发送 Cancel 控制帧
     let cancel = privet_protocol::ControlFrame {
         payload: Some(privet_protocol::control_frame::Payload::Control(
             privet_protocol::ControlMessage {
@@ -74,7 +69,6 @@ async fn cancel_arrives_while_data_backpressure() {
         .await
         .unwrap();
 
-    // 服务端 drain 控制通道（数据通道满的情况下，控制帧应在 200ms 内到达）
     let start = std::time::Instant::now();
     let got = tokio::time::timeout(
         Duration::from_millis(500),
@@ -92,7 +86,6 @@ async fn cancel_arrives_while_data_backpressure() {
         elapsed
     );
 
-    // 验证是 Control 帧（Cancel 确认）
     let cf = got.unwrap().expect("recv_control error");
     assert!(
         matches!(

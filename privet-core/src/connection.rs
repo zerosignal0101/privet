@@ -1,4 +1,3 @@
-//! 连接生命周期：connect_with_fallback + Listener accept + 控制流获取 + Hello/HelloAck
 use std::net::SocketAddr;
 
 use privet_crypto::identity::Identity;
@@ -8,7 +7,6 @@ use privet_transport::{connect_with_fallback, Connection, Stream, Transport, Tra
 
 use crate::Result;
 
-/// 连接发起（QUIC 优先 + TCP 降级）。
 pub async fn connect_peer(
     quic: &dyn Transport,
     tcp: Option<&dyn Transport>,
@@ -16,23 +14,32 @@ pub async fn connect_peer(
     mode: TransportMode,
     bind_source: Option<SocketAddr>,
 ) -> Result<Box<dyn Connection>> {
+    connect_peer_with_ports(quic, tcp, addr, addr, mode, bind_source).await
+}
+
+/// Connect using the independently advertised QUIC and TCP endpoints.
+pub async fn connect_peer_with_ports(
+    quic: &dyn Transport,
+    tcp: Option<&dyn Transport>,
+    quic_addr: SocketAddr,
+    tcp_addr: SocketAddr,
+    mode: TransportMode,
+    bind_source: Option<SocketAddr>,
+) -> Result<Box<dyn Connection>> {
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(12),
-        connect_with_fallback(quic, tcp, addr, addr, mode, bind_source),
+        connect_with_fallback(quic, tcp, quic_addr, tcp_addr, mode, bind_source),
     )
     .await
     .map_err(|_| crate::CoreError::Internal("connect timeout".into()))??;
     Ok(conn)
 }
 
-/// 控制流角色：发起方 open（QUIC open_bi）／应答方 accept（QUIC accept_bi）。
 pub enum ControlRole {
     Initiator,
     Responder,
 }
 
-/// 获取控制流（trait 多态，无需 downcast）。
-/// 发起方 open_control / 应答方 accept_control；QUIC 异步开/收双向流，TCP 返回共享 stream_id 0。
 pub async fn acquire_control(conn: &dyn Connection, role: ControlRole) -> Result<Box<dyn Stream>> {
     match role {
         ControlRole::Initiator => Ok(conn.open_control().await?),
@@ -40,16 +47,11 @@ pub async fn acquire_control(conn: &dyn Connection, role: ControlRole) -> Result
     }
 }
 
-/// 数据流角色：发起方（sender）开单向流 open_uni；应答方（receiver）收单向流 accept_uni。
-/// QUIC 单向流仅单侧可用（sender 仅 send_all，receiver 仅 recv_exact），故 sender/receiver 必须分别 open/accept。
-/// TCP 单连接多路（stream_id 1 共享），open_data_stream 即可（不区分角色）。
 pub enum DataRole {
     Initiator,
     Responder,
 }
 
-/// 获取数据流（trait 多态，无需 downcast）。
-/// 发起方 open_data_stream / 应答方 accept_data_stream；QUIC 单向流，TCP 共享 stream_id 1。
 pub async fn acquire_data(conn: &dyn Connection, role: DataRole) -> Result<Box<dyn Stream>> {
     match role {
         DataRole::Initiator => Ok(conn.open_data_stream().await?),
@@ -74,7 +76,6 @@ fn hello_frame(local: &Identity, proto_ver: u32, device_name: &str) -> ControlFr
     }
 }
 
-/// 发起方 Hello 交换：发 Hello，收 HelloAck。
 pub async fn hello_exchange(
     control: &mut dyn Stream,
     local: &Identity,
@@ -91,7 +92,6 @@ pub async fn hello_exchange(
     }
 }
 
-/// 应答方 Hello 交换：收 Hello，回 HelloAck。
 pub async fn hello_exchange_responder(
     control: &mut dyn Stream,
     local: &Identity,

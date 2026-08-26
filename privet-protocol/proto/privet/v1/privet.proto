@@ -1,7 +1,7 @@
 syntax = "proto3";
 package privet.v1;
 
-// ===== 发现（P1）=====
+// Discovery
 message Beacon {
     uint32 proto_version = 1;
     string device_fingerprint = 2;
@@ -23,7 +23,7 @@ message Goodbye {
     string device_fingerprint = 1;
 }
 
-// ===== 握手 =====
+// Connection handshake
 message Hello {
     uint32 proto_version = 1;
     string device_fingerprint = 2;
@@ -42,7 +42,7 @@ message HelloAck {
     string error = 7;
 }
 
-// ===== 配对 =====
+// Pairing
 message PairingInit {
     string device_fingerprint = 1;
     bytes identity_pubkey = 2;
@@ -68,7 +68,7 @@ message PairingResultAck {
     bytes transcript_hash = 1;
 }
 
-// ===== 传送 =====
+// Transfer
 message Segment {
     uint32 segment_id = 1;
     uint64 offset = 2;
@@ -155,7 +155,7 @@ message InlineFile {
     bytes data = 6;
 }
 
-// ===== 传送控制 =====
+// Transfer control
 message Cancel { string transfer_id = 1; string reason = 2; }
 message Pause { string transfer_id = 1; }
 message Resume { string transfer_id = 1; }
@@ -173,7 +173,7 @@ message ControlMessage {
     }
 }
 
-// ===== 控制流信封 =====
+// Control-stream envelope
 message ControlFrame {
     oneof payload {
         Hello hello = 1;
@@ -191,7 +191,7 @@ message ControlFrame {
     }
 }
 
-// ===== 数据流信封 =====
+// Data-stream envelope
 message DataFrame {
     oneof payload {
         ChunkHeader chunk_header = 1;

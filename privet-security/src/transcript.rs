@@ -1,15 +1,12 @@
-//! 转录组装：把会话状态拼成 TranscriptParts，双方算同一 hash。
 use crate::PairingError;
 use privet_crypto::transcript::TranscriptParts;
 
-/// 配对角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Initiator,
     Responder,
 }
 
-/// 组装转录部件。initiator 字段恒在前（与谁签名无关），故 I/R 算同一 hash。
 #[allow(clippy::too_many_arguments)]
 pub fn build_transcript_parts<'a>(
     role: Role,
@@ -43,7 +40,6 @@ pub fn build_transcript_parts<'a>(
     }
 }
 
-/// 断言 PairingInit.identity_pubkey_I == I 的 TLS 证书 SPKI（防 MITM 顶替；失败关闭）。
 pub fn assert_identity_binding(
     declared_pubkey: &[u8],
     tls_spki: &[u8],

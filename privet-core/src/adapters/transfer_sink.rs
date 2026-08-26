@@ -1,4 +1,3 @@
-//! TransferEvent -> EngineEvent 桥接（无数据/哈希内容）+ 传送历史写。
 
 use async_trait::async_trait;
 use privet_storage::history::{self, FileRow, TransferDirection, TransferStatus};
@@ -103,7 +102,6 @@ impl TransferEventSink for CoreTransferEventSink {
     }
 }
 
-// ===== 传送历史写 =====
 
 #[allow(clippy::too_many_arguments)]
 pub fn record_history_start(
@@ -258,7 +256,6 @@ mod tests {
     #[test]
     fn history_start_then_complete() {
         let conn = privet_storage::migration::open_and_migrate(":memory:").unwrap();
-        // 须先建 trust entry（histroy 的 FK 引用）
         conn.execute(
             "INSERT INTO trust_store(device_fingerprint, peer_spki, peer_device_name, trust_state, first_paired_ts, last_seen_ts)
              VALUES('dev1', X'01', 'peer', 'Trusted', 100, 100)",

@@ -1,7 +1,4 @@
-//! 真实 QUIC 上的配对 e2e（SPAKE2+ 完整握手） + 免密直连测试。
-//!
-//! 注：服务端（responder）无对端 TLS 证书（非 mTLS），但 TLS exporter 对称可用（同一会话）。
-//! 故 responder 从 TLS 提取 exporter，SPKI 从测试已知的客户端 SPKI 传入。
+//! End-to-end pairing over concrete transports.
 use std::time::Duration;
 
 use privet_core::auth::{decide_auth, AuthPlan};
@@ -39,7 +36,6 @@ async fn pairing_succeeds_over_quic() {
     let pake = Spake2Backend;
     let clock = SystemPairingClock;
 
-    // 在 accept/connect 闭包外持有信道，防止 premature close。
     let accept = async {
         let conn = listener.accept().await.unwrap();
         let exporter_bytes = conn
@@ -70,7 +66,6 @@ async fn pairing_succeeds_over_quic() {
         let outcome = run_pairing_responder(&srv_id, &inputs, &mut ch, &clock, &srv_trust, &pake)
             .await
             .unwrap();
-        // 保持 ch 不 drop（hold 在返回值中）
         (outcome, srv_trust, ch)
     };
 
@@ -113,7 +108,6 @@ async fn pairing_succeeds_over_quic() {
             run_pairing_initiator(&cli_id, &inputs, &mut ch, &clock, &cli_trust, &proof, &pake)
                 .await
                 .unwrap();
-        // 保持 ch 不 drop
         (outcome, cli_trust, inputs, ch)
     };
 

@@ -1,5 +1,3 @@
-//! StorageTrustStore：把 privet_security::TrustStore 接到 privet_storage::trust（同步锁，微秒级 SQLite）。
-//! 同对象也 impl ProofStore（PendingProof 经 bincode 存 SQLite 单行 kv）。
 use std::sync::{Arc, Mutex};
 
 use privet_security::commit::{PendingProof, ProofStore};
@@ -78,7 +76,6 @@ impl TrustStore for StorageTrustStore {
     }
 }
 
-// ===== ProofStore（PendingProof 经 bincode 存 SQLite 单行 kv）=====
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PendingProofSer {

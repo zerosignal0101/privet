@@ -8,7 +8,6 @@ use privet_security::trust::{InMemoryTrustStore, TrustState, TrustStore};
 use privet_security::PairingError;
 use std::sync::Arc;
 
-/// 信道永不返回（recv 一直 pending）-> 用于 AckTimeout 测试。
 struct HangingChannel;
 #[async_trait]
 impl PairingChannel for HangingChannel {
@@ -106,7 +105,6 @@ async fn ack_delivered_commits_and_returns_paired_clears_proof() {
 
 #[tokio::test]
 async fn ack_delayed_retry_powers_through() {
-    // ack 来得晚（超过第一轮超时但仍在重试次数内）-> I 重发后收到并提交
     let (proof, trust, store) = make_proof();
     let (mut ch, mut ch_r) = LoopbackChannel::pair(16);
     let clk = Arc::new(MutableClock::new());

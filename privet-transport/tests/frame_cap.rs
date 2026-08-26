@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use privet_transport::transport::Stream;
 use privet_transport::TransportError;
-use privet_transport::{recv_control, recv_data, send_data};
+use privet_transport::{recv_control, recv_data};
 
 struct MemStream {
     buf: Vec<u8>,
@@ -57,7 +57,7 @@ async fn oversized_chunk_length_rejected() {
         buf: Vec::new(),
         pos: 0,
     };
-    send_data(&mut s, &df, Some(b"x")).await.unwrap();
+    s.buf.extend_from_slice(&privet_protocol::framing::encode_data(&df, None));
     s.pos = 0;
     let err = recv_data(&mut s).await.unwrap_err();
     assert!(matches!(err, TransportError::TooLarge));

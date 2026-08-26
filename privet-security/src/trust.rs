@@ -1,7 +1,5 @@
-//! 信任库状态与可注入 trait。本 crate 不依赖 storage；core 用 storage::trust 实现真实 TrustStore。
 use crate::PairingError;
 
-/// 信任状态：Unknown 不在库；Trusted 公钥已钉扎；Revoked 退化为需重新配对。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustState {
     Unknown,
@@ -10,7 +8,6 @@ pub enum TrustState {
 }
 
 impl TrustState {
-    /// 与 storage 的 String 列互转（storage::trust 用 "Trusted"/"Revoked"）。
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "Trusted" => Self::Trusted,
@@ -27,7 +24,6 @@ impl TrustState {
     }
 }
 
-/// 待提交的对端信任条目。
 #[derive(Debug, Clone)]
 pub struct PeerTrust {
     pub device_fingerprint: String,
@@ -38,7 +34,6 @@ pub struct PeerTrust {
     pub last_seen_ts: u64,
 }
 
-/// 信任库记录（读出形态）。
 #[derive(Debug, Clone)]
 pub struct TrustRecord {
     pub device_fingerprint: String,
@@ -52,10 +47,8 @@ pub struct TrustRecord {
     pub revocation_reason: Option<String>,
 }
 
-/// 可注入信任库（同步：短促 KV 操作；core 用 spawn_blocking 包 storage）。
 pub trait TrustStore: Send + Sync {
     fn get(&self, device_fingerprint: &str) -> Result<Option<TrustRecord>, PairingError>;
-    /// 提交/重配对：upsert（存在则覆盖 SPKI 并回到 Trusted）。
     fn commit_peer(&self, peer: PeerTrust) -> Result<(), PairingError>;
     fn revoke(&self, device_fingerprint: &str, reason: &str, now_ms: u64) -> Result<(), PairingError>;
     fn refresh_seen(
@@ -67,7 +60,6 @@ pub trait TrustStore: Send + Sync {
     fn forget(&self, device_fingerprint: &str) -> Result<(), PairingError>;
 }
 
-/// 进程内信任库（测试/嵌入式）。
 pub struct InMemoryTrustStore {
     inner: std::sync::Mutex<std::collections::HashMap<String, TrustRecord>>,
 }

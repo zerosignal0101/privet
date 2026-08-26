@@ -1,4 +1,3 @@
-//! beacon 任务时序：立即 + 每 60s。tokio::time::pause 推进虚拟时钟。
 
 use privet_discovery::beacon::message_tag;
 use privet_discovery::config::DiscoveryConfigPrivet;
@@ -27,7 +26,6 @@ async fn beacon_task_sends_immediate_then_periodic() {
     eng.set_outgoing(sink.clone());
     let h = eng.clone().spawn_beacon_task();
 
-    // 立即一帧：yield 让 spawn 任务有机会跑
     tokio::task::yield_now().await;
     assert!(!sink.captured().is_empty(), "immediate beacon");
     let n0 = sink.captured().len();
@@ -36,12 +34,11 @@ async fn beacon_task_sends_immediate_then_periodic() {
         .iter()
         .all(|(d, _)| message_tag(d) == Some(1)));
 
-    // 推进 60s -> 第二帧
     tokio::time::advance(BEACON_INTERVAL).await;
     tokio::task::yield_now().await;
     assert!(sink.captured().len() > n0, "periodic beacon after 60s");
 
-    eng.cancel(); // 停
+    eng.cancel();
     tokio::task::yield_now().await;
     let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
 }

@@ -1,6 +1,4 @@
-//! privet-transfer：传输引擎。可靠文件/文件夹传输 + BLAKE3 三级完整性 + 断点续传 + 取消/暂停/重连。
-//! 引擎核心消费可注入 trait（ControlChannel/DataChannel/Clock/TransferEventSink/PartStore/ChunkReader）；
-//! 真实 QUIC/TCP 接线推迟到 privet-core。
+//! File-set preparation, integrity verification, transfer state, and resume behavior.
 
 #![allow(rustdoc::invalid_html_tags)]
 
@@ -35,5 +33,5 @@ pub use prepare::{prepare_dir, prepare_dir_streaming, prepare_single_file, Prepa
 pub use channel::{ControlChannel, DataChannel};
 pub use transport_adapter::{StreamControlChannel, StreamDataChannel};
 pub use part_store::FsPartStore;
-pub use sender::{run_sender, ChunkReader, MappedChunkReader, SenderInputs};
+pub use sender::{run_sender, ChunkReader, MappedChunkReader, SenderInputs, SharedCommandReceiver};
 pub use receiver::{run_receiver, ReceiverInputs};

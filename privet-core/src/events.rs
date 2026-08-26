@@ -1,10 +1,8 @@
-//! EngineEvent：仅 reason/result/progress/状态码 + 公开 id；无码/密钥/签名/哈希。
 
 use privet_transfer::PausedReason;
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    // 发现
     DeviceDiscovered {
         device_fingerprint: String,
         device_name: String,
@@ -12,7 +10,6 @@ pub enum EngineEvent {
     DeviceLost {
         device_fingerprint: String,
     },
-    // 配对
     PairingRequested {
         device_fingerprint: String,
     },
@@ -21,7 +18,6 @@ pub enum EngineEvent {
         success: bool,
         error: Option<String>,
     },
-    // 传送
     TransferPreparing {
         transfer_id: String,
     },
@@ -64,11 +60,9 @@ pub enum EngineEvent {
         retryable: bool,
         part_kept: bool,
     },
-    // 入站连接
     IncomingConnection {
         device_fingerprint: String,
     },
 }
 
-/// 事件订阅句柄（broadcast 接收端）。
 pub type EventSubscriber = tokio::sync::broadcast::Receiver<EngineEvent>;

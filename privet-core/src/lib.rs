@@ -1,5 +1,8 @@
-//! privet-core：Engine 集成层。把 discovery+transport+security+transfer+storage 缝接成可运行引擎，
-//! 暴露 async API + 事件通道。前端唯一入口。真实 I/O 接线在此完成。
+//! Daemon-side orchestration for Privet discovery, pairing, and transfers.
+//!
+//! Frontends must use the daemon IPC contract described in `SPEC.md`; direct engine embedding is
+//! reserved for the daemon and integration tests.
+
 #![allow(rustdoc::invalid_html_tags)]
 
 pub mod constants;

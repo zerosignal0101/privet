@@ -1,4 +1,3 @@
-//!  Full Engine e2e（构造 -> start -> subscribe -> shutdown -> 取消检查）。
 use privet_core::{Engine, EngineConfig};
 use tempfile::TempDir;
 

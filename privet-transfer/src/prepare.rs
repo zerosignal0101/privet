@@ -1,5 +1,3 @@
-//! Preparing（前置态）：遍历发送根 -> FileEntry/DirEntry/FileSetSummary + 流式 BLAKE3。
-//! 单次扫描产出整文件 BLAKE3 + 段根 + 逐块哈希（三级；段根随 manifest 流式发出，见 sender.rs）。
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +10,6 @@ use privet_protocol::layout::derive_segment_layout;
 use privet_protocol::path::{sanitize_relative_path, sanitize_root_name};
 use privet_protocol::{DirEntry, FileEntry, FileSetSummary};
 
-/// 单文件准备结果（含 manifest 所需哈希）。
 #[derive(Debug, Clone)]
 pub struct PreparedFile {
     pub file_id: String,
@@ -39,7 +36,6 @@ impl PreparedFile {
     }
 }
 
-/// 准备好的文件集。
 #[derive(Debug, Clone)]
 pub struct PreparedSet {
     pub root_name: Option<String>,
@@ -48,12 +44,10 @@ pub struct PreparedSet {
     pub summary: FileSetSummary,
 }
 
-/// 判断文件数是否在 DoS 上限内。
 pub fn is_within_file_limit(count: u64) -> bool {
     count <= MAX_FILES_PER_TRANSFER
 }
 
-/// 准备单文件（offset_id 仅用于生成 file_id）。
 pub fn prepare_single_file(
     root: &Path,
     rel: &str,
@@ -139,7 +133,6 @@ pub fn prepare_single_file(
     })
 }
 
-/// 遍历发送根，准备整个文件集。
 pub fn prepare_dir(
     root: &Path,
     root_name: Option<&str>,
@@ -191,7 +184,6 @@ pub fn prepare_dir(
     })
 }
 
-/// 带进度回调的 async prepare 版本（emit PreparingProgress 给事件收集器）。
 pub async fn prepare_dir_streaming(
     root: &Path,
     root_name: Option<&str>,
@@ -201,7 +193,6 @@ pub async fn prepare_dir_streaming(
     sink: &dyn TransferEventSink,
     transfer_id: &str,
 ) -> Result<PreparedSet> {
-    // Phase 1: 快速遍历统计 total_bytes 及文件列表（不哈希）
     let sanitized_root = sanitize_root_name(root_name.unwrap_or(""))?;
     let root_name_clean: Option<String> = sanitized_root.map(|s| s.into_string());
 
@@ -225,7 +216,6 @@ pub async fn prepare_dir_streaming(
         ));
     }
 
-    // Phase 2: 逐文件哈希 + 进度回调
     let mut files = Vec::with_capacity(file_infos.len());
     let mut scanned_bytes = 0u64;
     for (i, (rel_str, _abs_path, _size)) in file_infos.iter().enumerate() {
@@ -264,7 +254,6 @@ pub async fn prepare_dir_streaming(
     })
 }
 
-/// 轻量遍历：只统计文件路径和大小，不哈希。
 fn walk_for_count(
     root: &Path,
     cur: &Path,

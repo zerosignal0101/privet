@@ -1,6 +1,3 @@
-//! 续传已验证位图重建
-//! 读 `.part` + `.part.meta` -> 重哈希各块比对 `chunk_hash_values` -> 重建位图。
-//! 流式 seek+read 每块，内存有界（单块缓冲），不整体加载 .part。
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -14,13 +11,10 @@ pub struct SegmentBitmask {
     pub bitmask: Vec<u8>,
 }
 
-/// 最大合理 chunk 大小（4 MiB；防 OOM）。
 const MAX_REASONABLE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
-/// 最大合理 chunk 数量（防 bitmask 爆内存）。
 const MAX_REASONABLE_CHUNK_COUNT: usize = 1 << 20;
 
-/// 重建已验证位图（抗畸形 sidecar：bound loop + cap alloc）。
 pub fn rebuild_verified_bitmap(
     save_dir: &Path,
     transfer_id: &str,
@@ -53,7 +47,6 @@ pub fn rebuild_verified_bitmap(
                 seg.chunk_count
             )));
         }
-        // bound loop by available hashes (防 OOB)
         if !seg.chunk_hash_values.is_empty() && seg.chunk_hash_values.len() != chunk_count {
             return Err(StorageError::Corrupt(format!(
                 "chunk_count {} != chunk_hash_values.len {}",
@@ -160,7 +153,6 @@ mod tests {
         assert_eq!(bm.len(), 1);
         assert_eq!(bm[0].bitmask, vec![0b11]);
 
-        // 篡改第 1 块 -> 其位清 0
         let mut corrupted = data.clone();
         corrupted[4..8].copy_from_slice(b"XXXX");
         write_part(save, "t1", rel, &corrupted);

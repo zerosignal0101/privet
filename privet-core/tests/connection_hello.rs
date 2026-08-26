@@ -1,4 +1,3 @@
-//! connect/accept + Hello/HelloAck e2e over real QUIC loopback。
 use std::time::Duration;
 
 use privet_core::connection::{

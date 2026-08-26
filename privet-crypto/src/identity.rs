@@ -1,4 +1,3 @@
-//! Ed25519 设备身份 + 自签 X.509 证书。
 
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -56,7 +55,6 @@ impl Identity {
             .map_err(|e| CryptoError::InvalidKey(e.to_string()))
     }
 
-    /// 序列化为可存储形态（PKCS8 私钥 + SPKI + 证书 + device_id）。
     pub fn to_stored(&self) -> Result<crate::keystore::StoredIdentity, CryptoError> {
         use ed25519_dalek::pkcs8::EncodePrivateKey;
         let pkcs8 = self
@@ -64,14 +62,12 @@ impl Identity {
             .to_pkcs8_der()
             .map_err(|e| CryptoError::Encoding(e.to_string()))?;
         Ok(crate::keystore::StoredIdentity {
-            // 私钥 drop 时清零
             signing_key_pkcs8: Zeroizing::new(pkcs8.as_bytes().to_vec()),
             spki_der: self.spki_der.clone(),
             cert_der: self.cert_der.clone(),
         })
     }
 
-    /// 从存储形态重建身份。PKCS8 派生公钥解码自存储 SPKI 后须与签名密钥公钥一致（防御）。
     pub fn from_stored(s: &crate::keystore::StoredIdentity) -> Result<Self, CryptoError> {
         let signing_key = SigningKey::from_pkcs8_der(s.signing_key_pkcs8.as_ref())
             .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;

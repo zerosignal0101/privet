@@ -1,4 +1,3 @@
-//! receiver 周期发 ChunkAck（每 64 块或时间基）。
 
 use privet_protocol::{
     control_frame::Payload as CPayload, data_frame::Payload as DPayload, ChunkHeader, ControlFrame,

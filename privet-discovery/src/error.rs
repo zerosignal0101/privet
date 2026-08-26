@@ -1,4 +1,3 @@
-//! 发现层错误。
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {

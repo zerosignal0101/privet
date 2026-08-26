@@ -1,5 +1,3 @@
-//! FileSetBatch 流式分帧+ receiver 累积器 + summary 校验。
-//! offer 仅 summary；续以 FileSetBatch 多帧（每帧 < 4MiB，is_last 终结）。
 
 use crate::constants::FILESET_BATCH_TARGET_BYTES;
 use crate::error::{Result, TransferError};
@@ -7,7 +5,6 @@ use crate::prepare::PreparedFile;
 use privet_protocol::{DirEntry, FileEntry, FileSetBatch, FileSetSummary, TransferOffer};
 use prost::Message;
 
-/// 构建 offer（仅 summary + 元信息）。
 pub fn build_offer(transfer_id: &str, set: &crate::prepare::PreparedSet) -> TransferOffer {
     TransferOffer {
         transfer_id: transfer_id.into(),
@@ -17,7 +14,6 @@ pub fn build_offer(transfer_id: &str, set: &crate::prepare::PreparedSet) -> Tran
     }
 }
 
-/// FileSetBatch 分帧器：累积 files/dirs 至目标字节量后切帧。
 pub struct FileSetBatcher {
     transfer_id: String,
     cur_files: Vec<FileEntry>,
@@ -38,7 +34,9 @@ impl FileSetBatcher {
     }
 
     fn flush_if_full(&mut self) {
-        if self.cur_bytes >= FILESET_BATCH_TARGET_BYTES && !self.cur_files.is_empty() {
+        if self.cur_bytes >= FILESET_BATCH_TARGET_BYTES
+            && (!self.cur_files.is_empty() || !self.cur_dirs.is_empty())
+        {
             self.frames.push(FileSetBatch {
                 transfer_id: self.transfer_id.clone(),
                 files: std::mem::take(&mut self.cur_files),
@@ -56,12 +54,12 @@ impl FileSetBatcher {
         self.flush_if_full();
     }
 
-    #[allow(dead_code)]
     pub fn push_dir(&mut self, d: &DirEntry) {
+        self.cur_bytes += d.encoded_len();
         self.cur_dirs.push(d.clone());
+        self.flush_if_full();
     }
 
-    /// 终结：输出剩余 + 末帧 is_last=true。至少返回 1 帧（即使空）。
     pub fn finish(mut self) -> Vec<FileSetBatch> {
         self.frames.push(FileSetBatch {
             transfer_id: self.transfer_id,
@@ -73,7 +71,6 @@ impl FileSetBatcher {
     }
 }
 
-/// receiver 累积重建 FileSet，按 summary 校完整性（Q4）。
 pub struct FileSetAccumulator {
     summary: FileSetSummary,
     files: Vec<FileEntry>,

@@ -1,6 +1,4 @@
-//! 传送生命周期状态机。
 
-/// Paused 原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PausedReason {
     User,
@@ -9,7 +7,6 @@ pub enum PausedReason {
     ReconnectExhausted,
 }
 
-/// Failed 属性（对齐 TransferFailed{retryable,part_kept}）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferFailed {
     pub error_code: &'static str,
@@ -18,7 +15,6 @@ pub struct TransferFailed {
     pub part_kept: bool,
 }
 
-/// 传送状态。瞬时态 Reconnecting 不作持久态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferState {
     Preparing,
@@ -40,7 +36,6 @@ impl TransferState {
         matches!(self, Self::Completed | Self::Cancelled | Self::Failed(_))
     }
 
-    /// 检查状态迁移是否合法。返回 Ok(to) 或 Err 说明。
     pub fn transition(
         from: &TransferState,
         to: TransferState,

@@ -1,4 +1,3 @@
-//! PairingError。映射到 PairingResult.error 与连接拒绝码；不回传码/密钥。
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -27,7 +26,6 @@ pub enum PairingError {
     Protocol(String),
 }
 
-/// PairingResult.error 字符串（不含敏感材料）。
 impl PairingError {
     pub fn error_code(&self) -> &'static str {
         match self {

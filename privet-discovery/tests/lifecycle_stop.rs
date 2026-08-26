@@ -1,4 +1,3 @@
-//! stop：广播 Goodbye + 取消并 join 所有任务 + 关 mDNS。
 
 use privet_discovery::beacon::message_tag;
 use privet_discovery::config::DiscoveryConfigPrivet;
@@ -28,16 +27,13 @@ async fn stop_sends_goodbye_and_joins_tasks() {
     let s = eng.clone().spawn_sweep_task();
 
     eng.stop().await.unwrap();
-    // stop() 只 join start() 内注册的任务；测试手动 join 当前任务
     let _ = tokio::time::timeout(Duration::from_secs(2), b).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), s).await;
     let cap = sink.captured();
-    // 至少一帧 Goodbye（tag 3）发往某广播目标
     assert!(
         cap.iter().any(|(d, _)| message_tag(d) == Some(3)),
         "Goodbye must be sent: {cap:?}"
     );
-    // 任务已 join（无泄漏）：再 advance 不应产生新帧
     let before = cap.len();
     tokio::time::advance(Duration::from_secs(120)).await;
     tokio::task::yield_now().await;

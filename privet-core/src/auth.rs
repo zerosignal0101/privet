@@ -1,26 +1,40 @@
-//! conn_auth 编排：提取 peer SPKI + TLS exporter -> SessionInputs；钉扎分支。
 use privet_security::cert::{extract_spki, ConnAuthAction};
 use privet_security::conn_auth::{build_alert, conn_auth};
-use privet_security::constants::{EXPORTER_LEN, PAIRING_BINDING_LABEL, PAIRING_CONTEXT_STRING};
+use privet_security::constants::{EXPORTER_LEN, PAIRING_CONTEXT_STRING};
 use privet_security::session::SessionInputs;
 use privet_security::trust::TrustStore;
 use privet_transport::Connection;
 
 use crate::Result;
 
-/// 从连接提取 SessionInputs（peer SPKI 来自证书；exporter 来自 TLS）。
 pub fn peer_session_inputs(
     conn: &dyn Connection,
     code: String,
     peer_device_fingerprint: String,
     peer_device_name: String,
 ) -> Result<SessionInputs> {
+    peer_session_inputs_with_config(
+        conn,
+        code,
+        peer_device_fingerprint,
+        peer_device_name,
+        &privet_security::PairingConfig::default(),
+    )
+}
+
+pub fn peer_session_inputs_with_config(
+    conn: &dyn Connection,
+    code: String,
+    peer_device_fingerprint: String,
+    peer_device_name: String,
+    pairing: &privet_security::PairingConfig,
+) -> Result<SessionInputs> {
     let cert_der = conn
         .peer_cert_der()
         .ok_or_else(|| crate::CoreError::Internal("peer cert unavailable".into()))?;
     let peer_spki = extract_spki(&cert_der)?;
     let exporter_bytes = conn.export_keying_material(
-        PAIRING_BINDING_LABEL.as_bytes(),
+        pairing.pairing_binding_label.as_bytes(),
         Some(PAIRING_CONTEXT_STRING.as_bytes()),
     )?;
     let mut exporter = [0u8; EXPORTER_LEN];
@@ -35,16 +49,11 @@ pub fn peer_session_inputs(
     })
 }
 
-/// 钉扎分支计划。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthPlan {
-    /// 已配对 + SPKI 一致 -> 免码直连。
     AcceptCodeless,
-    /// 未知 -> 触发配对。
     TriggerPairing,
-    /// Revoked -> 静默拒。
     Reject,
-    /// SPKI 不符 -> 失败关闭告警。
     FailClosedAlert,
 }
 

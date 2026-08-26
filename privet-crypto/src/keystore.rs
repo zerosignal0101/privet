@@ -1,4 +1,3 @@
-//! 密钥库抽象：trait + FileKeyStore(0600) + InMemoryKeyStore。
 
 use std::path::{Path, PathBuf};
 
@@ -7,8 +6,6 @@ use zeroize::Zeroizing;
 
 use crate::error::CryptoError;
 
-/// 可存储的身份形态（PKCS8 私钥 + SPKI + 证书）。
-/// signing_key_pkcs8 用 Zeroizing 包装，drop 时清零。
 #[derive(Serialize, Deserialize)]
 pub struct StoredIdentity {
     pub signing_key_pkcs8: Zeroizing<Vec<u8>>,
@@ -16,14 +13,12 @@ pub struct StoredIdentity {
     pub cert_der: Vec<u8>,
 }
 
-/// 密钥库抽象（同步：keystore 操作短促；core 用 spawn_blocking 包裹平台后端）。
 pub trait KeyStore: Send + Sync {
     fn store(&self, identity: &StoredIdentity) -> Result<(), CryptoError>;
     fn load(&self) -> Result<Option<StoredIdentity>, CryptoError>;
     fn delete(&self) -> Result<(), CryptoError>;
 }
 
-/// 文件密钥库：`0600` 原子写（私钥仅在此 0600 文件内）。
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct FileKeyStore {
     path: PathBuf,
@@ -115,9 +110,6 @@ impl FileKeyStore {
     }
 }
 
-/// Windows 文件密钥库实现。
-/// 当前：与 Unix 同路径的文件 I/O；权限由 NTFS DACL 保护（`set_file_owner_only` 在
-/// `privet-ipc` 侧可选调用，keystore 自身不做 0600 等价）。
 #[cfg(windows)]
 impl FileKeyStore {
     fn store_windows(&self, identity: &StoredIdentity) -> Result<(), CryptoError> {
@@ -146,7 +138,6 @@ impl FileKeyStore {
     }
 }
 
-/// 原子写 + 0600（unix）：写到同目录临时文件、设权限、fsync、rename。
 /// cfg(not(unix)): only used by store_unix, which is cfg(unix).
 #[cfg_attr(not(unix), allow(dead_code))]
 fn atomic_write_0600(path: &Path, data: &[u8]) -> Result<(), CryptoError> {

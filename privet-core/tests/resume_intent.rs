@@ -1,5 +1,3 @@
-//! 续传意图错误路径：resume_send 各校验分支。
-//! 注：跨连接续传 e2e 见 reconnect_e2e.rs::drop_mid_transfer_then_resume。
 use privet_core::{Engine, EngineConfig};
 use tempfile::TempDir;
 

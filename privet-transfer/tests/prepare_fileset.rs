@@ -1,4 +1,3 @@
-//! Preparing + FileSetBatch 流式
 use privet_protocol::FileSetSummary;
 use privet_transfer::fileset::{build_offer, FileSetAccumulator, FileSetBatcher};
 use privet_transfer::prepare::{is_within_file_limit, prepare_dir, prepare_single_file};
@@ -27,15 +26,20 @@ fn prepare_single_file_hashes() {
 fn prepare_dir_inlines_small_and_segments_large() {
     let dir = tempdir().unwrap();
     write(dir.path(), "small.txt", b"tiny");
-    let big = vec![7u8; 2 * 1024 * 1024]; // 2MiB -> 2 块
+    let big = vec![7u8; 2 * 1024 * 1024];
     write(dir.path(), "big.bin", &big);
     write(dir.path(), "sub/inner.txt", b"inner");
     fs::create_dir_all(dir.path().join("emptydir")).unwrap();
+    fs::create_dir_all(dir.path().join("empty-tree/child/grandchild")).unwrap();
 
     let set = prepare_dir(dir.path(), None, 1, 1024 * 1024, 1024).unwrap();
     assert_eq!(set.files.len(), 3);
     // "sub" and "emptydir"
     assert!(set.dirs.iter().any(|d| d.relative_path == "emptydir"));
+    assert!(set
+        .dirs
+        .iter()
+        .any(|d| d.relative_path == "empty-tree/child/grandchild"));
     let big_entry = set
         .files
         .iter()

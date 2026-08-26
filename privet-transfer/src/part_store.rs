@@ -1,5 +1,3 @@
-//! PartStore：.part pwrite + sidecar 写/读 + resume 重建 + finalize(碰撞) + 落地根 mkdir + staging 清理。
-//! 消费 privet-storage（sidecar/staging/resume/path_guard），不重写。
 
 use std::path::{Path, PathBuf};
 
@@ -12,15 +10,12 @@ use privet_storage::sidecar::{
 use privet_storage::staging::{cleanup_staging_dir, delete_part_and_meta, finalize_part_file};
 use privet_storage::STAGING_DIR_NAME;
 
-/// finalize 结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalizeOutcome {
     Landed,
     Skipped,
 }
 
-/// .part + sidecar + resume + finalize 抽象（接收方用）。
-/// 同步 fs 操作（std::fs）；重 I/O 在 core 用 spawn_blocking 包裹。
 pub trait PartStore: Send + Sync {
     fn pwrite_part(
         &self,
@@ -72,7 +67,6 @@ pub trait PartStore: Send + Sync {
     fn save_dir(&self) -> &Path;
 }
 
-/// 真实 fs 实现（消费 storage）。
 pub struct FsPartStore {
     save_dir: PathBuf,
 }
@@ -238,7 +232,6 @@ impl PartStore for FsPartStore {
     }
 }
 
-/// 碰撞 rename：找空名 name(N).ext（(N) 插末次扩展名前；无扩展则 name(N)）。
 pub fn resolve_collision_path(final_path: &Path) -> Result<PathBuf> {
     let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = final_path

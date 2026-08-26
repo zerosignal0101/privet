@@ -1,8 +1,6 @@
-//! 前向 only、失败关闭的迁移运行器
 
 use crate::error::StorageError;
 
-/// 一个版本迁移（前向 only，无 down）。
 pub struct Migration {
     pub version: u32,
     pub name: &'static str,
@@ -33,7 +31,6 @@ pub fn run_migrations(
         match res {
             Ok(()) => tx.commit()?,
             Err(e) => {
-                // 失败关闭：回滚该事务，库不动。
                 let _ = tx.rollback();
                 return Err(StorageError::Migration {
                     version: m.version,
@@ -64,7 +61,6 @@ fn unix_now_secs() -> i64 {
 
 use crate::schema_v1::V1_SQL;
 
-/// 已发布的迁移（前向 only）。
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -73,7 +69,6 @@ pub const MIGRATIONS: &[Migration] = &[
     }
 ];
 
-/// 便捷：打开 DB 并应用到最新。
 pub fn open_and_migrate(
     path: impl AsRef<std::path::Path>,
 ) -> Result<rusqlite::Connection, StorageError> {

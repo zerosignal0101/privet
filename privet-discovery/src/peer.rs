@@ -1,4 +1,3 @@
-//! 对等体状态机（表驱动）+ PeerRecord + CandidateAddress + PeerStore。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerState {
@@ -24,7 +23,6 @@ pub enum PeerEvent {
     KnownAddrConnectFail,
 }
 
-/// 状态迁移。返回 None 表示该 (state,event) 无定义迁移（保持原态或忽略）。
 pub fn transition(state: PeerState, event: PeerEvent) -> Option<PeerState> {
     use PeerEvent::*;
     use PeerState::*;
@@ -47,14 +45,13 @@ pub fn transition(state: PeerState, event: PeerEvent) -> Option<PeerState> {
     })
 }
 
-// ===== PeerRecord + CandidateAddress + PeerStore（Task 5）=====
+// Peer records and candidate addresses.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::beacon::BeaconView;
 
-/// 一个候选地址：`(ip, quic_port, tcp_port, heard_iface, last_seen)`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateAddress {
     pub ip: IpAddr,
@@ -75,7 +72,7 @@ pub struct PeerRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerStoreEvent {
-    Discovered(String), // 新 peer 出现
+    Discovered(String),
     StateChanged(String, PeerState),
     Lost(String),
 }
@@ -118,7 +115,6 @@ impl PeerStore {
                 } else {
                     rec.candidates.push(cand);
                 }
-                // 任何 beacon_recv 推进状态机（Stale->Live 等）
                 let prev = rec.state;
                 if let Some(ns) = transition(prev, PeerEvent::BeaconRecv) {
                     rec.state = ns;
@@ -171,8 +167,6 @@ impl PeerStore {
         }
     }
 
-    /// 周期扫描：Live 超 stale -> Stale；Stale 超 lost -> Lost。
-    /// 纯逻辑（无 I/O）；由 sweep 任务按 SWEEP_INTERVAL 调用。
     pub fn sweep(&mut self, now_ms: u64, stale: std::time::Duration, lost: std::time::Duration) {
         let stale_ms = stale.as_millis() as u64;
         let lost_ms = lost.as_millis() as u64;
@@ -188,13 +182,12 @@ impl PeerStore {
             }
             let last = rec.last_beacon_ms;
             if now_ms < last {
-                continue; // 时钟回退，保守跳过
+                continue;
             }
             let age = now_ms - last;
             if state == PeerState::Live && age > stale_ms {
                 self.transition(&fp, PeerEvent::StaleTimeout);
             }
-            // 同一轮若已越 lost 阈值（Live 经 Stale 后），继续推 Lost。
             if let Some(r) = self.peers.get(&fp) {
                 if r.state == PeerState::Stale && age > lost_ms {
                     self.transition(&fp, PeerEvent::LostTimeout);

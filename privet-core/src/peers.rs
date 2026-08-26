@@ -1,4 +1,3 @@
-//! 多 peer 连接管理 + 每 peer 并发上限（MAX_CONCURRENT_TRANSFERS_PER_PEER=1）。
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

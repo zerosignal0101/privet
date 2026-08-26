@@ -1,4 +1,3 @@
-//! 传输层错误。
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

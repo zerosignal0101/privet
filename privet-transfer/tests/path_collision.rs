@@ -1,4 +1,3 @@
-//! 路径安全 + root_name + 空目录 + 碰撞矩阵
 use privet_protocol::path::sanitize_relative_path;
 use privet_transfer::config::CollisionPolicy;
 use privet_transfer::part_store::{FsPartStore, PartStore};

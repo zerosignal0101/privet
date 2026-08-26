@@ -1,4 +1,3 @@
-//! Stream 适配器（包 privet_transport::Stream + frame_io）。
 use async_trait::async_trait;
 use bytes::BytesMut;
 use privet_protocol::{
@@ -12,10 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// 双向内存流：两条 VecDeque 队列（每个方向一条）+ 通知。
 struct LoopbackStream {
-    to_peer: Arc<ChannelPair>,   // 写入此端 -> 对端读出
-    from_peer: Arc<ChannelPair>, // 对端写入 -> 从此端读出
+    to_peer: Arc<ChannelPair>,
+    from_peer: Arc<ChannelPair>,
 }
 struct ChannelPair {
     buf: Mutex<VecDeque<u8>>,

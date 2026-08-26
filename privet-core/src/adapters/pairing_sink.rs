@@ -1,4 +1,3 @@
-//! PairingEvent -> EngineEvent 桥接（无码/密钥/签名）。
 use privet_security::events::{PairingEvent, PairingEventSink};
 use tokio::sync::broadcast;
 

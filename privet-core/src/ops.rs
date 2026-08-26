@@ -1,19 +1,15 @@
-//! Engine 高层操作（P6 前端入口）：读类查询 + send/serve/pair/discover 编排。
-//! 模块级编排函数见 connection/auth/pairing/transfer/discovery；此文件把它们绑到 Engine 持有的组件。
 use privet_storage::{history, trust};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Engine;
 
-/// 本机身份公开信息（无密钥）。
 pub struct IdentityInfo {
     pub device_fingerprint: String,
     pub name: String,
 }
 
 impl Engine {
-    /// 本机身份信息（device_fingerprint / 显示名 / 指纹前缀 8 hex）。
     pub fn identity_info(&self) -> IdentityInfo {
         IdentityInfo {
             device_fingerprint: self.identity().fingerprint(),
@@ -21,13 +17,11 @@ impl Engine {
         }
     }
 
-    /// 全部信任记录（Trusted + Revoked）。
     pub fn list_trusted(&self) -> crate::Result<Vec<trust::TrustRecord>> {
         let db = self.db_conn()?;
         Ok(trust::list_all(&db)?)
     }
 
-    /// 历史查询（peer=Some 过滤；limit 行数）。
     pub fn history(
         &self,
         peer: Option<&str>,
@@ -37,7 +31,17 @@ impl Engine {
         Ok(history::list_history(&db, peer, limit as i64)?)
     }
 
-    /// 解析对端：device_fingerprint -> 信任+地址簿 recent_n\[0\]；ByAddr 直用。`via` 覆盖 IP（保留端口）。
+    pub fn revoke_peer(&self, device_fingerprint: &str, reason: &str) -> crate::Result<()> {
+        let now_ms = SystemPairingClock.now_ms();
+        self.trust().revoke(device_fingerprint, reason, now_ms)?;
+        Ok(())
+    }
+
+    pub fn forget_peer(&self, device_fingerprint: &str) -> crate::Result<()> {
+        self.trust().forget(device_fingerprint)?;
+        Ok(())
+    }
+
     pub fn resolve_peer(
         &self,
         target: &PeerTarget,
@@ -86,14 +90,12 @@ impl Engine {
     }
 }
 
-/// 对端定位（device_fingerprint 查地址簿，或直连 host:port）。
 #[derive(Debug, Clone)]
 pub enum PeerTarget {
     ByDeviceFingerprint(String),
     ByAddr(std::net::SocketAddr),
 }
 
-/// 解析后的对端地址。
 #[derive(Debug, Clone)]
 pub struct PeerAddr {
     pub addr: std::net::SocketAddr,
@@ -103,7 +105,6 @@ pub struct PeerAddr {
     pub tcp_port: u16,
 }
 
-/// verified-success 后 upsert + inc_success 真实地址。
 fn record_verified_address(
     db: &rusqlite::Connection,
     device_fingerprint: &str,
@@ -130,7 +131,6 @@ fn record_verified_address(
     Ok(())
 }
 
-/// 取对端 IP 所落本机接口的子网 CIDR；无匹配返回 None。
 pub(crate) fn subnet_for_peer(ip: std::net::IpAddr) -> Option<String> {
     let std::net::IpAddr::V4(v4) = ip else {
         return None;
@@ -148,7 +148,6 @@ pub(crate) fn subnet_for_peer(ip: std::net::IpAddr) -> Option<String> {
     None
 }
 
-/// 准备多路径文件集：文件用 prepare_single_file，目录用 prepare_dir，合并 files+dirs。
 pub fn prepare_paths(
     paths: &[std::path::PathBuf],
     root_name: Option<&str>,
@@ -211,32 +210,28 @@ use privet_security::code::Now;
 use privet_transfer::CollisionPolicy;
 use privet_transport::{Connection, Transport};
 
-use crate::auth::{decide_auth, peer_session_inputs, AuthPlan};
+use crate::auth::{decide_auth, peer_session_inputs_with_config, AuthPlan};
 use crate::connection::{
     acquire_control, acquire_data, hello_exchange_responder, ControlRole, DataRole,
 };
-use crate::pairing::{run_pairing_responder, StreamPairingChannel, SystemPairingClock};
+use crate::pairing::{StreamPairingChannel, SystemPairingClock};
 use crate::transfer::receive_over_connection;
 use crate::EngineEvent;
 
-/// 发送结果。
 pub struct SendOutcome {
     pub transfer_id: String,
     pub file_count: u64,
     pub total_bytes: u64,
 }
 
-/// 入站接收选项。
 #[derive(Clone)]
 pub struct ServeOptions {
     pub save_dir: std::path::PathBuf,
     pub accept_all_trusted: bool,
     pub on_collision: CollisionPolicy,
-    /// 接受策略：CLI 嵌入 = AutoAccept；守护进程 = Resolver。
     pub accept_policy: crate::AcceptPolicy,
 }
 
-/// 入站服务句柄（持监听 addr + 取消）。
 pub struct ServeHandle {
     pub quic_addr: std::net::SocketAddr,
     pub tcp_addr: std::net::SocketAddr,
@@ -245,7 +240,6 @@ pub struct ServeHandle {
 }
 
 impl ServeHandle {
-    /// 优雅关停：置取消 + 等任务退出。
     pub async fn shutdown(mut self) {
         self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -254,9 +248,7 @@ impl ServeHandle {
     }
 }
 
-// ===== 续传意图持久化 =====
 
-/// 发送意图的 DB 持久化格式（不透明 JSON blob，storage 层不解析）。
 #[derive(Serialize, Deserialize)]
 pub(crate) struct StoredSendIntent {
     pub paths: Vec<String>,
@@ -281,8 +273,6 @@ impl From<&PeerTarget> for StoredPeerTarget {
 }
 
 impl Engine {
-    /// 发送：准备 -> 连接 -> Hello -> 鉴权（已信任免码直发）-> send_with_reconnect -> 写发送历史。
-    /// 发起时持久化 Partial 行 + send_intent blob，供 `privet resume <tid>` 续传。
     pub async fn send(
         &self,
         paths: Vec<std::path::PathBuf>,
@@ -290,14 +280,29 @@ impl Engine {
         via: Option<std::net::IpAddr>,
         as_name: Option<&str>,
     ) -> crate::Result<SendOutcome> {
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let transfer_id = format!("t-{short_id}");
+        self.send_with_id(paths, target, via, as_name, transfer_id).await
+    }
+
+    /// Send paths using a caller-allocated transfer ID.
+    ///
+    /// Daemon clients use this to receive an ID before the potentially long
+    /// preparation and network phases begin, making cancellation and event
+    /// correlation possible immediately.
+    pub async fn send_with_id(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        target: &PeerTarget,
+        via: Option<std::net::IpAddr>,
+        as_name: Option<&str>,
+        transfer_id: String,
+    ) -> crate::Result<SendOutcome> {
         let pa = self.resolve_peer(target, via)?;
         let cfg = self.engine_config().transfer.clone();
         let clock = SystemPairingClock;
         let now = clock.now_ms() as i64;
-        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let transfer_id = format!("t-{short_id}");
 
-        // ByDeviceId 时校验信任状态；ByAddr 直发。
         if let Some(did) = &pa.device_fingerprint {
             let db = self.db_conn()?;
             let rec = privet_storage::trust::get_trust(&db, did)
@@ -308,8 +313,6 @@ impl Engine {
             }
         }
 
-        // 在 prepare_paths（BLAKE3 全文件哈希，大文件耗时数秒）之前就先持久化
-        // send_intent 意图 + 空 partial 行，确保中断时起码有记录可续传。
         {
             let intent = StoredSendIntent {
                 paths: paths
@@ -346,7 +349,6 @@ impl Engine {
             .map_err(crate::CoreError::Storage)?;
         }
 
-        // 现在做 prepare（BLAKE3 哈希，大文件可能耗时 > 5 秒）；若中断，上述 partial 行可续。
         let prepared = prepare_paths(
             &paths,
             as_name,
@@ -356,7 +358,6 @@ impl Engine {
         let file_count = prepared.summary.file_count;
         let total_bytes = prepared.summary.total_bytes;
 
-        // 更新 partial 行中的实际计数（prepare 后已知）。
         {
             let db = self.db_conn()?;
             privet_storage::history::update_send_counts(
@@ -369,15 +370,11 @@ impl Engine {
             .map_err(crate::CoreError::Storage)?;
         }
 
-        // 共用发送尾段（registry + send_with_reconnect + complete_history）。
         self.do_send_inner(cfg, prepared, pa, transfer_id, file_count, total_bytes)
             .await
     }
 
-    /// 按 transfer_id 手动续传中断的发送
-    /// 从 DB 读 persist 的 send_intent blob → 重建 prepared → 同上 transfer_id 重连 → receiver 自动续传。
     pub async fn resume_send(&self, transfer_id: &str) -> crate::Result<SendOutcome> {
-        // 1. 查续传意图
         let row = {
             let db = self.db_conn()?;
             privet_storage::history::get_send_intent_row(&db, transfer_id)
@@ -387,7 +384,6 @@ impl Engine {
             crate::CoreError::Internal(format!("transfer {transfer_id} not found"))
         })?;
 
-        // 2. 校验状态
         if row.direction != "send" {
             return Err(crate::CoreError::Internal(format!(
                 "transfer {transfer_id} is not a send (resume requires send direction)"
@@ -405,11 +401,9 @@ impl Engine {
             ))
         })?;
 
-        // 3. 反序列化 intent
         let intent: StoredSendIntent = serde_json::from_str(&blob)
             .map_err(|e| crate::CoreError::Internal(format!("send intent deser: {e}")))?;
 
-        // 4. 重建 PreparedSet（same tid + same paths → receiver 自动续传）
         let root_name = row.root_name.as_deref();
         let paths: Vec<std::path::PathBuf> =
             intent.paths.iter().map(std::path::PathBuf::from).collect();
@@ -422,7 +416,6 @@ impl Engine {
         let file_count = prepared.summary.file_count;
         let total_bytes = prepared.summary.total_bytes;
 
-        // 5. 重建对端目标（PeerTarget -> resolve_peer -> 查地址簿最新 addr）
         let target = match &intent.peer_target {
             StoredPeerTarget::DeviceFingerprint(id) => PeerTarget::ByDeviceFingerprint(id.clone()),
             StoredPeerTarget::Addr(a) => {
@@ -434,7 +427,6 @@ impl Engine {
         };
         let pa = self.resolve_peer(&target, None)?;
 
-        // 6. 发送（行已在，complete_history 会 UPDATE 到 completed）
         let cfg = self.engine_config().transfer.clone();
         self.do_send_inner(
             cfg,
@@ -447,8 +439,55 @@ impl Engine {
         .await
     }
 
-    /// 内部发送尾段（registry + send_with_reconnect + complete_history）。
-    /// 为 send 和 resume_send 共用，避免重复。
+    /// Start a new transfer from the paths and peer stored in a previous send-history row.
+    pub async fn resend(&self, transfer_id: &str) -> crate::Result<SendOutcome> {
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let new_transfer_id = format!("t-{short_id}");
+        self.resend_with_id(transfer_id, new_transfer_id).await
+    }
+
+    /// Resend a history item under a caller-allocated new transfer ID.
+    pub async fn resend_with_id(
+        &self,
+        transfer_id: &str,
+        new_transfer_id: String,
+    ) -> crate::Result<SendOutcome> {
+        let row = {
+            let db = self.db_conn()?;
+            privet_storage::history::get_send_intent_row(&db, transfer_id)
+                .map_err(crate::CoreError::Storage)?
+        }
+        .ok_or_else(|| crate::CoreError::Internal(format!("transfer {transfer_id} not found")))?;
+        if row.direction != "send" {
+            return Err(crate::CoreError::Internal(format!(
+                "transfer {transfer_id} is not a send"
+            )));
+        }
+        let intent: StoredSendIntent = serde_json::from_str(
+            row.send_intent
+                .as_deref()
+                .ok_or_else(|| crate::CoreError::Internal("history row has no send intent".into()))?,
+        )
+        .map_err(|error| crate::CoreError::Internal(format!("send intent deserialize: {error}")))?;
+        let paths = intent.paths.into_iter().map(std::path::PathBuf::from).collect();
+        let target = match intent.peer_target {
+            StoredPeerTarget::DeviceFingerprint(id) => PeerTarget::ByDeviceFingerprint(id),
+            StoredPeerTarget::Addr(address) => PeerTarget::ByAddr(
+                address.parse().map_err(|error| {
+                    crate::CoreError::Internal(format!("stored peer address: {error}"))
+                })?,
+            ),
+        };
+        self.send_with_id(
+            paths,
+            &target,
+            None,
+            row.root_name.as_deref(),
+            new_transfer_id,
+        )
+        .await
+    }
+
     async fn do_send_inner(
         &self,
         cfg: privet_transfer::TransferEngineConfig,
@@ -460,10 +499,13 @@ impl Engine {
     ) -> crate::Result<SendOutcome> {
         let mut backoff = crate::reconnect::Backoff::new();
         let cmd_rx = self.registry.register(&transfer_id);
-        let send_result = crate::transfer::send_with_reconnect(
+        let quic_addr = std::net::SocketAddr::new(pa.addr.ip(), pa.quic_port);
+        let tcp_addr = std::net::SocketAddr::new(pa.addr.ip(), pa.tcp_port);
+        let send_result = crate::transfer::send_with_reconnect_endpoints(
             self.quic.as_ref(),
             Some(self.tcp.as_ref()),
-            pa.addr,
+            quic_addr,
+            tcp_addr,
             self.engine_config().transport.mode,
             self.identity(),
             &self.engine_config().device_name,
@@ -478,7 +520,6 @@ impl Engine {
         self.registry.unregister(&transfer_id);
         send_result?;
 
-        // verified-success：pinning 已通过（连接成功），upsert + inc_success 真实地址。
         if let Some(did) = &pa.device_fingerprint {
             let now = SystemPairingClock.now_ms() as i64 / 1000;
             if let Ok(db) = self.db_conn() {
@@ -493,7 +534,6 @@ impl Engine {
             }
         }
 
-        // 行已在 send / resume_send 建好，complete_history -> UPDATE status='completed'
         let clock = SystemPairingClock;
         let now = clock.now_ms() as i64;
         let files: Vec<privet_storage::history::FileRow> = prepared
@@ -521,7 +561,6 @@ impl Engine {
         })
     }
 
-    /// 入站服务：绑 QUIC+TCP 监听（config 端口，0=ephemeral）-> 双 acceptor 任务。每连接 -> handle_inbound。
     pub async fn serve(&self, opts: ServeOptions) -> crate::Result<ServeHandle> {
         let quic_addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.engine_config().transport.quic_port)
             .parse()
@@ -537,15 +576,12 @@ impl Engine {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut tasks = Vec::new();
 
-        // serve 启动时把 ServeOptions seed 进运行时设置；acceptor 每连接读取当前值，
-        // 使 IPC SetConfig 可立即改变入站行为（accept_all_trusted / on_collision / save_dir）。
         let runtime = self.runtime.clone();
         runtime.set_accept_all_trusted(opts.accept_all_trusted);
         runtime.set_base_accept_policy(opts.accept_policy.clone());
         runtime.set_on_collision(opts.on_collision);
         runtime.set_save_dir(opts.save_dir.clone());
 
-        // QUIC acceptor 任务（顺序处理，一行连接处理完再 accept 下一）。
         let device_name = self.engine_config().device_name.clone();
         let platform = self.engine_config().platform.clone();
         tasks.push(tokio::spawn({
@@ -559,6 +595,7 @@ impl Engine {
             let device_name = device_name.clone();
             let pending = self.pending_pair_code.clone();
             let pake = self.pake.clone();
+            let pairing_cfg = self.engine_config().pairing.clone();
             async move {
                 loop {
                     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -588,14 +625,14 @@ impl Engine {
                         registry.clone(),
                         runtime.clone(),
                         &device_name,
-                        &platform
+                        &platform,
+                        &pairing_cfg,
                     )
                     .await;
                 }
             }
         }));
 
-        // TCP acceptor 任务（同理，顺序处理）。
         let device_name = self.engine_config().device_name.clone();
         let platform = self.engine_config().platform.clone();
         tasks.push(tokio::spawn({
@@ -610,6 +647,7 @@ impl Engine {
             let platform = platform.clone();
             let pending = self.pending_pair_code.clone();
             let pake = self.pake.clone();
+            let pairing_cfg = self.engine_config().pairing.clone();
             async move {
                 loop {
                     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -639,7 +677,8 @@ impl Engine {
                         registry.clone(),
                         runtime.clone(),
                         &device_name,
-                        &platform
+                        &platform,
+                        &pairing_cfg,
                     )
                     .await;
                 }
@@ -655,10 +694,7 @@ impl Engine {
     }
 }
 
-/// 入站单连接处理（serve 的每连接子任务）。
-///
-/// 接受策略 / 冲突策略 / 落地目录均从 `runtime` 每连接读取，使 IPC SetConfig
-/// 能在 serve 运行期即时改变入站行为。
+/// Handle one authorized inbound connection for the daemon-owned engine.
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound(
     conn: Box<dyn Connection>,
@@ -672,6 +708,7 @@ async fn handle_inbound(
     runtime: std::sync::Arc<crate::RuntimeSettings>,
     device_name: &str,
     platform: &str,
+    pairing_cfg: &privet_security::PairingConfig,
 ) -> crate::Result<()> {
     let mut ctrl = acquire_control(conn.as_ref(), ControlRole::Responder).await?;
     let hello = hello_exchange_responder(ctrl.as_mut(), identity, 1, device_name, platform).await?;
@@ -683,7 +720,6 @@ async fn handle_inbound(
     match plan {
         AuthPlan::AcceptCodeless => {
             tracing::info!("inbound: trusted peer, codeless accept");
-            // 每连接读运行时设置（IPC SetConfig 可即时改变）。
             let accept_policy = runtime.effective_accept_policy();
             let on_collision = runtime.on_collision();
             let save_dir = runtime.save_dir();
@@ -701,7 +737,6 @@ async fn handle_inbound(
                 accept_policy,
             )
             .await;
-            // 短暂延迟，让发送方完成 ack 后再关连接（防 TransportLost）。
             if recv.is_ok() {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
@@ -712,20 +747,43 @@ async fn handle_inbound(
             let code = pending
                 .lock()
                 .map_err(|_| crate::CoreError::Internal("code lock".into()))?
-                .as_ref()
-                .map(|c| c.code().to_string());
+                .take();
             match code {
-                Some(code) => {
-                    let inputs = peer_session_inputs(
+                Some(mut code) => {
+                    let inputs = match peer_session_inputs_with_config(
                         conn.as_ref(),
-                        code,
+                        code.code().to_string(),
                         hello.device_fingerprint.clone(),
                         hello.device_name.clone(),
-                    )?;
+                        pairing_cfg,
+                    ) {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            if let Ok(mut slot) = pending.lock() {
+                                *slot = Some(code);
+                            }
+                            return Err(error);
+                        }
+                    };
                     let mut ch = StreamPairingChannel::new(ctrl);
                     let clock = SystemPairingClock;
-                    let pr = run_pairing_responder(identity, &inputs, &mut ch, &clock, trust, pake)
-                        .await;
+                    let pr = privet_security::session::run_responder_checked(
+                        identity,
+                        &inputs,
+                        &mut code,
+                        &mut ch,
+                        &clock,
+                        trust,
+                        pake,
+                    )
+                    .await;
+                    if !code.is_consumed()
+                        && code.check_valid(clock.now_ms()).is_ok()
+                    {
+                        if let Ok(mut slot) = pending.lock() {
+                            *slot = Some(code);
+                        }
+                    }
                     let _ = pr?;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     Ok(())
@@ -752,18 +810,32 @@ async fn handle_inbound(
     }
 }
 
-/// 设置待配对码（serve 的 TriggerPairing 分支用）。
 impl Engine {
-    /// 发起配对：连接 -> Hello -> peer_session_inputs（带 code）-> run_pairing_initiator。
     pub async fn pair_initiate(
         &self,
         addr: std::net::SocketAddr,
         code: String,
     ) -> crate::Result<privet_security::session::PairingOutcome> {
-        let conn = crate::connection::connect_peer(
+        self.pair_initiate_with_ports(addr, addr, code).await
+    }
+
+    /// Pair using the peer's independently advertised transport endpoints.
+    pub async fn pair_initiate_with_ports(
+        &self,
+        quic_addr: std::net::SocketAddr,
+        tcp_addr: std::net::SocketAddr,
+        code: String,
+    ) -> crate::Result<privet_security::session::PairingOutcome> {
+        if quic_addr.ip() != tcp_addr.ip() {
+            return Err(crate::CoreError::Internal(
+                "QUIC and TCP pairing endpoints must use the same peer IP".into(),
+            ));
+        }
+        let conn = crate::connection::connect_peer_with_ports(
             self.quic.as_ref(),
             Some(self.tcp.as_ref()),
-            addr,
+            quic_addr,
+            tcp_addr,
             self.engine_config().transport.mode,
             None,
         )
@@ -777,13 +849,18 @@ impl Engine {
             &self.engine_config().device_name,
         )
         .await?;
-        let inputs =
-            crate::auth::peer_session_inputs(conn.as_ref(), code, ack.device_fingerprint, ack.device_name)?;
+        let inputs = crate::auth::peer_session_inputs_with_config(
+            conn.as_ref(),
+            code,
+            ack.device_fingerprint,
+            ack.device_name,
+            &self.engine_config().pairing,
+        )?;
         let mut ch = StreamPairingChannel::new(ctrl);
         let clock = SystemPairingClock;
         let trust: &dyn privet_security::trust::TrustStore = self.trust.as_ref();
         let proof: &dyn privet_security::commit::ProofStore = self.trust.as_ref();
-        let outcome = crate::pairing::run_pairing_initiator(
+        let outcome = crate::pairing::run_pairing_initiator_with_config(
             self.identity(),
             &inputs,
             &mut ch,
@@ -791,9 +868,9 @@ impl Engine {
             trust,
             proof,
             self.pake.as_ref(),
+            &self.engine_config().pairing,
         )
         .await;
-        // bootstrap：配对成功时记录实际情况地址。
         if let Ok(privet_security::session::PairingOutcome::Paired { peer_device_fingerprint, .. }) =
             &outcome
         {
@@ -802,9 +879,9 @@ impl Engine {
                 let _ = record_verified_address(
                     &db,
                     peer_device_fingerprint,
-                    addr.ip(),
-                    addr.port(),
-                    addr.port(),
+                    quic_addr.ip(),
+                    quic_addr.port(),
+                    tcp_addr.port(),
                     now,
                 );
             }
@@ -812,13 +889,25 @@ impl Engine {
         outcome
     }
 
-    /// 设置待配对码（serve 的 TriggerPairing 分支用）。
     pub fn set_pending_pair_code(&self, code: privet_security::code::PairingCode) {
         let mut g = self.pending_pair_code.lock().expect("pending code lock");
         *g = Some(code);
     }
 
-    /// 当前可见对端快照（无 discovery 则空）。
+    /// Generate and install a decimal code using this engine's pairing policy.
+    pub fn generate_pairing_code(&self) -> crate::Result<String> {
+        let clock = SystemPairingClock;
+        let cfg = &self.engine_config().pairing;
+        let code = privet_security::code::PairingCode::generate_decimal_with_policy(
+            &clock,
+            cfg.code_validity_secs,
+            cfg.max_code_attempts,
+        )?;
+        let display = code.code().to_string();
+        self.set_pending_pair_code(code);
+        Ok(display)
+    }
+
     pub fn discover_snapshot(&self) -> Vec<privet_discovery::peer::PeerRecord> {
         match &self.discovery {
             Some(d) => d.peers(),
@@ -826,7 +915,6 @@ impl Engine {
         }
     }
 
-    /// 主动刷新（发 Probe / 单播已知设备 / 触发 mDNS browse）。无 discovery 则空操作。
     pub async fn discover_refresh(&self) -> crate::Result<()> {
         if let Some(d) = &self.discovery {
             d.refresh().await.map_err(crate::CoreError::Discovery)?;
@@ -835,8 +923,6 @@ impl Engine {
         Ok(())
     }
 
-    /// 对地址簿中已知（已信任）设备的近邻地址单播 Probe（受限网络可达性）。
-    /// 仅在 known.probe_known=true 时执行；所有模式（含 TrustedOnly）生效。
     pub async fn discover_probe_known(&self) -> crate::Result<()> {
         let Some(d) = &self.discovery else {
             return Ok(());
@@ -867,7 +953,6 @@ impl Engine {
         Ok(())
     }
 
-    /// 排空 discovery peer 事件 -> EngineEvent（forwarder 周期调用；保留供测试直接调用）。
     pub fn drain_peer_events(&self) -> Vec<EngineEvent> {
         let fp_map = self
             .db

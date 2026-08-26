@@ -1,13 +1,13 @@
 syntax = "proto3";
 package privet.storage.v1;
 
-// 自包含续传 sidecar。不依赖线协议 schema；独立版本化。
-// 路径：<save_dir>/.privet/<transfer_id>/<relative_path>.part.meta（紧邻 .part）。
+// Versioned, self-contained resume metadata. It does not depend on the wire schema.
+// Stored beside the partial file under <save_dir>/.privet/<transfer_id>/.
 
 message PartMeta {
   string transfer_id = 1;
   string file_id = 2;
-  string relative_path = 3;   // 已清洗
+  string relative_path = 3;   // Sanitized relative path.
   uint64 size = 4;
   uint64 mtime_ms = 5;
   string hash_type = 6;
@@ -22,6 +22,6 @@ message PartSegment {
   uint32 chunk_count = 4;
   uint32 chunk_size = 5;
   string hash_type = 6; 
-  repeated string chunk_hash_values = 7; // 逐块 BLAKE3 hex（manifest 到达前为空）
-  string segment_hash_value = 8; // 段根 BLAKE3 hex（SegmentManifest 到达前为空）
+  repeated string chunk_hash_values = 7; // Per-chunk BLAKE3 hex; empty before the manifest arrives.
+  string segment_hash_value = 8; // Segment-root BLAKE3 hex; empty before the manifest arrives.
 }

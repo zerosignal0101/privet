@@ -1,4 +1,3 @@
-//! CoreError：融合 leaf crate 错误。
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,7 +25,6 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    /// 稳定错误码（事件/退出码用；不含敏感材料）。
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Pairing(_) => "pairing",

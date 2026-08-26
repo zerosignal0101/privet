@@ -1,5 +1,3 @@
-//! 段布局 derived：由 `size`+`chunk_size`+`seg_max_chunks` 计算。
-//! sender/receiver/storage(sidecar 骨架) 同法，不入 offer。
 
 use crate::constants::{DEFAULT_CHUNK_SIZE, SEGMENT_MAX_CHUNKS};
 
@@ -12,7 +10,6 @@ pub struct SegmentLayout {
     pub chunk_size: u32,
 }
 
-/// 派生段布局。`size==0` -> 空。每段至多 `seg_max_chunks` 块；末块可小于 `chunk_size`。
 pub fn derive_segment_layout(
     size: u64,
     chunk_size: u32,
@@ -50,7 +47,6 @@ pub fn derive_segment_layout(
     out
 }
 
-/// 用默认常量（DEFAULT_CHUNK_SIZE=1MiB、SEGMENT_MAX_CHUNKS=1024）派生。
 pub fn derive_segment_layout_default(size: u64) -> Vec<SegmentLayout> {
     derive_segment_layout(size, DEFAULT_CHUNK_SIZE as u32, SEGMENT_MAX_CHUNKS)
 }
@@ -91,7 +87,6 @@ mod tests {
 
     #[test]
     fn spans_two_segments_at_boundary() {
-        // seg_max=8 -> 8 块满段 + 余 1 块 = 2 段；size = 8*100 + 30 = 830
         let s = derive_segment_layout(830, 100, 8);
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].segment_id, 0);

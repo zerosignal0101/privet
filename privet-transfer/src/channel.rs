@@ -1,5 +1,3 @@
-//! 可注入 I/O：ControlChannel（控制帧）+ DataChannel（数据帧+raw）+ 测试夹具。
-//! 镜像 privet-security::channel 的注入范式；引擎核心只消费这两个 trait。
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -8,14 +6,12 @@ use tokio::sync::mpsc;
 
 use crate::error::{Result, TransferError};
 
-/// 控制流通道：收发 ControlFrame（control 交错、cancel 响应）。
 #[async_trait]
 pub trait ControlChannel: Send {
     async fn send(&mut self, frame: ControlFrame) -> Result<()>;
     async fn recv(&mut self) -> Result<ControlFrame>;
 }
 
-/// 数据流通道：收发 DataFrame(+raw)。raw 为 ChunkHeader 后随的块字节。
 #[async_trait]
 pub trait DataChannel: Send {
     async fn send(&mut self, frame: DataFrame, raw: Option<&[u8]>) -> Result<()>;
@@ -38,7 +34,6 @@ impl LoopbackControlChannel {
         let (btx, arx) = mpsc::channel(cap);
         (Self { tx: atx, rx: arx }, Self { tx: btx, rx: brx })
     }
-    /// 取出底层 tx（测试用：从外部发帧给另一端）。
     pub fn sender(&self) -> mpsc::Sender<ControlFrame> {
         self.tx.clone()
     }
@@ -53,7 +48,6 @@ impl ControlChannel for LoopbackControlChannel {
     }
 }
 
-/// 数据帧 + raw 一起传送的载荷。
 struct DataItem {
     frame: DataFrame,
     raw: Option<Vec<u8>>,
@@ -93,7 +87,6 @@ impl DataChannel for LoopbackDataChannel {
     }
 }
 
-// ===== Lossy（recv 侧丢前 N 帧）=====
 
 pub struct LossyControlChannel {
     inner: Box<dyn ControlChannel>,
@@ -153,11 +146,7 @@ impl DataChannel for LossyDataChannel {
     }
 }
 
-// ===== Throttle（recv 侧插入延迟，模拟慢链路使 500ms 空闲不触发）=====
 
-/// 慢链路模拟：对 `recv()` 插入固定延迟，使接收方 500ms 空闲 flush 永不触发。
-/// 配合 CHUNK_ACK_INTERVAL（已降到 16 < INFLIGHT_TOTAL_CAP 32）+ 周期 flush 可防死锁；
-/// 旧版 64（> 32）时复现 ack 死锁 -> ChunkCorrupt。
 pub struct ThrottledDataChannel {
     inner: Box<dyn DataChannel>,
     delay: std::time::Duration,
@@ -178,7 +167,6 @@ impl DataChannel for ThrottledDataChannel {
     }
 }
 
-// ===== Reorder（缓冲前 N 帧后倒序释放）=====
 
 pub struct ReorderDataChannel {
     inner: Box<dyn DataChannel>,
@@ -218,7 +206,6 @@ impl DataChannel for ReorderDataChannel {
     }
 }
 
-// ===== Latch（前 K 帧持有到第 K+1 帧到达后按序释放，测 manifest-late）=====
 
 pub struct LatchControlChannel {
     inner: Box<dyn ControlChannel>,

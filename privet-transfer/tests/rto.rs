@@ -1,4 +1,3 @@
-//! retransmit 已落地：丢第一块 -> RTO 重发 -> 传送成功。
 
 use privet_transfer::channel::{LoopbackControlChannel, LoopbackDataChannel, LossyDataChannel};
 use privet_transfer::config::TransferEngineConfig;
@@ -20,7 +19,6 @@ async fn dropped_chunk_retransmitted_and_completes() {
     let reader = MappedChunkReader::from_prepared(&prepared);
     let (ctl_a, ctl_b) = LoopbackControlChannel::pair(64);
     let (dat_a, dat_b_inner) = LoopbackDataChannel::pair(64);
-    // 丢第一块 -> sender RTO 重传后成功
     let dat_b = LossyDataChannel::drop_first(Box::new(dat_b_inner), 1);
     let s = SenderInputs {
         control: Box::new(ctl_a),

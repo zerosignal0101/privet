@@ -23,7 +23,6 @@ async fn quic_bind_and_client_connects() {
         .await
         .unwrap();
     assert_eq!(client.kind(), privet_transport::TransportKind::Quic);
-    // 核对点：max_data_streams 当前返回 STREAM_POOL_SIZE（peer max 暂不可用）。
     let streams = client.max_data_streams();
     assert!(streams >= 1);
     assert!(streams <= privet_transport::STREAM_POOL_SIZE);

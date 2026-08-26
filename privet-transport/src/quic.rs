@@ -1,4 +1,3 @@
-//! QUIC 路径：quinn + rustls TLS 1.3。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,11 +23,9 @@ pub struct QuicTransport {
 }
 
 fn apply_transport_config(tcfg: &mut TransportConfig, cfg: &TransportConfigPrivet) {
-    // 核对点：IdleTimeout::from(VarInt) 以毫秒计。
     tcfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
         cfg.idle_timeout.as_millis() as u32,
     ))));
-    // 显式设 max_concurrent_*_streams。
     tcfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(cfg.stream_pool_size as u32));
     tcfg.max_concurrent_uni_streams(quinn::VarInt::from_u32(cfg.stream_pool_size as u32));
     use quinn::congestion::ControllerFactory;
@@ -115,14 +112,11 @@ pub struct QuicConnectionPrivet {
 #[async_trait]
 impl Connection for QuicConnectionPrivet {
     fn control_stream(&self) -> Result<Box<dyn Stream>> {
-        // QUIC 控制流角色相关（initiator open / responder accept），无法以无角色同步 API 提供。
-        // 用 acquire_control(.., ControlRole)（core）或本类型 open_control/accept_control。
         Err(TransportError::Unavailable(
             "QUIC control via open_control/accept_control".into(),
         ))
     }
 
-    /// 发起方开控制流（双向流 0）。控制流优先级高于数据流。
     async fn open_control(&self) -> Result<Box<dyn Stream>> {
         let (send, recv) = self.conn.open_bi().await?;
         let _ = send.set_priority(1);
@@ -132,7 +126,6 @@ impl Connection for QuicConnectionPrivet {
         }))
     }
 
-    /// 应答方收控制流。
     async fn accept_control(&self) -> Result<Box<dyn Stream>> {
         let (send, recv) = self.conn.accept_bi().await?;
         Ok(Box::new(QuicStreamPrivet {
@@ -141,7 +134,6 @@ impl Connection for QuicConnectionPrivet {
         }))
     }
 
-    /// 应答方收数据流（sender 开 uni，receiver 用 accept_uni）。
     async fn accept_data_stream(&self) -> Result<Box<dyn Stream>> {
         let recv = self.conn.accept_uni().await?;
         Ok(Box::new(QuicStreamPrivet {

@@ -1,4 +1,3 @@
-//! Identity -> TlsMaterial -> QuicTransport/TcpTransport。
 use privet_core::identity_tls::{build_tls_material, build_transports};
 use privet_core::EngineConfig;
 use privet_crypto::identity::Identity;

@@ -1,7 +1,3 @@
-//! 丢块 + 反压测试。retransmit 已落地：
-//! - 单块丢 -> RTO 重传成功
-//! - 全丢 -> CHUNK_RETRANSMIT_MAX -> ChunkCorrupt（retryable，.part 留）
-//! - manifest-late 块缓冲保留（R11 已修复 pending 块回灌计数）。
 
 use privet_transfer::channel::{
     LatchControlChannel, LoopbackControlChannel, LoopbackDataChannel, LossyDataChannel,
@@ -14,7 +10,6 @@ use privet_transfer::sender::{run_sender, MappedChunkReader, SenderInputs};
 use std::time::Duration;
 use tempfile::tempdir;
 
-// 持续丢块 -> 重传至上限 -> Err(ChunkCorrupt)（retryable，.part 留）。
 #[tokio::test]
 async fn all_drops_hit_chunk_corrupt_ceiling() {
     let dir = tempdir().unwrap();
@@ -26,7 +21,6 @@ async fn all_drops_hit_chunk_corrupt_ceiling() {
     let reader = MappedChunkReader::from_prepared(&prepared);
     let (ctl_a, ctl_b) = LoopbackControlChannel::pair(64);
     let (dat_a, dat_b_inner) = LoopbackDataChannel::pair(64);
-    // 全丢：所有 data 帧丢弃
     let dat_b = LossyDataChannel::drop_first(Box::new(dat_b_inner), usize::MAX);
     let s = SenderInputs {
         control: Box::new(ctl_a),
@@ -61,10 +55,8 @@ async fn all_drops_hit_chunk_corrupt_ceiling() {
         "expected ChunkCorrupt after CHUNK_RETRANSMIT_MAX, got {res:?}"
     );
     // ChunkCorrupt retryable - receiver exits cleanly (no .part created since no chunks arrived)
-    // 若部分块已到，.part 保留不删。此处全丢故无 staging；测试构造请见 manifest_late 用例。
 }
 
-// manifest 到货后块才来 -> 缓冲再验证 -> 仍成功
 #[tokio::test]
 async fn manifest_late_chunk_buffered_not_dropped() {
     let dir = tempdir().unwrap();

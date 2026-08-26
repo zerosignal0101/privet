@@ -1,4 +1,3 @@
-//! 续传 sidecar `.part.meta` codec + 写入/读取
 
 use std::path::{Path, PathBuf};
 
@@ -6,8 +5,6 @@ use crate::constants::{PART_META_SUFFIX, PART_SUFFIX, STAGING_DIR_NAME};
 use crate::error::StorageError;
 use prost::Message;
 
-/// 追加 `.part.meta` 到文件名（不加路径分隔符）。
-/// 先验 relative_path 安全性，拒绝 traversal。
 pub fn part_meta_path(
     save_dir: &Path,
     transfer_id: &str,
@@ -23,8 +20,6 @@ pub fn part_meta_path(
     Ok(PathBuf::from(s))
 }
 
-/// 追加 `.part` 到文件名。
-/// 先验 relative_path 安全性，拒绝 traversal。
 pub fn part_path(
     save_dir: &Path,
     transfer_id: &str,
@@ -40,7 +35,6 @@ pub fn part_path(
     Ok(PathBuf::from(s))
 }
 
-/// file 级 + 段骨架（derived from size；segment_hash_value/chunk_hash_values 空）。
 pub fn build_initial_meta(
     transfer_id: &str,
     file_id: &str,
@@ -91,8 +85,6 @@ fn atomic_write_fsync(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// rename durability: fsync 父目录让 rename 的目录项立即可靠落盘。
-/// Unix: libc::fsync(dir_fd); Windows: File::sync_data (best-effort)。
 pub(crate) fn fsync_parent(path: &Path) -> Result<(), StorageError> {
     let parent = path.parent().ok_or_else(|| {
         StorageError::Io(std::io::Error::new(
@@ -108,7 +100,6 @@ pub(crate) fn fsync_parent(path: &Path) -> Result<(), StorageError> {
     }
     #[cfg(not(unix))]
     {
-        // Windows: File::open 不支持目录句柄，best-effort（NTFS 日志保障元数据）。
         if let Ok(d) = std::fs::File::open(parent) {
             let _ = d.sync_data();
         }
@@ -116,31 +107,26 @@ pub(crate) fn fsync_parent(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// 解码 protobuf 字节为 PartMeta。
 pub fn decode_part_meta(bytes: &[u8]) -> Result<crate::PartMeta, StorageError> {
     let meta = crate::PartMeta::decode(bytes)?;
     Ok(meta)
 }
 
-/// 读回 sidecar。
 pub fn read_part_meta(path: &Path) -> Result<crate::PartMeta, StorageError> {
     let bytes = std::fs::read(path)?;
     decode_part_meta(&bytes)
 }
 
-/// 编码 PartMeta 为 protobuf 字节。
 pub fn encode_part_meta(meta: &crate::PartMeta) -> Result<Vec<u8>, StorageError> {
     let mut buf = Vec::with_capacity(meta.encoded_len());
     meta.encode(&mut buf)?;
     Ok(buf)
 }
 
-/// 写初始 sidecar（含段骨架，哈希空）。
 pub fn write_part_meta_initial(path: &Path, meta: &crate::PartMeta) -> Result<(), StorageError> {
     atomic_write_fsync(path, &encode_part_meta(meta)?)
 }
 
-/// 增量补写某段 segment_hash_value + chunk_hash_values 并 fsync。
 pub fn write_segment(
     path: &Path,
     file_id: &str,
@@ -248,7 +234,6 @@ mod tests {
         assert!(r.segments[0].chunk_hash_values.is_empty());
         assert!(r.segments[1].chunk_hash_values.is_empty());
 
-        // 段 0 manifest 到达 -> 补写
         write_segment(&mp, "f1", 0, "root0", &["h0".into(), "h1".into()]).unwrap();
         let r = read_part_meta(&mp).unwrap();
         assert_eq!(r.segments[0].segment_hash_value, "root0");

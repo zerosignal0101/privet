@@ -1,4 +1,3 @@
-//! QUIC 与 TCP 行为一致（除并行度）。
 
 mod common;
 
@@ -11,7 +10,6 @@ async fn connect_kind(t: &dyn Transport, addr: std::net::SocketAddr, mode: Trans
         let _conn = listener.accept().await;
     });
     let client = t.connect(bound, mode, None).await.unwrap();
-    // QUIC 和 TCP 都能连接，kind 匹配。
     let kind = client.kind();
     match mode {
         TransportMode::Quic => assert_eq!(kind, TransportKind::Quic),

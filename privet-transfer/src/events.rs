@@ -1,4 +1,3 @@
-//! 可观测事件（无数据/无密钥/无块哈希内容）。
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -66,14 +65,12 @@ pub trait TransferEventSink: Send + Sync {
     async fn emit(&self, event: TransferEvent);
 }
 
-/// 丢弃所有事件（默认）。
 pub struct NoopEventSink;
 #[async_trait]
 impl TransferEventSink for NoopEventSink {
     async fn emit(&self, _event: TransferEvent) {}
 }
 
-/// 收集事件（测试用）。
 pub struct InMemoryEventSink {
     tx: mpsc::UnboundedSender<TransferEvent>,
 }

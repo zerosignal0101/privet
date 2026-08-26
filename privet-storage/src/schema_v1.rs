@@ -1,5 +1,3 @@
-//! v1 baseline schema。
-//! 注：`schema_version` 表由迁移运行器自举创建（migration.rs），不在此。
 
 pub const V1_SQL: &str = r#"
 -- trust_store

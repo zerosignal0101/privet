@@ -1,4 +1,3 @@
-//! receiver happy path + 内联边界（test 1）+ 空文件（test 17）。
 use privet_protocol::{
     control_frame::Payload as CP, data_frame::Payload as DP, ControlFrame, ControlMessage,
     DataFrame, FileEntry, FileSetBatch, FileSetSummary, InlineFile, TransferOffer,

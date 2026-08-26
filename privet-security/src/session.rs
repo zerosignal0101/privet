@@ -1,5 +1,3 @@
-//! 配对握手驱动：SPAKE2+ 消息流 + 转录签名/验签 + 信任提交。
-//! 可注入：channel/clock/trust/pake 均为 trait 对象。提交时序在 commit.rs。
 use privet_crypto::pake::{PakeOutput, PakeScheme};
 use privet_crypto::transcript::{transcript_hash, verify_transcript};
 use privet_crypto::{gen_nonce, identity::Identity};
@@ -7,13 +5,12 @@ use privet_protocol::control_frame::Payload;
 use privet_protocol::{ControlFrame, PairingConfirm, PairingInit, PairingResult, PairingResultAck};
 
 use crate::channel::{PairingChannel, PairingClock};
-use crate::constants::{EXPORTER_LEN, PAIRING_ACK_TIMEOUT_SECS};
+use crate::constants::EXPORTER_LEN;
 use crate::transcript::{assert_identity_binding, build_transcript_parts, Role};
 use crate::trust::{PeerTrust, TrustStore};
 use crate::PairingError;
 use privet_crypto::CryptoError;
 
-/// 会话输入（core 在 Hello/HelloAck 后注入；peer_spki/exporter 来自 TLS）。
 pub struct SessionInputs {
     pub code: String,
     pub peer_device_fingerprint: String,
@@ -22,15 +19,12 @@ pub struct SessionInputs {
     pub exporter: [u8; EXPORTER_LEN],
 }
 
-/// 配对结果。
 #[derive(Debug)]
 pub enum PairingOutcome {
-    /// 配对成功，已提交信任。
     Paired {
         peer_device_fingerprint: String,
         peer_spki: Vec<u8>,
     },
-    /// 失败（不提交信任）。
     Failed { reason: PairingError },
 }
 
@@ -40,7 +34,6 @@ fn wrap(payload: Payload) -> ControlFrame {
     }
 }
 
-/// 发起方驱动（I 侧；重发/超时 + ProofStore 持久化）。
 pub async fn run_initiator(
     local: &Identity,
     inputs: &SessionInputs,
@@ -50,13 +43,37 @@ pub async fn run_initiator(
     pake: &dyn PakeScheme,
     store: &dyn crate::commit::ProofStore,
 ) -> Result<PairingOutcome, PairingError> {
+    run_initiator_with_config(
+        local,
+        inputs,
+        channel,
+        clock,
+        trust,
+        pake,
+        store,
+        &crate::PairingConfig::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_initiator_with_config(
+    local: &Identity,
+    inputs: &SessionInputs,
+    channel: &mut dyn PairingChannel,
+    clock: &dyn PairingClock,
+    trust: &dyn TrustStore,
+    pake: &dyn PakeScheme,
+    store: &dyn crate::commit::ProofStore,
+    config: &crate::PairingConfig,
+) -> Result<PairingOutcome, PairingError> {
     let nonce_i = gen_nonce()?;
     let (mut state_i, spake_msg_i) = pake.start_initiator(
         inputs.code.as_bytes(),
-        local.fingerprint().as_bytes(), // id_a = I（initiator 在前）
+        local.fingerprint().as_bytes(),
         inputs.peer_device_fingerprint.as_bytes(), // id_b = R
     )?;
-    let msg_i = spake_msg_i.clone(); // 保留进转录（发出后仍需引用）
+    let msg_i = spake_msg_i.clone();
     channel
         .send(wrap(Payload::PairingInit(PairingInit {
             device_fingerprint: local.fingerprint(),
@@ -66,7 +83,6 @@ pub async fn run_initiator(
         })))
         .await?;
 
-    // 收 PairingConfirm
     let confirm = match channel.recv().await?.payload {
         Some(Payload::PairingConfirm(c)) => c,
         _ => return Err(PairingError::Protocol("expected PairingConfirm".into())),
@@ -90,10 +106,8 @@ pub async fn run_initiator(
     );
     let hash = transcript_hash(&parts);
 
-    // 验 R 的转录签名（用 R 的 SPKI = peer_spki，来自 TLS 证书）
     let sig_r = ed25519_dalek::Signature::from_slice(&confirm.transcript_sig)
         .map_err(|e| PairingError::TranscriptInvalid(format!("sig decode: {e}")))?;
-    // 转录验签失败（含码不一致）-> CodeMismatch
     verify_transcript(&inputs.peer_spki, &hash, &sig_r).map_err(|e| {
         if matches!(e, CryptoError::InvalidKey(_)) {
             PairingError::CodeMismatch
@@ -102,7 +116,6 @@ pub async fn run_initiator(
         }
     })?;
 
-    // I 签同一转录
     let sig_i = local.sign(&hash);
     channel
         .send(wrap(Payload::PairingResult(PairingResult {
@@ -113,7 +126,6 @@ pub async fn run_initiator(
         })))
         .await?;
 
-    // 进 Pending（持久化 proof，不提交）-> wait_for_ack（重发/超时/Failed）。
     let proof = crate::commit::PendingProof {
         transcript_hash: hash,
         transcript_sig_i: sig_i.to_vec(),
@@ -122,18 +134,18 @@ pub async fn run_initiator(
         peer_spki: inputs.peer_spki.clone(),
         local_spki: local.spki_der().to_vec(),
     };
-    crate::commit::wait_for_ack(
+    crate::commit::wait_for_ack_with_retries(
         channel,
         clock,
         trust,
         &proof,
         store,
-        std::time::Duration::from_secs(PAIRING_ACK_TIMEOUT_SECS),
+        std::time::Duration::from_secs(config.pairing_ack_timeout_secs),
+        config.pairing_max_retries,
     )
     .await
 }
 
-/// 应答方驱动（R 侧）。
 pub async fn run_responder(
     local: &Identity,
     inputs: &SessionInputs,
@@ -142,20 +154,18 @@ pub async fn run_responder(
     trust: &dyn TrustStore,
     pake: &dyn PakeScheme,
 ) -> Result<PairingOutcome, PairingError> {
-    // 收 PairingInit
     let init = match channel.recv().await?.payload {
         Some(Payload::PairingInit(i)) => i,
         _ => return Err(PairingError::Protocol("expected PairingInit".into())),
     };
-    // 断言 identity_pubkey_I == I 的 TLS 证书 SPKI（防 MITM 顶替）
     assert_identity_binding(&init.identity_pubkey, &inputs.peer_spki)?;
 
     let (mut state_r, spake_msg_r) = pake.start_responder(
         inputs.code.as_bytes(),
-        inputs.peer_device_fingerprint.as_bytes(), // id_a = I（initiator 在前）
+        inputs.peer_device_fingerprint.as_bytes(),
         local.fingerprint().as_bytes(), // id_b = R
     )?;
-    let out = state_r.finish(&init.spake2_msg)?; // R 持双方 share -> 派生 tag
+    let out = state_r.finish(&init.spake2_msg)?;
     let nonce_r = gen_nonce()?;
 
     let local_fingerprint = local.fingerprint();
@@ -183,7 +193,6 @@ pub async fn run_responder(
         })))
         .await?;
 
-    // 收 PairingResult
     let result = match channel.recv().await?.payload {
         Some(Payload::PairingResult(r)) => r,
         _ => return Err(PairingError::Protocol("expected PairingResult".into())),
@@ -196,7 +205,6 @@ pub async fn run_responder(
     assert_identity_binding(&result.identity_pubkey, &inputs.peer_spki)?;
     let sig_i = ed25519_dalek::Signature::from_slice(&result.transcript_sig)
         .map_err(|e| PairingError::TranscriptInvalid(format!("sig decode: {e}")))?;
-    // 转录验签失败（含码不一致）-> CodeMismatch
     verify_transcript(&result.identity_pubkey, &hash, &sig_i).map_err(|e| {
         if matches!(e, CryptoError::InvalidKey(_)) {
             PairingError::CodeMismatch
@@ -205,7 +213,6 @@ pub async fn run_responder(
         }
     })?;
 
-    // 幂等：已信任同 SPKI 则重 ack 不重提交
     let now = clock.now_ms();
     if crate::commit::should_commit(trust, &inputs.peer_device_fingerprint, &inputs.peer_spki)? {
         trust.commit_peer(PeerTrust {
@@ -230,7 +237,6 @@ pub async fn run_responder(
 
 use crate::code::PairingCode;
 
-/// 发起方（带码生命周期校验 + ProofStore 持久化）。失败 record_failure + 不 consume；成功 consume。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_initiator_checked(
     local: &Identity,
@@ -262,7 +268,6 @@ pub async fn run_initiator_checked(
     outcome
 }
 
-/// 仅 SPAKE2 验证失败（码不一致/转录无效/密钥错误）计为错误尝试。
 fn is_spake2_failure(e: &PairingError) -> bool {
     matches!(
         e,
@@ -272,7 +277,6 @@ fn is_spake2_failure(e: &PairingError) -> bool {
     )
 }
 
-/// 应答方（带码生命周期校验）。
 pub async fn run_responder_checked(
     local: &Identity,
     inputs: &SessionInputs,

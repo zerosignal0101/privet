@@ -1,4 +1,3 @@
-//! 可注入 I/O：PairingChannel（控制帧收发）+ PairingClock（时钟）+ 测试夹具。
 use async_trait::async_trait;
 use privet_protocol::ControlFrame;
 use tokio::sync::mpsc;
@@ -6,25 +5,21 @@ use tokio::sync::mpsc;
 use crate::code::Now;
 use crate::PairingError;
 
-/// 配对时钟（继承 code::Now）。
 pub trait PairingClock: Now {}
 impl<T: Now> PairingClock for T {}
 
-/// 控制流通道：收发 ControlFrame（PairingInit/Confirm/Result/ResultAck 封装于内）。
 #[async_trait]
 pub trait PairingChannel: Send {
     async fn send(&mut self, frame: ControlFrame) -> Result<(), PairingError>;
     async fn recv(&mut self) -> Result<ControlFrame, PairingError>;
 }
 
-/// 进程内回环通道对（A<->B 双向 mpsc）。
 pub struct LoopbackChannel {
     tx: mpsc::Sender<ControlFrame>,
     rx: mpsc::Receiver<ControlFrame>,
 }
 
 impl LoopbackChannel {
-    /// 返回 (A, B)：A.send 进 B.recv，B.send 进 A.recv。
     pub fn pair(cap: usize) -> (Self, Self) {
         let (atx, brx) = mpsc::channel(cap);
         let (btx, arx) = mpsc::channel(cap);
@@ -48,7 +43,6 @@ impl PairingChannel for LoopbackChannel {
     }
 }
 
-/// 丢前 `n` 帧的通道包装（测重发/丢失）。
 pub struct LossyChannel {
     inner: Box<dyn PairingChannel>,
     drop_remaining: usize,
@@ -80,7 +74,6 @@ impl PairingChannel for LossyChannel {
     }
 }
 
-/// 可设时钟（测试过期/超时）。
 pub struct MutableClock(std::sync::atomic::AtomicU64);
 impl MutableClock {
     pub fn new() -> Self {

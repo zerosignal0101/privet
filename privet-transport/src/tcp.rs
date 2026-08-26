@@ -1,4 +1,3 @@
-//! TCP 降级路径：tokio TCP + tokio-rustls，单连接 2 逻辑流多路。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -68,11 +67,9 @@ impl Stream for TcpStreamPrivet {
     }
 
     async fn reset(self: Box<Self>, _code: u32) {
-        // TCP: 无 per-stream reset；忽略。
     }
 }
 
-// ===== TcpConnection（2 流 mux）=====
 
 pub struct TcpConnectionPrivet {
     writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
@@ -82,6 +79,7 @@ pub struct TcpConnectionPrivet {
     peer_cert: Option<Vec<u8>>,
     exporter: Option<Vec<u8>>,
     captured_label: Option<Vec<u8>>,
+    captured_context: Option<Vec<u8>>,
 }
 
 impl TcpConnectionPrivet {
@@ -90,6 +88,7 @@ impl TcpConnectionPrivet {
         peer_cert: Option<Vec<u8>>,
         exporter: Option<Vec<u8>>,
         captured_label: Option<Vec<u8>>,
+        captured_context: Option<Vec<u8>>,
     ) -> Self
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -106,13 +105,11 @@ impl TcpConnectionPrivet {
             let mut buf = [0u8; 8192];
             let mut read_half = read_half;
             loop {
-                // always read TCP (may block; data_tx full 时也读 — Cancel 可能在后面)
                 match read_half.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => accum.extend_from_slice(&buf[..n]),
                     Err(_) => break,
                 }
-                // parse + dispatch; 控制帧优先，数据帧 try_send
                 'parse: loop {
                     // Parse all complete frames
                     let mut parsed: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -160,7 +157,6 @@ impl TcpConnectionPrivet {
                     }
                     rebuilt.extend_from_slice(&accum[parse_end..]);
                     accum = rebuilt;
-                    // 无控制帧且数据通道满 — 停止解析（等更多 TCP 数据 / data_tx 腾出）
                     if !had_control && any_data_blocked {
                         break 'parse;
                     }
@@ -177,6 +173,7 @@ impl TcpConnectionPrivet {
             peer_cert,
             exporter,
             captured_label,
+            captured_context,
         }
     }
 }
@@ -192,7 +189,6 @@ impl Connection for TcpConnectionPrivet {
         }))
     }
 
-    /// TCP 对称单流：open_control/accept_control 均返回共享控制流 stream_id 0。
     async fn open_control(&self) -> Result<Box<dyn Stream>> {
         self.control_stream()
     }
@@ -210,7 +206,6 @@ impl Connection for TcpConnectionPrivet {
         }))
     }
 
-    /// TCP 数据流对称：accept_data_stream 等价 open_data_stream（共享 stream_id 1）。
     async fn accept_data_stream(&self) -> Result<Box<dyn Stream>> {
         self.open_data_stream().await
     }
@@ -230,10 +225,14 @@ impl Connection for TcpConnectionPrivet {
     fn export_keying_material(
         &self,
         label: &[u8],
-        _context: Option<&[u8]>,
+        context: Option<&[u8]>,
     ) -> std::result::Result<Vec<u8>, TransportError> {
-        match (&self.captured_label, &self.exporter) {
-            (Some(cl), Some(e)) if cl == label => Ok(e.clone()),
+        match (&self.captured_label, &self.captured_context, &self.exporter) {
+            (Some(cl), Some(cc), Some(e))
+                if cl == label && cc.as_slice() == context.unwrap_or_default() =>
+            {
+                Ok(e.clone())
+            }
             _ => Err(TransportError::Unavailable("no tcp exporter".into())),
         }
     }
@@ -252,6 +251,8 @@ impl Connection for TcpConnectionPrivet {
 pub struct TcpListenerPrivet {
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
+    exporter_label: Vec<u8>,
+    exporter_context: Vec<u8>,
 }
 
 #[async_trait]
@@ -271,22 +272,28 @@ impl Listener for TcpListenerPrivet {
             .and_then(|c| c.first())
             .map(|c| c.as_ref().to_vec());
         // capture TLS exporter for transcript binding
-        let label = b"privet-pairing-binding";
+        let label = self.exporter_label.as_slice();
+        let context = self.exporter_context.as_slice();
         let mut exporter_out = [0u8; 32];
-        let (exporter, captured_label) =
+        let (exporter, captured_label, captured_context) =
             match stream
                 .get_ref()
                 .1
-                .export_keying_material(&mut exporter_out, label, Some(&[]))
+                .export_keying_material(&mut exporter_out, label, Some(context))
             {
-                Ok(out) => (Some(out.to_vec()), Some(label.to_vec())),
-                Err(_) => (None, None),
+                Ok(out) => (
+                    Some(out.to_vec()),
+                    Some(label.to_vec()),
+                    Some(context.to_vec()),
+                ),
+                Err(_) => (None, None, None),
             };
         Ok(Box::new(TcpConnectionPrivet::from_stream(
             stream,
             peer_cert,
             exporter,
             captured_label,
+            captured_context,
         )))
     }
 
@@ -328,7 +335,6 @@ impl Transport for TcpTransport {
         let server_name = rustls::pki_types::ServerName::try_from("privet")
             .map_err(|_| TransportError::Config("invalid SNI".into()))?;
         let stream = tls.connect(server_name, tcp).await?;
-        // 核对点：tokio-rustls 0.26 TlsStream::get_ref() 返回 (&TcpStream, &ServerConnection/ClientConnection)。
         let peer_cert = stream
             .get_ref()
             .1
@@ -336,22 +342,34 @@ impl Transport for TcpTransport {
             .and_then(|c| c.first())
             .map(|c| c.as_ref().to_vec());
         // capture TLS exporter for transcript binding (TCP fallback pairing)
-        let label = b"privet-pairing-binding";
+        let exporter_spec = self.config.pairing_exporter.clone().unwrap_or_else(|| {
+            crate::config::PairingExporterLabel {
+                label: b"privet-pairing-binding".to_vec(),
+                context: b"privet-pairing-v1".to_vec(),
+            }
+        });
+        let label = exporter_spec.label.as_slice();
+        let context = exporter_spec.context.as_slice();
         let mut exporter_out = [0u8; 32];
-        let (exporter, captured_label) =
+        let (exporter, captured_label, captured_context) =
             match stream
                 .get_ref()
                 .1
-                .export_keying_material(&mut exporter_out, label, Some(&[]))
+                .export_keying_material(&mut exporter_out, label, Some(context))
             {
-                Ok(out) => (Some(out.to_vec()), Some(label.to_vec())),
-                Err(_) => (None, None),
+                Ok(out) => (
+                    Some(out.to_vec()),
+                    Some(label.to_vec()),
+                    Some(context.to_vec()),
+                ),
+                Err(_) => (None, None, None),
             };
         Ok(Box::new(TcpConnectionPrivet::from_stream(
             stream,
             peer_cert,
             exporter,
             captured_label,
+            captured_context,
         )))
     }
 
@@ -359,7 +377,18 @@ impl Transport for TcpTransport {
         let listener = TcpListener::bind(addr).await?;
         let acceptor =
             tokio_rustls::TlsAcceptor::from(Arc::new(build_server_config(&self.material)?));
-        Ok(Box::new(TcpListenerPrivet { listener, acceptor }))
+        let exporter = self.config.pairing_exporter.clone().unwrap_or_else(|| {
+            crate::config::PairingExporterLabel {
+                label: b"privet-pairing-binding".to_vec(),
+                context: b"privet-pairing-v1".to_vec(),
+            }
+        });
+        Ok(Box::new(TcpListenerPrivet {
+            listener,
+            acceptor,
+            exporter_label: exporter.label,
+            exporter_context: exporter.context,
+        }))
     }
 }
 
@@ -397,7 +426,6 @@ mod tests {
         .await
         .unwrap();
 
-        // 客户端侧（看到服务端证书）应有 peer_cert；服务端（无 mTLS）无客户端证书。
         assert!(
             cli_conn.peer_cert_der().is_some(),
             "tcp client must see server cert"

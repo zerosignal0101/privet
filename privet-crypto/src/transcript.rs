@@ -1,4 +1,3 @@
-//! 配对转录：规范化拼接 -> BLAKE3 -> Ed25519 签名/验签
 
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -20,9 +19,6 @@ pub struct TranscriptParts<'a> {
     pub confirmation_tag: &'a [u8; 32],
 }
 
-/// 转录哈希：BLAKE3(canonical_concat(...))。
-/// canonical 编码 = 每字段「tag(ASCII) + 8B LE length + value」，无歧义、域分隔。
-/// initiator 字段恒在前（与谁签名无关），双方算同一 hash。
 pub fn transcript_hash(parts: &TranscriptParts<'_>) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     field(&mut h, b"proto_version", &parts.proto_version.to_le_bytes());

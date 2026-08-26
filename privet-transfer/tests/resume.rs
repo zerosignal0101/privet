@@ -1,4 +1,3 @@
-//! 续传已验证位图 + manifest 变更。
 use privet_transfer::part_store::{FsPartStore, PartStore};
 use privet_transfer::resume::manifest_changed;
 use tempfile::tempdir;

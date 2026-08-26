@@ -1,4 +1,3 @@
-//! Task D17: Discovery 接线（LocalDeviceInfo 拼装 + map_peer_event + Engine start/stop）。
 use privet_core::discovery::{build_local_device_info, map_peer_event};
 use privet_core::{EngineConfig, EngineEvent};
 use privet_crypto::identity::Identity;

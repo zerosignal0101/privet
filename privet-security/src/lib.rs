@@ -1,5 +1,4 @@
-//! privet-security：身份钉扎、配对码、SPAKE2+ 握手、提交时序、撤销/失败关闭。
-//! 可注入测试：不依赖 transport/storage。core 负责接真实 I/O。
+//! Pairing policy, transcript binding, pinned-key authorization, and trust commit behavior.
 #![allow(rustdoc::invalid_html_tags)]
 
 pub mod constants;

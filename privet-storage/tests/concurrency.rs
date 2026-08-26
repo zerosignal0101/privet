@@ -1,4 +1,3 @@
-//! WAL 并发：N 读 + 1 写无损坏；busy_timeout 生效（结构性断言于 db::tests）。
 
 use std::sync::Arc;
 use std::thread;
@@ -39,7 +38,6 @@ fn n_readers_one_writer_no_corruption() {
     let path = Arc::new(path.to_path_buf());
     let mut handles = Vec::new();
 
-    // 1 写者：插 200 条历史
     let wp = Arc::clone(&path);
     handles.push(thread::spawn(move || {
         let conn = open_and_migrate(&*wp).unwrap();
@@ -64,7 +62,6 @@ fn n_readers_one_writer_no_corruption() {
         }
     }));
 
-    // 4 读者：反复查 COUNT，断言无错且单调非减
     for _ in 0..4 {
         let rp = Arc::clone(&path);
         handles.push(thread::spawn(move || {
@@ -83,7 +80,6 @@ fn n_readers_one_writer_no_corruption() {
         h.join().unwrap();
     }
 
-    // 终态：200 条全在
     let conn = open_and_migrate(&*path).unwrap();
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM transfer_history", [], |r| r.get(0))
@@ -93,7 +89,6 @@ fn n_readers_one_writer_no_corruption() {
 
 #[test]
 fn large_history_query_correct_via_index() {
-    // 测试 12：1 万传送，idx_history_started 查询正确（仅正确性，不断言绝对耗时）。
     let dir = tempfile::tempdir().unwrap();
     let conn = open_and_migrate(dir.path().join("big.db")).unwrap();
     for i in 0..10_000u64 {
@@ -115,7 +110,6 @@ fn large_history_query_correct_via_index() {
         )
         .unwrap();
     }
-    // 按 started_ts DESC 取前 5 -> 应为 ts 10000,9999,9998,9997,9996
     let mut stmt = conn
         .prepare("SELECT transfer_id FROM transfer_history ORDER BY started_ts DESC LIMIT 5")
         .unwrap();

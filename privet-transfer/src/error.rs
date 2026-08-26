@@ -1,8 +1,6 @@
-//! TransferError + 错误码映射。
 
 use privet_protocol::error::PathError;
 
-/// 传送错误分类。-> 映射 ControlMessage.cancel{reason} / TransferVerified{ok=false,error}。
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
     #[error("declined: {0}")]
@@ -45,7 +43,6 @@ impl From<PathError> for TransferError {
     }
 }
 
-/// -> ControlMessage.cancel.reason / TransferVerified.error 用的短码串。
 impl TransferError {
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -68,7 +65,6 @@ impl TransferError {
         }
     }
 
-    /// 是否可重试（对齐 TransferFailed{retryable}）。
     pub fn retryable(&self) -> bool {
         matches!(
             self,

@@ -1,4 +1,3 @@
-//! 帧级与路径错误类型。
 
 use thiserror::Error;
 

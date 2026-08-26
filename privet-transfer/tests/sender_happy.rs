@@ -1,4 +1,3 @@
-//! sender + receiver 回环 happy path（单文件分块）。
 use privet_transfer::channel::{LoopbackControlChannel, LoopbackDataChannel};
 use privet_transfer::config::TransferEngineConfig;
 use privet_transfer::events::NoopEventSink;

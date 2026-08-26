@@ -1,5 +1,3 @@
-//! 孤儿对账 scoping: 只 reconcile direction='receive' 且 save_dir 匹配的 partial 行。
-//! SEND 和其他 save_dir 的 RECEIVE 不得被标记为 failed。
 
 use privet_storage::db::open_in_memory;
 use privet_storage::migration::{run_migrations, MIGRATIONS};

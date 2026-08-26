@@ -1,4 +1,3 @@
-//! PartStore（.part/sidecar/resume/finalize/碰撞/落地根/清理）
 use privet_transfer::config::CollisionPolicy;
 use privet_transfer::part_store::{FinalizeOutcome, FsPartStore, PartStore};
 use std::fs;
@@ -25,14 +24,12 @@ fn write_segment_meta_then_resume_rebuilds() {
     st.init_part_meta("t1", "a.bin", "f1", 8, 0, "fullhash")
         .unwrap();
     st.pwrite_part("t1", "a.bin", 0, b"AAAABBBB").unwrap();
-    // 默认分段 1MiB/块，8 字节文件 -> 1 块
     let h0 = hex::encode(privet_crypto::hash::blake3(b"AAAABBBB"));
     st.write_segment_meta("t1", "a.bin", "f1", 0, "root0", &[h0])
         .unwrap();
     let bm = st.rebuild_resume_bitmask("t1", "a.bin").unwrap();
     assert_eq!(bm.len(), 1);
     assert_eq!(bm[0].segment_id, 0);
-    // 1 块全部验证 -> bit 0 set
     assert_eq!(bm[0].bitmask, vec![0b01]);
 }
 

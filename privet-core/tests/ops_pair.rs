@@ -1,4 +1,3 @@
-//! Engine::pair_initiate + set_pending_pair_code + serve 配对 e2e over loopback QUIC。
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -44,18 +43,20 @@ async fn pair_initiate_and_accept_succeed_over_quic() {
         .unwrap();
     receiver.set_pending_pair_code(code);
 
-    // 绑 0.0.0.0：接收所有接口；本地测试须用 127.0.0.1 连接。
-    let mut addr = serve.quic_addr;
-    addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut quic_addr = serve.quic_addr;
+    quic_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut tcp_addr = serve.tcp_addr;
+    tcp_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let outcome = tokio::time::timeout(Duration::from_secs(15), async {
-        sender.pair_initiate(addr, code_str).await
+        sender
+            .pair_initiate_with_ports(quic_addr, tcp_addr, code_str)
+            .await
     })
     .await
     .expect("pair timeout")
     .expect("pair failed");
     assert!(matches!(outcome, PairingOutcome::Paired { .. }));
 
-    // 双方互信。
     assert!(sender
         .list_trusted()
         .unwrap()
@@ -66,6 +67,15 @@ async fn pair_initiate_and_accept_succeed_over_quic() {
         .unwrap()
         .iter()
         .any(|r| r.device_fingerprint == sender.identity().fingerprint()));
+
+    let addresses = privet_storage::addresses::recent_known(
+        &sender.db_conn().unwrap(),
+        &receiver.identity().fingerprint(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(addresses[0].quic_port, quic_addr.port());
+    assert_eq!(addresses[0].tcp_port, tcp_addr.port());
 
     serve.shutdown().await;
     let _ = receiver.shutdown().await;

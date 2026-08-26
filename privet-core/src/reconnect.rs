@@ -1,11 +1,8 @@
-//! 指数退避 \[1,2,4,8,16,30\]s + 6 次上限 -> Paused{reconnect_exhausted}。
 use std::time::Duration;
 
 use crate::constants::BACKOFF_SCHEDULE;
 use crate::EngineEvent;
 
-/// 退避迭代器：逐次返回 BACKOFF_SCHEDULE；超过上限返回 None。
-/// 默认用全局退避表；测试可注入短 schedule（Vec 而非静态引用）。
 #[derive(Debug)]
 pub struct Backoff {
     attempt: u32,
@@ -19,7 +16,6 @@ impl Backoff {
             schedule: BACKOFF_SCHEDULE.to_vec(),
         }
     }
-    /// 测试用：自定义退避表（如 vec![1ms, 1ms]）。
     pub fn with_schedule(schedule: Vec<Duration>) -> Self {
         Self {
             attempt: 0,

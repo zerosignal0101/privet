@@ -1,4 +1,3 @@
-//! 多数据流池（Vec<Box<dyn DataChannel>>）验证。单流链路仍走 data[0]。
 
 use privet_transfer::channel::{LoopbackControlChannel, LoopbackDataChannel};
 use privet_transfer::config::TransferEngineConfig;
@@ -19,7 +18,6 @@ async fn pool_with_multiple_channels_transfers_successfully() {
         privet_transfer::prepare::prepare_dir(dir.path(), None, 0, 1024 * 1024, 1024).unwrap();
     let reader = MappedChunkReader::from_prepared(&prepared);
     let (ctl_a, ctl_b) = LoopbackControlChannel::pair(64);
-    // 提供 2 条数据流（仅第 0 条被使用，但池模式允许）
     let (dat_a1, dat_b1) = LoopbackDataChannel::pair(64);
     let (dat_a2, dat_b2) = LoopbackDataChannel::pair(64);
     let s = SenderInputs {

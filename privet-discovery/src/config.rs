@@ -1,4 +1,3 @@
-//! 发现配置
 
 #![cfg_attr(test, allow(unused_imports))]
 
@@ -6,14 +5,10 @@ use std::time::Duration;
 
 use crate::constants::*;
 
-/// 可发现性模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoverabilityMode {
-    /// 始终广播 + 响应 Probe（默认）。
     Always,
-    /// 限时窗口内广播，期满静默。
     Window,
-    /// 不广播不响应公开 Probe；仅直连 + 接受已信任入站。
     TrustedOnly,
 }
 

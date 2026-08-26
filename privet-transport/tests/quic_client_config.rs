@@ -1,5 +1,4 @@
 //! QUIC client applies TransportConfigPrivet (idle timeout, BBR, stream pool).
-//! 验证自定义配置的 client 能正常连接。
 
 mod common;
 

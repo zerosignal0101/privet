@@ -1,4 +1,3 @@
-//! 传送编排：输入构造 + 重写包装 + recovery + 重连循环
 
 use std::net::SocketAddr;
 
@@ -12,13 +11,12 @@ use tokio::sync::broadcast;
 
 use crate::adapters::transfer_sink::CoreTransferEventSink;
 use crate::connection::{
-    acquire_control, acquire_data, connect_peer, hello_exchange, ControlRole, DataRole,
+    acquire_control, acquire_data, connect_peer_with_ports, hello_exchange, ControlRole, DataRole,
 };
 use crate::reconnect::{reconnect_event, resumed_event, Backoff};
 use crate::EngineEvent;
 use privet_crypto::identity::Identity;
 
-/// 构造 receiver 输入（受信控制流 + 数据流 + 真 PartStore + 事件桥接）。
 pub fn receiver_inputs(
     control: Box<dyn Stream>,
     data: Box<dyn Stream>,
@@ -39,7 +37,6 @@ pub fn receiver_inputs(
     }
 }
 
-/// 构造 sender 输入。
 #[allow(clippy::too_many_arguments)]
 pub fn sender_inputs(
     control: Box<dyn Stream>,
@@ -49,7 +46,7 @@ pub fn sender_inputs(
     prepared: privet_transfer::PreparedSet,
     reader: Box<dyn privet_transfer::ChunkReader>,
     transfer_id: String,
-    cmd_rx: Option<tokio::sync::mpsc::Receiver<privet_transfer::TransferCommand>>,
+    cmd_rx: Option<privet_transfer::SharedCommandReceiver>,
 ) -> SenderInputs {
     SenderInputs {
         control: Box::new(StreamControlChannel::new(control)),
@@ -63,7 +60,6 @@ pub fn sender_inputs(
     }
 }
 
-/// 受信控制流 + 数据流上发送传送（return Ok when done）。
 pub async fn send_over_connection(
     control: Box<dyn Stream>,
     data: Box<dyn Stream>,
@@ -74,6 +70,9 @@ pub async fn send_over_connection(
     cmd_rx: Option<tokio::sync::mpsc::Receiver<privet_transfer::TransferCommand>>,
 ) -> crate::Result<()> {
     let reader = Box::new(privet_transfer::MappedChunkReader::from_prepared(&prepared));
+    let cmd_rx = cmd_rx.map(|receiver| {
+        std::sync::Arc::new(tokio::sync::Mutex::new(receiver))
+    });
     let inputs = sender_inputs(
         control,
         data,
@@ -87,7 +86,6 @@ pub async fn send_over_connection(
     Ok(privet_transfer::run_sender(inputs).await?)
 }
 
-/// 受信控制流 + 数据流上接收传送。
 pub async fn receive_over_connection(
     control: Box<dyn Stream>,
     data: Box<dyn Stream>,
@@ -101,15 +99,11 @@ pub async fn receive_over_connection(
     Ok(privet_transfer::run_receiver(inputs).await?)
 }
 
-// ===== 重连循环 =====
 
 use crate::CoreError;
 use privet_transfer::TransferError;
 
 #[allow(clippy::too_many_arguments)]
-/// 发送方重连循环：连接断 -> 退避 -> 重连 -> resume。耗尽 -> 返回 Err(TransportLost)。
-/// `backoff` 可注自定义退避表（测试用短表）。
-/// 在 acquire_control/acquire_data/send_data 阶段若得 TransportError 也重试。
 pub async fn send_with_reconnect(
     quic: &dyn Transport,
     tcp: Option<&dyn Transport>,
@@ -122,10 +116,47 @@ pub async fn send_with_reconnect(
     event_tx: broadcast::Sender<EngineEvent>,
     transfer_id: String,
     backoff: &mut Backoff,
-    _cmd_rx: Option<tokio::sync::mpsc::Receiver<privet_transfer::TransferCommand>>,
+    cmd_rx: Option<tokio::sync::mpsc::Receiver<privet_transfer::TransferCommand>>,
 ) -> crate::Result<()> {
+    send_with_reconnect_endpoints(
+        quic,
+        tcp,
+        addr,
+        addr,
+        mode,
+        local,
+        device_name,
+        prepared,
+        cfg,
+        event_tx,
+        transfer_id,
+        backoff,
+        cmd_rx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_with_reconnect_endpoints(
+    quic: &dyn Transport,
+    tcp: Option<&dyn Transport>,
+    quic_addr: SocketAddr,
+    tcp_addr: SocketAddr,
+    mode: TransportMode,
+    local: &Identity,
+    device_name: &str,
+    prepared: privet_transfer::PreparedSet,
+    cfg: TransferEngineConfig,
+    event_tx: broadcast::Sender<EngineEvent>,
+    transfer_id: String,
+    backoff: &mut Backoff,
+    cmd_rx: Option<tokio::sync::mpsc::Receiver<privet_transfer::TransferCommand>>,
+) -> crate::Result<()> {
+    let cmd_rx = cmd_rx.map(|receiver| {
+        std::sync::Arc::new(tokio::sync::Mutex::new(receiver))
+    });
     loop {
-        let conn = match connect_peer(quic, tcp, addr, mode, None).await {
+        let conn = match connect_peer_with_ports(quic, tcp, quic_addr, tcp_addr, mode, None).await {
             Ok(c) => c,
             Err(_) => {
                 if !next_backoff_or_exhausted(backoff, &transfer_id, &event_tx).await {
@@ -143,7 +174,6 @@ pub async fn send_with_reconnect(
                 return Err(e);
             }
         };
-        // Hello 交换（重连后重建 TLS 协议状态）。
         if let Err(e) = hello_exchange(ctrl.as_mut(), local, 1, device_name).await {
             if retry_on_transport_lost(&e, backoff, &transfer_id, &event_tx).await {
                 continue;
@@ -159,7 +189,6 @@ pub async fn send_with_reconnect(
                 return Err(e);
             }
         };
-        // QUIC：写空 DataFrame 触发 STREAM frame，让对端 accept_uni 解析。
         if let Err(e) = send_data(data.as_mut(), &DataFrame { payload: None }, None).await {
             if retry_on_transport_lost(&CoreError::Transport(e), backoff, &transfer_id, &event_tx)
                 .await
@@ -177,7 +206,7 @@ pub async fn send_with_reconnect(
             prepared.clone(),
             reader,
             transfer_id.clone(),
-            None,
+            cmd_rx.clone(),
         );
         match privet_transfer::run_sender(inputs).await {
             Ok(()) => {
@@ -185,8 +214,6 @@ pub async fn send_with_reconnect(
                 return Ok(());
             }
             Err(TransferError::TransportLost) | Err(TransferError::Transport(_)) => {
-                // TransportLost 与 Transport(String) 均视为可重连（前者 run_sender
-                // 显式匹配，后者如 control recv 错误也应触发退避而非直接失败）。
                 if !next_backoff_or_exhausted(backoff, &transfer_id, &event_tx).await {
                     return Err(CoreError::Transfer(TransferError::TransportLost));
                 }
@@ -197,7 +224,6 @@ pub async fn send_with_reconnect(
     }
 }
 
-/// 退避或耗尽：返回 true=有退避（继续重试），false=耗尽。
 async fn next_backoff_or_exhausted(
     backoff: &mut Backoff,
     transfer_id: &str,
@@ -205,7 +231,6 @@ async fn next_backoff_or_exhausted(
 ) -> bool {
     match backoff.next_backoff() {
         Some(d) => {
-            // 重连日志（原实现静默；诊断连接死亡次数）
             tracing::warn!(
                 transfer_id,
                 attempt = backoff.attempt(),
@@ -217,14 +242,12 @@ async fn next_backoff_or_exhausted(
             true
         }
         None => {
-            // 退避耗尽日志（原仅返回 false，逐次重连不可见）
             tracing::warn!(transfer_id, "transport lost; backoff exhausted");
             false
         }
     }
 }
 
-/// transport 级（连接断）是否可重试？是则退避并返回 true。
 async fn retry_on_transport_lost(
     error: &CoreError,
     backoff: &mut Backoff,
@@ -237,11 +260,8 @@ async fn retry_on_transport_lost(
     false
 }
 
-// ===== 崩溃恢复 =====
 use std::path::Path;
 
-/// 启动时扫描 staging 目录的 .part/.part.meta + 孤儿对账。
-/// 仅扫描 staging 目录，不碰用户子目录。
 pub fn recover_partial_transfers(
     save_dir: &Path,
     conn: &rusqlite::Connection,

@@ -1,4 +1,3 @@
-//! 通道夹具（三态测、丢包、乱序、RTO 用）。
 use privet_protocol::{
     control_frame::Payload as CPayload, data_frame::Payload as DPayload, ChunkHeader, ControlFrame,
     ControlMessage, DataFrame,

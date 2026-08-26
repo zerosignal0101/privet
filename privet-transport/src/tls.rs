@@ -1,4 +1,3 @@
-//! TLS 材料 + rustls 配置。
 
 use std::sync::Arc;
 
@@ -6,7 +5,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::error::{Result, TransportError};
 
-/// TLS 材料：证书链 + PKCS8 私钥（core 用 crypto Identity 拼装注入）。
 #[derive(Clone)]
 pub struct TlsMaterial {
     pub cert_chain: Vec<CertificateDer<'static>>,
@@ -26,7 +24,6 @@ fn ensure_ring_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// 服务端接受任意客户端证书（应用层钉扎）。
 #[derive(Debug)]
 struct AcceptAnyClientCert;
 
@@ -69,7 +66,6 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
     }
 }
 
-/// 服务端配置：自签证书 + 接收任意客户端证书（钉扎在应用层）。
 pub fn build_server_config(mat: &TlsMaterial) -> Result<rustls::ServerConfig> {
     if mat.cert_chain.is_empty() {
         return Err(TransportError::TlsMaterial("empty cert chain".into()));
@@ -82,7 +78,6 @@ pub fn build_server_config(mat: &TlsMaterial) -> Result<rustls::ServerConfig> {
         .map_err(|e| TransportError::TlsMaterial(e.to_string()))
 }
 
-/// 接受任意对端证书（钉扎在 `Connection::peer_cert_der()` 后做）。
 #[derive(Debug)]
 struct NoVerify;
 
@@ -125,7 +120,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
-/// 客户端配置：danger_accept_any + 发送本端证书（使 server 侧 peer_cert_der 可用）。
 pub fn build_client_config(mat: &TlsMaterial) -> Result<rustls::ClientConfig> {
     ensure_ring_provider();
     let key = PrivateKeyDer::Pkcs8(mat.key_pkcs8.clone().into());

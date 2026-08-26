@@ -1,4 +1,3 @@
-//! sweep 纯逻辑单测（无 I/O）。
 
 use privet_discovery::beacon::BeaconView;
 use privet_discovery::peer::{PeerEvent, PeerState, PeerStore, PeerStoreEvent};
@@ -33,7 +32,6 @@ fn sweep_live_to_stale_to_lost() {
     s.transition("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", PeerEvent::ConnectOk);
     assert_eq!(s.get("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap().state, PeerState::Live);
 
-    // +200s: 超 stale(180s) -> Stale
     s.sweep(
         now + 200_000,
         Duration::from_secs(180),
@@ -45,7 +43,6 @@ fn sweep_live_to_stale_to_lost() {
     ));
     assert_eq!(s.get("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap().state, PeerState::Stale);
 
-    // +310s: 超 lost(300s) -> Lost
     s.sweep(
         now + 310_000,
         Duration::from_secs(180),
@@ -70,7 +67,6 @@ fn sweep_skips_fresh_live_peer() {
     );
     s.transition("cafebabe", PeerEvent::AddrResolved);
     s.transition("cafebabe", PeerEvent::ConnectOk);
-    // 排空 setup 阶段的事件（Discovered + StateChanged）
     let _ = s.drain_events();
     s.sweep(
         now + 10_000,
@@ -81,7 +77,6 @@ fn sweep_skips_fresh_live_peer() {
     assert_eq!(s.get("cafebabe").unwrap().state, PeerState::Live);
 }
 
-// now_fn 时钟缝：任务用注入时钟，非 SystemTime。
 use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,7 +122,7 @@ fn should_announce_window_expiry() {
     eng.set_start_ms_for_test(1_000_000);
     assert!(eng.should_announce(1_000_000));
     assert!(eng.should_announce(1_000_000 + 599_999));
-    assert!(!eng.should_announce(1_000_000 + 600_000)); // 期满
+    assert!(!eng.should_announce(1_000_000 + 600_000));
 }
 
 #[test]
@@ -180,7 +175,7 @@ async fn reply_to_probe_sends_beacon_to_prober_discovery_port() {
     assert_eq!(
         cap[0].1,
         SocketAddr::new(prober.ip(), PRIVET_DISCOVERY_PORT)
-    ); // 回 47809
+    );
     assert_eq!(message_tag(&cap[0].0), Some(1)); // beacon tag
     let b = decode_beacon_tagged(&cap[0].0).unwrap();
     assert_eq!(b.device_fingerprint, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
@@ -214,7 +209,6 @@ async fn refresh_sends_probe_to_all_broadcast_targets() {
         "all must be Probe (tag 2)"
     );
     let targets = eng.broadcast_targets();
-    // 每个目标至少收到一帧
     for t in &targets {
         assert!(
             cap.iter().any(|(_, dst)| dst == t),
@@ -266,7 +260,6 @@ fn on_mdns_resolved_feeds_store_as_beacon() {
     );
 }
 
-// 子网放大防护 + handle_inbound 接线
 use privet_discovery::beacon::encode_beacon_tagged;
 use privet_discovery::beacon::encode_probe_tagged;
 use privet_discovery::netinfo::{enumerate_interfaces, probe_src_is_local_subnet};
@@ -274,7 +267,6 @@ use privet_protocol::{Beacon, Probe};
 
 #[test]
 fn probe_src_is_local_subnet_matches_local_and_rejects_foreign() {
-    // 合成接口：192.168.1.0/24 + 10.0.0.0/16
     let ifaces = vec![
         (
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
@@ -289,7 +281,6 @@ fn probe_src_is_local_subnet_matches_local_and_rejects_foreign() {
             "eth1".into(),
         ),
     ];
-    // 同子网 -> true
     assert!(probe_src_is_local_subnet(
         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
         &ifaces
@@ -298,17 +289,14 @@ fn probe_src_is_local_subnet_matches_local_and_rejects_foreign() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 255, 255)),
         &ifaces
     ));
-    // 不同子网 -> false
     assert!(!probe_src_is_local_subnet(
         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         &ifaces
     ));
-    // IPv6 源 -> false（本期不处理 IPv6 Probe）
     assert!(!probe_src_is_local_subnet(
         IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
         &ifaces
     ));
-    // 空接口列表 -> false
     assert!(!probe_src_is_local_subnet(
         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
         &[]
@@ -322,10 +310,9 @@ async fn handle_inbound_replies_to_probe_in_always_mode() {
         .filter(|(ip, _, _, _)| ip.is_ipv4())
         .collect();
     if ifaces.is_empty() {
-        return; // 无可用的非环回 IPv4 接口，跳过
+        return;
     }
     let (local_ip, _, _, _) = ifaces[0];
-    // 同子网的非本机 IP（避免 handle_inbound 自回环跳过）。
     let peer_ip = match local_ip {
         IpAddr::V4(v4) => {
             let mut oct = v4.octets();
@@ -391,13 +378,12 @@ async fn handle_inbound_suppresses_reply_in_trusted_only() {
 #[tokio::test]
 async fn handle_inbound_suppresses_reply_for_non_local_src() {
     let non_local = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-    // 确保 8.8.8.8 确实不在本地子网
     let ifaces: Vec<_> = enumerate_interfaces()
         .into_iter()
         .filter(|(ip, _, _, _)| ip.is_ipv4())
         .collect();
     if probe_src_is_local_subnet(non_local, &ifaces) {
-        return; // 罕见的跨网络环境，跳过
+        return;
     }
     let eng = DiscoveryEngine::new(info(), DiscoveryConfigPrivet::default()); // Always
     let sink = Arc::new(CapturedSink::new());

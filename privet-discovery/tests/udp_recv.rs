@@ -1,5 +1,3 @@
-//! now_ms 验证 + Goodbye discriminator 测试。
-//! 验证真实 now_ms 下 beacon 不被误拒，Goodbye 正确解派发到 handle_goodbye。
 
 use privet_discovery::peer::PeerStore;
 use privet_discovery::udp::{handle_incoming_datagram, NonceCache, RateLimiter};
@@ -38,7 +36,6 @@ fn real_timestamped_beacon_is_accepted() {
     let mut rl = RateLimiter::new();
     let src = IpAddr::from_str("10.0.0.1").unwrap();
 
-    // 不应因 now_ms=0 bug 被拒
     handle_incoming_datagram(&mut store, &bytes, src, None, now, &mut nonce, &mut rl);
     let peers = store.snapshot();
     assert!(
@@ -52,7 +49,6 @@ fn goodbye_reaches_handle_goodbye() {
     let fp = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     let bytes = make_goodbye(fp);
     let mut store = PeerStore::new();
-    // 先注入一个 live 的 peer
     store.handle_beacon(
         &privet_discovery::beacon::BeaconView {
             device_name: "alice".into(),
@@ -76,7 +72,6 @@ fn goodbye_reaches_handle_goodbye() {
     let mut rl = RateLimiter::new();
     let src = IpAddr::from_str("10.0.0.2").unwrap();
 
-    // 发送 Goodbye
     handle_incoming_datagram(
         &mut store,
         &bytes,
@@ -87,9 +82,7 @@ fn goodbye_reaches_handle_goodbye() {
         &mut rl,
     );
 
-    // Goodbye 后 peer 应变为 Absent
     let peers_after = store.snapshot();
-    // Peer 不应出现（triggered Goodbye → Absent → snapshot 不包含 Absent）
     assert!(
         peers_after.is_empty()
             || peers_after

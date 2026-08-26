@@ -25,7 +25,6 @@ async fn tcp_connect_control_roundtrip() {
     assert_eq!(client.kind(), privet_transport::TransportKind::Tcp);
     assert_eq!(client.max_data_streams(), 1);
 
-    // Client 控制流发 Cancel (ControlMessage)，server 接收。
     let mut c = client.control_stream().unwrap();
     let msg = privet_protocol::ControlFrame {
         payload: Some(privet_protocol::control_frame::Payload::Control(
@@ -54,7 +53,6 @@ async fn tcp_connect_control_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_control_interleaves_data() {
-    // 发送数据帧后紧接控制 Cancel，server 应能从控制流读到 Cancel（不被数据阻塞）。
     let mat = common::test_tls_material();
     let transport = privet_transport::TcpTransport::new(mat, Default::default());
     let listener = transport
@@ -72,7 +70,6 @@ async fn tcp_control_interleaves_data() {
         .unwrap();
     let server = srv.await.unwrap();
 
-    // Client: 发数据帧，接 Cancel。
     let mut data = client.open_data_stream().await.unwrap();
     let dh = privet_protocol::DataFrame {
         payload: Some(privet_protocol::data_frame::Payload::ChunkHeader(
@@ -107,7 +104,6 @@ async fn tcp_control_interleaves_data() {
     .await
     .unwrap();
 
-    // Server: 控制流可读（不读数据流）。
     let mut sctrl = server.control_stream().unwrap();
     let got = privet_transport::recv_control(sctrl.as_mut())
         .await

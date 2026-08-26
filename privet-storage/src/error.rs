@@ -1,4 +1,3 @@
-//! storage 层错误类型。
 
 use thiserror::Error;
 

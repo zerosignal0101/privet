@@ -1,8 +1,6 @@
-//! 已验证位图：与 ChunkAck 语义对齐，仅置已验证块。
 
 use privet_protocol::ChunkBitmask;
 
-/// 单段已验证位图。
 #[derive(Debug, Clone)]
 pub struct VerifiedBitmask {
     bits: Vec<u8>,
@@ -18,7 +16,6 @@ impl VerifiedBitmask {
         }
     }
 
-    /// 全零空段（chunk_count=0）。
     pub fn empty_segment(_segment_id: u32) -> Self {
         Self::new(0)
     }
@@ -52,7 +49,6 @@ impl VerifiedBitmask {
         self.n
     }
 
-    /// 从 proto ChunkBitmask 还原（resume 比对用）。
     #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8], chunk_count: u32) -> Self {
         let mut bm = Self::new(chunk_count);
@@ -61,7 +57,6 @@ impl VerifiedBitmask {
         bm
     }
 
-    /// 返回所有已置位的块索引（ChunkAck 用）。
     pub fn set_bits(&self) -> Vec<u64> {
         (0..self.n)
             .filter(|&i| self.is_set(i))
@@ -69,7 +64,6 @@ impl VerifiedBitmask {
             .collect()
     }
 
-    /// -> proto ChunkBitmask。
     pub fn to_chunk_bitmask(&self, file_id: &str, segment_id: u32) -> ChunkBitmask {
         ChunkBitmask {
             file_id: file_id.into(),

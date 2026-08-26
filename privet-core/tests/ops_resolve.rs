@@ -1,4 +1,3 @@
-//! E4: Engine::resolve_peer + prepare_paths（对端解析 + 多路径准备）。
 use tempfile::TempDir;
 
 use privet_core::ops::{prepare_paths, PeerTarget};
@@ -58,6 +57,8 @@ fn resolve_by_device_fingerprint_uses_recent_address() {
     assert_eq!(pa.peer_name.as_deref(), Some("bob"));
     assert!(pa.addr.ip().to_string() == "127.0.0.9");
     assert_eq!(pa.addr.port(), 47808);
+    assert_eq!(pa.quic_port, 47808);
+    assert_eq!(pa.tcp_port, 47810);
 }
 
 #[test]
@@ -102,6 +103,7 @@ fn resolve_via_overrides_ip_keeps_ports() {
         .unwrap();
     assert_eq!(pa.addr.ip(), via);
     assert_eq!(pa.addr.port(), 47808);
+    assert_eq!(pa.tcp_port, 47810);
 }
 
 #[test]

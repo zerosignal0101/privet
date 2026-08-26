@@ -1,4 +1,3 @@
-//! E3: Engine 读类操作（identity_info / list_trusted / history）。
 use privet_core::{Engine, EngineConfig};
 use tempfile::TempDir;
 

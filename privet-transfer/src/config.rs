@@ -1,4 +1,3 @@
-//! 传送引擎配置+ 碰撞策略。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,15 +8,11 @@ use crate::constants::{
 };
 use privet_protocol::constants::{DEFAULT_CHUNK_SIZE, INLINE_FILE_THRESHOLD, SEGMENT_MAX_CHUNKS};
 
-/// 落地同名碰撞策略（接收方配置；发送方不可指定 overwrite）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CollisionPolicy {
-    /// rename（默认）：找空名 name(N).ext，exclusive-create 占位 -> rename。永不丢数据。
     #[default]
     Rename,
-    /// skip：unlink .part、不落地，per-file 标 skipped。
     Skip,
-    /// overwrite：rename(.part -> 终态) 直接替换（接收方自负）。
     Overwrite,
 }
 
@@ -34,7 +29,6 @@ pub struct TransferEngineConfig {
     pub chunk_retransmit_max: u32,
     pub fsync_per_segment: bool,
     pub on_collision: CollisionPolicy,
-    /// 接收方落地根目录（save_dir）。
     pub save_dir: PathBuf,
 }
 

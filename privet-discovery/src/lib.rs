@@ -1,4 +1,4 @@
-//! privet-discovery：mDNS + UDP beacon，对等体列表与生命周期。无传输逻辑。
+//! LAN peer discovery and candidate-address tracking.
 
 pub mod constants;
 pub mod error;

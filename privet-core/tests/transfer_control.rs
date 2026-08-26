@@ -1,4 +1,3 @@
-//! 传输控制面：TransferRegistry + OfferResolver + AcceptPolicy + TransferCommand + Engine 接入
 use std::sync::Arc;
 
 use privet_core::{
@@ -66,7 +65,6 @@ fn offer_resolver_cancel_cleans_up() {
     let res = OfferResolver::new();
     let _rx = res.await_decision("t-clean");
     res.cancel("t-clean");
-    // cancel 后再 resolve -> false（无此 tid）
     assert!(!res.resolve("t-clean", true));
 }
 

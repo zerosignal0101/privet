@@ -1,5 +1,3 @@
-//! Task A1：crate scaffold + EngineConfig Default + CoreError 融合 + Result 别名。
-//! Task A2：EngineEvent 广播 + Engine 骨架。
 use privet_core::{CoreError, EngineConfig, EngineEvent, Result};
 
 #[test]

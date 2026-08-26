@@ -1,0 +1,30 @@
+[package]
+name = "privet-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "privetd"
+path = "src/main.rs"
+
+[dependencies]
+privet-core = { path = "../privet-core" }
+privet-ipc = { path = "../privet-ipc" }
+privet-discovery = { path = "../privet-discovery" }
+privet-security = { path = "../privet-security" }
+privet-storage = { path = "../privet-storage" }
+privet-transfer = { path = "../privet-transfer" }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

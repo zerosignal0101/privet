@@ -1,4 +1,3 @@
-//! known_device_addresses 仓库
 
 use crate::constants::EVICT_FAILS;
 use crate::error::StorageError;
@@ -108,12 +107,8 @@ pub fn inc_fail(
     Ok(())
 }
 
-/// 淘汰：fail_count >= EVICT_FAILS 且陈旧（last_seen_ts < now - EVICT_AGING_SECS）-> 删。
-/// 单次失败不删。EVICT_AGING_SECS 自选（仅陈旧地址才淘汰，防瞬时抖动误删）。
-const EVICT_AGING_SECS: i64 = 86_400 * 30; // 30 天
+const EVICT_AGING_SECS: i64 = 86_400 * 30;
 
-/// 候选选址/单播探测用：某 device 的近邻地址（**无 success_count>0 过滤**，按 last_seen 倒序）。
-/// 含 beacon 刷新的候选；pinning 兜底安全。
 pub fn recent_known(
     conn: &rusqlite::Connection,
     device_fingerprint: &str,
@@ -147,7 +142,6 @@ pub fn recent_known(
     Ok(out)
 }
 
-/// 跨设备列出全部已知地址（每 device 取近邻 n），供启动时单播 Probe。
 pub fn list_known(
     conn: &rusqlite::Connection,
     n: usize,
@@ -244,7 +238,6 @@ mod tests {
             &addr("10.0.0.1", 10),
         )
         .unwrap();
-        // 10 个地址，仅偶数 success_count>0
         for i in 1..=10u8 {
             let s = format!("10.0.0.{i}");
             upsert_address(&conn, "d", &addr(&s, i as i64 * 10)).unwrap();
@@ -253,7 +246,7 @@ mod tests {
             }
         }
         let r = recent_n(&conn, "d", RECENT_N).unwrap();
-        assert_eq!(r.len(), 5); // 5 个偶数 success
+        assert_eq!(r.len(), 5);
         assert_eq!(r[0].addr, "10.0.0.10");
         assert_eq!(r[4].addr, "10.0.0.2");
     }
@@ -274,15 +267,15 @@ mod tests {
             &addr("10.0.0.1", 10),
         )
         .unwrap();
-        upsert_address(&conn, "d", &addr("10.0.0.2", 5)).unwrap(); // 陈旧 + 高失败
-        upsert_address(&conn, "d", &addr("10.0.0.3", 1_000_000 * 30)).unwrap(); // 高失败但新鲜
+        upsert_address(&conn, "d", &addr("10.0.0.2", 5)).unwrap();
+        upsert_address(&conn, "d", &addr("10.0.0.3", 1_000_000 * 30)).unwrap();
         for _ in 0..EVICT_FAILS {
             inc_fail(&conn, "d", "10.0.0.0/24", "10.0.0.2", 5).unwrap();
             inc_fail(&conn, "d", "10.0.0.0/24", "10.0.0.3", 1_000_000 * 30).unwrap();
         }
-        inc_fail(&conn, "d", "10.0.0.0/24", "10.0.0.1", 10).unwrap(); // 单次失败
+        inc_fail(&conn, "d", "10.0.0.0/24", "10.0.0.1", 10).unwrap();
         let removed = evict_failed(&conn, 1_000_000 * 30).unwrap();
-        assert_eq!(removed, 1); // 仅 10.0.0.2（陈旧+高失败）
+        assert_eq!(removed, 1);
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM known_device_addresses WHERE device_fingerprint='d'",
@@ -290,7 +283,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 2); // 剩 10.0.0.1（配对，单次失败）+ 10.0.0.3（高失败但新鲜）
+        assert_eq!(n, 2);
     }
 
     #[test]
@@ -309,11 +302,10 @@ mod tests {
             &addr("10.0.0.1", 10),
         )
         .unwrap();
-        // 仅 beacon 刷新的候选（success_count=0）也应被 recent_known 返回。
         upsert_address(&conn, "d", &addr("10.0.0.9", 99)).unwrap();
         let r = recent_known(&conn, "d", RECENT_N).unwrap();
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].addr, "10.0.0.9"); // last_seen 最新
+        assert_eq!(r[0].addr, "10.0.0.9");
     }
 
     #[test]

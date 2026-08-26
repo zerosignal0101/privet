@@ -1,4 +1,3 @@
-//! sweep 任务：30s 周期；Live -> Stale(180s) -> Lost(300s)。
 
 use privet_discovery::config::DiscoveryConfigPrivet;
 use privet_discovery::engine::{DiscoveryEngine, LocalDeviceInfo};
@@ -26,7 +25,6 @@ async fn sweep_task_promotes_stale_then_lost() {
         DiscoveryConfigPrivet::default(),
         Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed)),
     ));
-    // 造一个 Live peer（构造 beacon 字节 inject）
     let now = 1_000_000;
     let b = eng.make_beacon(now, vec![1, 2, 3, 4]);
     let bytes = privet_discovery::beacon::encode_beacon_tagged(&b).unwrap();
@@ -40,7 +38,6 @@ async fn sweep_task_promotes_stale_then_lost() {
     );
     let h = eng.clone().spawn_sweep_task();
 
-    // +200s: 超 stale(180s) -> Stale
     clock.store(1_000_000 + 200_000, std::sync::atomic::Ordering::Relaxed);
     tokio::time::advance(Duration::from_secs(31)).await;
     tokio::task::yield_now().await;
@@ -51,7 +48,6 @@ async fn sweep_task_promotes_stale_then_lost() {
         "peer must transition to Stale after 200s"
     );
 
-    // +310s: 超 lost(300s) -> Lost
     clock.store(1_000_000 + 310_000, std::sync::atomic::Ordering::Relaxed);
     tokio::time::advance(Duration::from_secs(31)).await;
     tokio::task::yield_now().await;

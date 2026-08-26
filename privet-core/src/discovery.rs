@@ -1,4 +1,3 @@
-//! Discovery 接线：LocalDeviceInfo 拼装 + 引擎启停 + peer 事件 -> EngineEvent（P1）。
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -12,7 +11,6 @@ use privet_discovery::{
 use crate::config::EngineConfig;
 use crate::EngineEvent;
 
-/// 从 Identity + EngineConfig 拼装本地设备信息。
 pub fn build_local_device_info(
     identity: &Identity,
     cfg: &EngineConfig,
@@ -38,7 +36,6 @@ pub fn build_local_device_info(
 
 use privet_crypto::hash::fingerprint_hex;
 
-/// 启动发现引擎（bind UDP + recv 任务）。
 pub async fn start_discovery(
     info: privet_discovery::engine::LocalDeviceInfo,
     dcfg: DiscoveryConfigPrivet,
@@ -48,7 +45,6 @@ pub async fn start_discovery(
     Ok(engine)
 }
 
-/// 把 PeerStoreEvent 映射为 EngineEvent（用 peers device_name 表补 name，用 fp_map 解析 fp_prefix→UUID）。
 pub fn map_peer_event(
     e: PeerStoreEvent,
     names: &HashMap<String, String>,
@@ -56,7 +52,6 @@ pub fn map_peer_event(
 ) -> Option<EngineEvent> {
     match e {
         PeerStoreEvent::Discovered(device_fingerprint) => {
-            // device_fingerprint 仅当 device_fingerprint 命中已信任设备时才设为 UUID，否则留空（前端用 device_fingerprint 作 key）。
             let device_fingerprint = fp_map.get(&device_fingerprint).cloned().unwrap_or_default();
             Some(EngineEvent::DeviceDiscovered {
                 device_fingerprint: device_fingerprint.clone(),
@@ -69,13 +64,10 @@ pub fn map_peer_event(
                 device_fingerprint,
             })
         }
-        // StateChanged 不直接外发（避免 Seen->Resolved->Live 三连发）。
         PeerStoreEvent::StateChanged(_, _) => None,
     }
 }
 
-/// 排空 discovery peer 事件并补 device_name + fp_map（UUID 解析）-> EngineEvent。
-/// 在过滤映射前先发出 richer tracing 日志（含地址信息）。
 pub(crate) fn drain_peer_events_named(
     d: &DiscoveryEngine,
     fp_map: &HashMap<String, String>,
@@ -87,7 +79,6 @@ pub(crate) fn drain_peer_events_named(
         .collect();
     let events = d.drain_events();
 
-    // 发出 richer tracing 日志
     for e in &events {
         match e {
             PeerStoreEvent::Discovered(device_fingerprint) => {
@@ -120,7 +111,6 @@ pub(crate) fn drain_peer_events_named(
         .collect()
 }
 
-/// 构建 device_fingerprint -> device_fingerprint 映射（仅 Trusted 设备；从 peer_spki 派生 fingerprint_hex）。
 pub fn trusted_fp_map(db: &rusqlite::Connection) -> std::collections::HashMap<String, String> {
     let Ok(rows) = privet_storage::trust::list_all(db) else {
         return Default::default();
@@ -131,7 +121,6 @@ pub fn trusted_fp_map(db: &rusqlite::Connection) -> std::collections::HashMap<St
         .collect()
 }
 
-/// beacon 命中已信任设备时 best-effort upsert 其最新候选地址（不 inc_success）。
 pub(crate) fn refresh_trusted_on_beacon(
     d: &DiscoveryEngine,
     db: &rusqlite::Connection,
@@ -155,7 +144,7 @@ pub(crate) fn refresh_trusted_on_beacon(
                 source: "self",
                 last_seen_ts: now_secs,
             };
-            let _ = privet_storage::addresses::upsert_address(db, did, &pa); // best-effort；不 inc_success
+            let _ = privet_storage::addresses::upsert_address(db, did, &pa);
         }
     }
 }
@@ -179,7 +168,6 @@ mod tests {
     fn fp_prefix_map_matches_trusted_spki() {
         let id = Identity::generate().unwrap();
         let fp = privet_crypto::hash::fingerprint_hex(id.spki_der());
-        // 模拟数据库中有该设备。
         let map: std::collections::HashMap<String, String> =
             [(fp.clone(), "dev-x".to_string())].into();
         let matched = map.iter().find(|(f, _)| **f == fp).map(|(_, v)| v.clone());

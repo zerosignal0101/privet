@@ -1,4 +1,3 @@
-//! DiscoveryEngine：编排 store + UDP + mDNS + 生命周期 + 模式。
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +12,6 @@ use crate::config::{DiscoverabilityMode, DiscoveryConfigPrivet};
 use crate::peer::{PeerEvent, PeerRecord, PeerStore, PeerStoreEvent};
 use crate::udp::{handle_incoming_datagram, NonceCache, Outgoing, RateLimiter, UdpBeacon};
 
-/// 本机设备信息（core 用 crypto + transport 端口拼装注入）。
 #[derive(Debug, Clone)]
 pub struct LocalDeviceInfo {
     pub device_name: String,
@@ -31,23 +29,16 @@ pub struct DiscoveryEngine {
     nonce: Arc<Mutex<NonceCache>>,
     rl: Arc<Mutex<RateLimiter>>,
     mode: Mutex<DiscoverabilityMode>,
-    // 时钟缝（默认 SystemTime；测试注入）。
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
-    // 对外 sink（生产 UdpSink，测试 CapturedSink）。
     outgoing: Mutex<Option<Arc<dyn Outgoing>>>,
-    // 取消信号 + 任务句柄（stop 时 join）。
     cancel: watch::Sender<bool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     start_ms: Mutex<u64>,
-    // nonce 生成计数器（与 now_ms 拼 16 字节）。
     nonce_ctr: AtomicU64,
-    // mDNS 句柄（announce + browse；best-effort，None=走纯 UDP）。
     mdns: Mutex<Option<MdnsHandles>>,
-    // 本机接口 IP 列表（mDNS resolved 时用于过滤非本机地址）。
     local_addrs: Mutex<Vec<IpAddr>>,
 }
 
-/// mDNS 句柄（best-effort 创建；任意为 None 则走纯 UDP 发现）。
 pub(crate) struct MdnsHandles {
     pub announcer: Option<crate::mdns::MdnsAnnouncer>,
     pub browser: Option<crate::mdns::MdnsBrowser>,
@@ -99,7 +90,6 @@ impl DiscoveryEngine {
         *self.mode.lock().unwrap()
     }
 
-    /// 注入点（测试用；生产由 recv 任务调）。
     pub fn inject_incoming(
         &self,
         bytes: &[u8],
@@ -121,13 +111,9 @@ impl DiscoveryEngine {
         );
     }
 
-    /// recv 任务（与测试）共用的入站处理：注入 + Probe 响应。
-    /// 锁在 inject_incoming 内取放、未跨 await；reply 经 outgoing sink 发出。
     pub async fn handle_inbound(&self, bytes: &[u8], src: std::net::SocketAddr, now_ms: u64) {
         self.inject_incoming(bytes, src.ip(), None, now_ms);
-        // Probe 响应（受可发现性 + 同子网放大防护门控）。
         if crate::beacon::message_tag(bytes) == Some(2) {
-            // 自回环跳过：本机广播 Probe 被 UDP 回环接收（同一 socket 收到自己发出的包）。
             let ifaces = crate::netinfo::enumerate_interfaces();
             if crate::netinfo::is_local_ip(src.ip(), &ifaces) {
                 return;
@@ -167,7 +153,6 @@ impl DiscoveryEngine {
         *self.mode.lock().unwrap() = mode;
     }
 
-    /// 构造本机 beacon（响应 Probe / 周期广播）。
     pub fn make_beacon(&self, now_ms: u64, nonce: Vec<u8>) -> Beacon {
         Beacon {
             device_name: self.info.device_name.clone(),
@@ -186,9 +171,7 @@ impl DiscoveryEngine {
         self.store.lock().unwrap().drain_events()
     }
 
-    /// 生成 16 字节 nonce（now_ms + 计数器；非密码学，仅用于防重放）。
     fn fresh_nonce(&self) -> Vec<u8> {
-        // 非密码学随机：仅用于防重放（256 条窗口）；真正认证在 SPAKE2 配对。
         let now = self.now_ms().to_le_bytes();
         let ctr = self.nonce_ctr.fetch_add(1, Ordering::Relaxed).to_le_bytes();
         let mut v = Vec::with_capacity(16);
@@ -212,7 +195,6 @@ impl DiscoveryEngine {
             }
         }
     }
-    /// 收到 Probe 后回发自身 beacon 至 prober 的发现端口。
     pub async fn reply_to_probe(&self, src: std::net::SocketAddr) {
         let b = self.make_beacon(self.now_ms(), self.fresh_nonce());
         self.send_beacon_to(
@@ -222,7 +204,6 @@ impl DiscoveryEngine {
         .await;
     }
 
-    /// 仅在当前可发现 且 Probe 源与本机同子网时回发。
     fn should_reply_to_probe(&self, src: IpAddr, now_ms: u64) -> bool {
         self.should_announce(now_ms)
             && crate::netinfo::probe_src_is_local_subnet(
@@ -231,11 +212,9 @@ impl DiscoveryEngine {
             )
     }
 
-    /// 测试缝：注入 start_ms（生产由 start() 设）。
     pub fn set_start_ms_for_test(&self, ms: u64) {
         *self.start_ms.lock().unwrap() = ms;
     }
-    /// Window 模式下的过期截止时间戳（ms）。
     pub fn window_deadline(&self) -> Option<u64> {
         if self.mode() != DiscoverabilityMode::Window {
             return None;
@@ -243,7 +222,6 @@ impl DiscoveryEngine {
         let start = *self.start_ms.lock().unwrap();
         Some(start + self.config.window_secs.saturating_mul(1000))
     }
-    /// Always=始终；Window=窗口内；TrustedOnly=不广播。
     pub fn should_announce(&self, now_ms: u64) -> bool {
         match self.mode() {
             DiscoverabilityMode::Always => true,
@@ -251,7 +229,6 @@ impl DiscoveryEngine {
             DiscoverabilityMode::TrustedOnly => false,
         }
     }
-    /// 各非环回接口的定向广播地址 + 255.255.255.255 兜底。
     pub fn broadcast_targets(&self) -> Vec<std::net::SocketAddr> {
         let port = self.config.udp_port;
         let mut out: Vec<std::net::SocketAddr> = Vec::new();
@@ -269,7 +246,6 @@ impl DiscoveryEngine {
         }
         out
     }
-    /// mDNS 用的 BeaconView（nonce/ts 为默认值，announce 时为具体值）。
     pub(crate) fn local_beacon_view(&self) -> crate::beacon::BeaconView {
         crate::beacon::BeaconView {
             device_name: self.info.device_name.clone(),
@@ -284,7 +260,6 @@ impl DiscoveryEngine {
         }
     }
 
-    /// 周期广播：立即一帧 + 每 BEACON_INTERVAL。
     pub fn spawn_beacon_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let mut cancel_rx = self.cancel.subscribe();
         let this = self.clone();
@@ -305,7 +280,6 @@ impl DiscoveryEngine {
             }
         })
     }
-    /// 周期扫描：sweep peer store 然后等待 SWEEP_INTERVAL。
     pub fn spawn_sweep_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let mut cancel_rx = self.cancel.subscribe();
         let this = self.clone();
@@ -320,7 +294,6 @@ impl DiscoveryEngine {
             }
         })
     }
-    /// 周期主动 Probe：立即一帧 + 每 probe_interval（受 active_scan + should_announce 门控）。
     pub fn spawn_probe_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let mut cancel_rx = self.cancel.subscribe();
         let this = self.clone();
@@ -349,8 +322,6 @@ impl DiscoveryEngine {
         let _ = self.cancel.send(true);
     }
 
-    /// 将 mDNS 解析到的 (BeaconView, addrs) 注入 peer store。
-    /// 过滤掉本机接口 IP（mDNS 解析可能返回对方机器上的本机地址）。
     pub fn on_mdns_resolved(
         &self,
         view: crate::beacon::BeaconView,
@@ -366,13 +337,11 @@ impl DiscoveryEngine {
             store.handle_beacon(&view, addr, None, now_ms);
         }
     }
-    /// mDNS 接线（best-effort：失败则退化为纯 UDP 发现）。
     pub fn spawn_mdns_task(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         let local_addrs: Vec<IpAddr> = crate::netinfo::enumerate_interfaces()
             .into_iter()
             .map(|(a, _, _, _)| a)
             .collect();
-        // 存本机 IP 列表供 on_mdns_resolved 过滤
         *self.local_addrs.lock().unwrap() = local_addrs.clone();
         let announcer =
             crate::mdns::MdnsAnnouncer::new(&self.local_beacon_view(), local_addrs).ok();
@@ -381,7 +350,7 @@ impl DiscoveryEngine {
         if announcer.is_none() && browser.is_none() {
             tracing::warn!("mdns init failed (no multicast?); falling back to udp beacon");
             return None;
-        } // 无 mDNS 可用
+        }
         *self.mdns.lock().unwrap() = Some(MdnsHandles { announcer, browser });
         let mut cancel_rx = self.cancel.subscribe();
         let this = self.clone();
@@ -400,7 +369,6 @@ impl DiscoveryEngine {
         Some(h)
     }
 
-    /// 启动引擎（bind UDP + recv 任务 + 记录 start_ms；beacon/sweep/mdns 由后续任务加入）。
     pub async fn start(self: &Arc<Self>) -> crate::Result<()> {
         let udp = UdpBeacon::bind_listening(self.config.udp_port).await?;
         self.set_outgoing(udp.sink.clone());
@@ -423,25 +391,20 @@ impl DiscoveryEngine {
             }
         });
         self.tasks.lock().unwrap().push(handle);
-        // beacon 任务
         let bh = self.clone().spawn_beacon_task();
         self.tasks.lock().unwrap().push(bh);
-        // sweep 任务
         let sh = self.clone().spawn_sweep_task();
         self.tasks.lock().unwrap().push(sh);
-        // 周期主动 Probe（保证丢包/NAT 环境持续可达）。
         let ph = self.clone().spawn_probe_task();
         self.tasks.lock().unwrap().push(ph);
         // mDNS（best-effort）
         if let Some(mh) = self.clone().spawn_mdns_task() {
             self.tasks.lock().unwrap().push(mh);
         }
-        // 启动时主动扫描（发 Probe）
         self.clone().send_probe_to_all().await;
         Ok(())
     }
 
-    /// 向所有定向广播目标发 Probe（主动扫描）。
     async fn send_probe_to_all(&self) {
         if !self.config.active_scan {
             return;
@@ -460,7 +423,6 @@ impl DiscoveryEngine {
             }
         }
     }
-    /// step2: 向单个已知地址单播 Probe（受限网络/已知设备探测）。
     pub async fn send_probe_to(&self, dst: std::net::SocketAddr) {
         let p = Probe {
             nonce: self.fresh_nonce(),
@@ -474,15 +436,12 @@ impl DiscoveryEngine {
             let _ = o.send_to(&bytes, dst).await;
         }
     }
-    /// 主动扫描：向所有定向广播目标发 Probe。
     pub async fn refresh(&self) -> crate::Result<()> {
         self.send_probe_to_all().await;
         Ok(())
     }
 
-    /// 停止引擎（广播 Goodbye + 关 socket/mdns）。
     pub async fn stop(&self) -> crate::Result<()> {
-        // 优雅关停：广播 Goodbye -> 取消 -> join -> 关 mDNS。
         let g = Goodbye {
             device_fingerprint: self.info.device_fingerprint.clone(),
         };

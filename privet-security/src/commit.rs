@@ -1,4 +1,3 @@
-//! 提交时序：I 侧 Pending proof + 重发 + ack 超时 Failed；R 侧幂等去重。
 use std::time::Duration;
 
 use privet_protocol::control_frame::Payload;
@@ -10,7 +9,6 @@ use crate::session::PairingOutcome;
 use crate::trust::{PeerTrust, TrustState, TrustStore};
 use crate::PairingError;
 
-/// I 侧 Pending proof（持久化，未提交；崩溃恢复可重发）。
 #[derive(Debug, Clone)]
 pub struct PendingProof {
     pub transcript_hash: [u8; 32],
@@ -18,11 +16,9 @@ pub struct PendingProof {
     pub peer_device_fingerprint: String,
     pub peer_device_name: String,
     pub peer_spki: Vec<u8>,
-    /// I 自己的 SPKI（重发 PairingResult.identity_pubkey 须为 I 的 SPKI）。
     pub local_spki: Vec<u8>,
 }
 
-/// 可注入 proof 持久化（core 用 SQLite；测试 InMemory）。
 pub trait ProofStore: Send + Sync {
     fn store_pending(&self, proof: PendingProof) -> Result<(), PairingError>;
     fn load_pending(&self) -> Result<Option<PendingProof>, PairingError>;
@@ -54,7 +50,6 @@ impl ProofStore for InMemoryProofStore {
     }
 }
 
-/// R 侧幂等判定：已信任同 SPKI 则返回 false（重 ack 不重提交）。
 pub fn should_commit(
     trust: &dyn TrustStore,
     peer_device_fingerprint: &str,
@@ -66,7 +61,6 @@ pub fn should_commit(
     }
 }
 
-/// 构造重发用的 PairingResult ControlFrame。
 fn resend_frame(local_spki: &[u8], transcript_sig_i: &[u8]) -> ControlFrame {
     ControlFrame {
         payload: Some(Payload::PairingResult(PairingResult {
@@ -78,8 +72,6 @@ fn resend_frame(local_spki: &[u8], transcript_sig_i: &[u8]) -> ControlFrame {
     }
 }
 
-/// I 侧等 ack：重发 `resend` 最多 PAIRING_MAX_RETRIES 次，每次 `ack_timeout` 超时；
-/// 收到匹配 ack -> 提交 trust(R) + 清 proof -> Paired；耗尽 -> Failed{AckTimeout} + 清 proof（不提交）。
 pub async fn wait_for_ack(
     channel: &mut dyn PairingChannel,
     clock: &dyn PairingClock,
@@ -88,10 +80,31 @@ pub async fn wait_for_ack(
     store: &dyn ProofStore,
     ack_timeout: Duration,
 ) -> Result<PairingOutcome, PairingError> {
-    // I 进 Pending: 持久化 proof (转录+双签+R SPKI), 不提交 trust
+    wait_for_ack_with_retries(
+        channel,
+        clock,
+        trust,
+        proof,
+        store,
+        ack_timeout,
+        PAIRING_MAX_RETRIES,
+    )
+    .await
+}
+
+/// Wait for the responder acknowledgement using the configured retry budget.
+pub async fn wait_for_ack_with_retries(
+    channel: &mut dyn PairingChannel,
+    clock: &dyn PairingClock,
+    trust: &dyn TrustStore,
+    proof: &PendingProof,
+    store: &dyn ProofStore,
+    ack_timeout: Duration,
+    max_retries: u32,
+) -> Result<PairingOutcome, PairingError> {
     let _ = store.store_pending(proof.clone());
     let resend = resend_frame(&proof.local_spki, &proof.transcript_sig_i);
-    for attempt in 0..=PAIRING_MAX_RETRIES {
+    for attempt in 0..=max_retries {
         if attempt > 0 {
             let _ = channel.send(resend.clone()).await;
         }
@@ -109,7 +122,6 @@ pub async fn wait_for_ack(
                         first_paired_ts: now,
                         last_seen_ts: now,
                     })?;
-                    // 提交后清 proof
                     let _ = store.clear_pending();
                     return Ok(PairingOutcome::Paired {
                         peer_device_fingerprint: proof.peer_device_fingerprint.clone(),
@@ -134,7 +146,6 @@ pub async fn wait_for_ack(
     })
 }
 
-/// 崩溃恢复：从持久化 proof 重发 Result + 等 ack（重连重发）。
 pub async fn resume_pending(
     channel: &mut dyn PairingChannel,
     clock: &dyn PairingClock,

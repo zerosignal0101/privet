@@ -1,4 +1,3 @@
-//! 配对适配器：PairingChannel over Stream + SystemPairingClock。
 
 use async_trait::async_trait;
 use privet_protocol::ControlFrame;
@@ -8,7 +7,6 @@ use privet_security::PairingError;
 use privet_transport::frame_io::{recv_control, send_control};
 use privet_transport::Stream;
 
-/// 控制流包装为 PairingChannel（send/recv ControlFrame；TransportError -> PairingError）。
 pub struct StreamPairingChannel {
     inner: Box<dyn Stream>,
 }
@@ -17,7 +15,6 @@ impl StreamPairingChannel {
     pub fn new(inner: Box<dyn Stream>) -> Self {
         Self { inner }
     }
-    /// 取回底层流（配对完成后移交传送阶段复用）。
     pub fn into_inner(self) -> Box<dyn Stream> {
         self.inner
     }
@@ -37,7 +34,6 @@ impl PairingChannel for StreamPairingChannel {
     }
 }
 
-/// 系统时钟实现 PairingClock（now_ms 毫秒）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemPairingClock;
 impl Now for SystemPairingClock {
@@ -48,19 +44,16 @@ impl Now for SystemPairingClock {
             .unwrap_or(0)
     }
 }
-// PairingClock 有 blanket impl `<T: Now> PairingClock for T`，无需显式 impl。
 
-// ===== 配对编排（Task B10）=====
 use privet_crypto::identity::Identity;
 use privet_crypto::pake::Spake2Backend;
 use privet_security::channel::PairingClock;
 use privet_security::commit::{wait_for_ack, PendingProof, ProofStore};
 use privet_security::constants::PAIRING_ACK_TIMEOUT_SECS;
-use privet_security::session::{run_initiator, run_responder, PairingOutcome, SessionInputs};
+use privet_security::session::{run_responder, PairingOutcome, SessionInputs};
 use privet_security::trust::TrustStore;
 use std::time::Duration;
 
-/// I 侧编排：跑 run_initiator，进 Pending（持久化 proof），再 wait_for_ack。
 pub async fn run_pairing_initiator(
     local: &Identity,
     inputs: &SessionInputs,
@@ -70,11 +63,43 @@ pub async fn run_pairing_initiator(
     proof_store: &dyn ProofStore,
     pake: &Spake2Backend,
 ) -> crate::Result<PairingOutcome> {
-    // run_initiator 内部持久化 proof + wait_for_ack 自动清 proof
-    Ok(run_initiator(local, inputs, channel, clock, trust, pake, proof_store).await?)
+    run_pairing_initiator_with_config(
+        local,
+        inputs,
+        channel,
+        clock,
+        trust,
+        proof_store,
+        pake,
+        &privet_security::PairingConfig::default(),
+    )
+    .await
 }
 
-/// R 侧编排（幂等去重）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_pairing_initiator_with_config(
+    local: &Identity,
+    inputs: &SessionInputs,
+    channel: &mut dyn privet_security::channel::PairingChannel,
+    clock: &dyn PairingClock,
+    trust: &dyn TrustStore,
+    proof_store: &dyn ProofStore,
+    pake: &Spake2Backend,
+    config: &privet_security::PairingConfig,
+) -> crate::Result<PairingOutcome> {
+    Ok(privet_security::session::run_initiator_with_config(
+        local,
+        inputs,
+        channel,
+        clock,
+        trust,
+        pake,
+        proof_store,
+        config,
+    )
+    .await?)
+}
+
 pub async fn run_pairing_responder(
     local: &Identity,
     inputs: &SessionInputs,
@@ -86,7 +111,6 @@ pub async fn run_pairing_responder(
     Ok(run_responder(local, inputs, channel, clock, trust, pake).await?)
 }
 
-/// 崩溃恢复：从持久化 proof 重发 + 等 ack。
 pub async fn resume_pending_pairing(
     channel: &mut dyn privet_security::channel::PairingChannel,
     clock: &dyn PairingClock,

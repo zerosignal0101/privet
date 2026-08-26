@@ -990,6 +990,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "privet-daemon"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hex",
+ "privet-core",
+ "privet-discovery",
+ "privet-ipc",
+ "privet-security",
+ "privet-storage",
+ "privet-transfer",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "privet-discovery"
 version = "0.1.0"
 dependencies = [
@@ -1005,6 +1026,19 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "privet-ipc"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1029,6 +1063,8 @@ dependencies = [
  "privet-crypto",
  "privet-protocol",
  "proptest",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
