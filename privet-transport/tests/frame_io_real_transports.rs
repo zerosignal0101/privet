@@ -31,12 +31,12 @@ fn data_frame(length: usize) -> DataFrame {
 }
 
 async fn assert_frame_roundtrip(client: Box<dyn Connection>, server: Box<dyn Connection>) {
-    let mut client_control = client.open_control().await.unwrap();
-    let mut server_control = server.accept_control().await.unwrap();
     let expected_control = control_frame();
+    let mut client_control = client.open_control().await.unwrap();
     privet_transport::send_control(client_control.as_mut(), &expected_control)
         .await
         .unwrap();
+    let mut server_control = server.accept_control().await.unwrap();
     let received_control = privet_transport::recv_control(server_control.as_mut())
         .await
         .unwrap();

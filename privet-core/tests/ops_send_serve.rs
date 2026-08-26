@@ -15,6 +15,12 @@ fn engine(dir: &TempDir, name: &str) -> Engine {
         ..Default::default()
     };
     cfg.transport.mode = TransportMode::Quic;
+    // Tests in this binary run concurrently and each engine binds sockets; use
+    // ephemeral ports and disable LAN discovery so the fixed defaults (47808/47809)
+    // don't collide between tests.
+    cfg.discovery.udp_port = 0;
+    cfg.transport.quic_port = 0;
+    cfg.transport.tcp_port = 0;
     std::fs::create_dir_all(cfg.save_dir.as_path()).ok();
     Engine::new(cfg)
 }

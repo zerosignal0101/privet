@@ -395,7 +395,7 @@ impl Engine {
                 row.status
             )));
         }
-        let blob = row.send_intent.ok_or_else(|| {
+        let blob = row.send_intent.filter(|b| !b.trim().is_empty()).ok_or_else(|| {
             crate::CoreError::Internal(format!(
                 "transfer {transfer_id} has no send intent (not resumable)"
             ))

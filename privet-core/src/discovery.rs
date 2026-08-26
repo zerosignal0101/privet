@@ -52,16 +52,22 @@ pub fn map_peer_event(
 ) -> Option<EngineEvent> {
     match e {
         PeerStoreEvent::Discovered(device_fingerprint) => {
-            let device_fingerprint = fp_map.get(&device_fingerprint).cloned().unwrap_or_default();
+            let resolved = fp_map
+                .get(&device_fingerprint)
+                .cloned()
+                .unwrap_or_else(|| device_fingerprint.clone());
             Some(EngineEvent::DeviceDiscovered {
-                device_fingerprint: device_fingerprint.clone(),
+                device_fingerprint: resolved,
                 device_name: names.get(&device_fingerprint).cloned().unwrap_or_default(),
             })
         }
         PeerStoreEvent::Lost(device_fingerprint) => {
-            let device_fingerprint = fp_map.get(&device_fingerprint).cloned().unwrap_or_default();
+            let resolved = fp_map
+                .get(&device_fingerprint)
+                .cloned()
+                .unwrap_or_else(|| device_fingerprint.clone());
             Some(EngineEvent::DeviceLost {
-                device_fingerprint,
+                device_fingerprint: resolved,
             })
         }
         PeerStoreEvent::StateChanged(_, _) => None,

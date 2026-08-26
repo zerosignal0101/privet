@@ -38,7 +38,7 @@ fn insert_partial_send_row(
             status: privet_storage::history::TransferStatus::Partial,
             started_ts: 1,
             save_dir: None,
-            send_intent: "{}".into()
+            send_intent: "".into()
         },
     )
     .unwrap();
