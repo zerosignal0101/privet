@@ -10,3 +10,26 @@ privet-protocol = { path = "../privet-protocol" }
 privet-crypto = { path = "../privet-crypto" }
 privet-storage = { path = "../privet-storage" }
 privet-transport = { path = "../privet-transport" }
+
+# protocol
+prost.workspace = true
+
+# transport
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# utils
+bytes = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+filetime = { workspace = true }
+
+# trace
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

@@ -80,7 +80,7 @@ message Segment {
 message FileEntry {
     string file_id = 1;
     string relative_path = 2;
-    string size = 3;
+    uint64 size = 3;
     uint64 mtime_ms = 4;
     string hash_type = 5;
     string hash_value = 6;
