@@ -162,6 +162,17 @@ impl DaemonBackend {
                 let rows = self.engine.history(peer.as_deref(), u64::from(limit.clamp(1, 1000)))?;
                 Ok(ResponsePayload::History(rows.into_iter().map(history_dto).collect()))
             }
+            Request::GetHistoryDetail { transfer_id } => {
+                let row = self
+                    .engine
+                    .history_detail(&transfer_id)?
+                    .ok_or_else(|| BackendError::invalid("transfer not found"))?;
+                Ok(ResponsePayload::HistoryDetail(history_detail_dto(row)))
+            }
+            Request::DeleteHistory { transfer_id } => {
+                self.engine.delete_history(&transfer_id)?;
+                Ok(ResponsePayload::Ack)
+            }
             Request::GetRuntimeConfig => Ok(ResponsePayload::RuntimeConfig(self.runtime_config())),
             Request::SetRuntimeConfig(patch) => {
                 if let Some(value) = patch.accept_all_trusted { self.engine.runtime().set_accept_all_trusted(value); }
@@ -298,5 +309,121 @@ fn history_dto(row: privet_storage::history::HistoryRow) -> HistoryEntryDto {
         status: row.status,
         started_ts: row.started_ts,
         finished_ts: row.finished_ts,
+    }
+}
+
+fn history_detail_dto(row: privet_storage::history::HistoryDetailRow) -> HistoryDetailDto {
+    let files = row
+        .files
+        .iter()
+        .map(|f| {
+            let absolute_path = if row.direction == "send" {
+                f.source_path.clone()
+            } else {
+                let mut path = std::path::PathBuf::new();
+                if let Some(dir) = &row.save_dir {
+                    path.push(dir);
+                }
+                if let Some(root) = &row.root_name {
+                    path.push(root);
+                }
+                path.push(&f.relative_path);
+                Some(path.to_string_lossy().into_owned())
+            };
+            HistoryFileDto {
+                relative_path: f.relative_path.clone(),
+                absolute_path,
+                size: f.size,
+                status: f.status.clone(),
+            }
+        })
+        .collect();
+    HistoryDetailDto {
+        transfer_id: row.transfer_id,
+        direction: row.direction,
+        peer_device_fingerprint: row.peer_device_fingerprint,
+        peer_name: row.peer_name,
+        root_name: row.root_name,
+        status: row.status,
+        started_ts: row.started_ts,
+        finished_ts: row.finished_ts,
+        files,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use privet_storage::history::{HistoryDetailRow, HistoryFileRow};
+
+    #[test]
+    fn history_detail_dto_maps_send_source_path() {
+        let row = HistoryDetailRow {
+            transfer_id: "t1".into(),
+            direction: "send".into(),
+            peer_device_fingerprint: None,
+            peer_name: Some("peer".into()),
+            root_name: Some("docs".into()),
+            status: "completed".into(),
+            started_ts: 1,
+            finished_ts: Some(2),
+            save_dir: None,
+            files: vec![HistoryFileRow {
+                relative_path: "a.txt".into(),
+                source_path: Some("/home/u/docs/a.txt".into()),
+                size: 10,
+                status: "completed".into(),
+            }],
+        };
+        let dto = history_detail_dto(row);
+        assert_eq!(dto.files[0].absolute_path.as_deref(), Some("/home/u/docs/a.txt"));
+    }
+
+    #[test]
+    fn history_detail_dto_maps_receive_landed_path() {
+        let row = HistoryDetailRow {
+            transfer_id: "t2".into(),
+            direction: "receive".into(),
+            peer_device_fingerprint: None,
+            peer_name: None,
+            root_name: Some("docs".into()),
+            status: "completed".into(),
+            started_ts: 1,
+            finished_ts: Some(2),
+            save_dir: Some("/tmp/s".into()),
+            files: vec![HistoryFileRow {
+                relative_path: "a.txt".into(),
+                source_path: None,
+                size: 10,
+                status: "completed".into(),
+            }],
+        };
+        let dto = history_detail_dto(row);
+        let expected = std::path::PathBuf::from("/tmp/s").join("docs").join("a.txt");
+        assert_eq!(dto.files[0].absolute_path.as_deref(), Some(expected.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn history_detail_dto_receive_without_root_uses_save_dir_only() {
+        let row = HistoryDetailRow {
+            transfer_id: "t3".into(),
+            direction: "receive".into(),
+            peer_device_fingerprint: None,
+            peer_name: None,
+            root_name: None,
+            status: "completed".into(),
+            started_ts: 1,
+            finished_ts: None,
+            save_dir: Some("/tmp/s".into()),
+            files: vec![HistoryFileRow {
+                relative_path: "a.txt".into(),
+                source_path: None,
+                size: 10,
+                status: "completed".into(),
+            }],
+        };
+        let dto = history_detail_dto(row);
+        let expected = std::path::PathBuf::from("/tmp/s").join("a.txt");
+        assert_eq!(dto.files[0].absolute_path.as_deref(), Some(expected.to_string_lossy().as_ref()));
     }
 }
