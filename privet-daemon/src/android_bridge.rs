@@ -30,10 +30,14 @@ pub extern "system" fn Java_app_privet_privet_1app_PrivetDaemonNative_privetdRun
         .get_string(&ipc_path)
         .ok()
         .map(|s| PathBuf::from(s.to_string_lossy().into_owned()));
-    run::reset_shutdown();
     match run::run_blocking(config, ipc) {
         Ok(()) => 0,
         Err(error) => {
+            // Surface the error to the Kotlin thread's catch (it logs under the
+            // `PrivetDaemon` tag): an app's native stderr goes to /dev/null and
+            // the embedded path has no tracing subscriber, so both eprintln and
+            // tracing::error! would be invisible in logcat.
+            let _ = env.throw_new("java/lang/RuntimeException", &error);
             tracing::error!(%error, "embedded privetd stopped with an error");
             1
         }
