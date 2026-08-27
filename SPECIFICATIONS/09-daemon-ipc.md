@@ -58,6 +58,8 @@ Unsupported protocol versions return `incompatible_protocol`. Adding optional fi
 | `accept_transfer` | transfer ID, accept boolean | ack |
 | `cancel_transfer` / `pause_transfer` / `continue_transfer` | transfer ID | ack |
 | `list_history` | optional peer, limit | history list |
+| `get_history_detail` | transfer ID | history detail with per-file absolute paths |
+| `delete_history` | transfer ID | ack |
 | `get_runtime_config` / `set_runtime_config` | none / partial patch | runtime configuration |
 | `subscribe_events` | optional sequence cursor | replay window |
 | `shutdown` | none | ack flushed before shutdown |
@@ -68,12 +70,13 @@ History limits are clamped to 1–1000. Transfer-starting requests return an ID 
 
 ## 6. Response data
 
-Implemented response variants are `pong`, `ack`, `status`, `identity`, `peers`, `trusted`, `pairing_code`, `pairing_result`, `transfer_queued`, `transfer`, `history`, `runtime_config`, and `event_replay`.
+Implemented response variants are `pong`, `ack`, `status`, `identity`, `peers`, `trusted`, `pairing_code`, `pairing_result`, `transfer_queued`, `transfer`, `history`, `history_detail`, `runtime_config`, and `event_replay`.
 
 - Status includes versions, daemon session UUID, fingerprint, bound QUIC/TCP addresses, and active IDs.
 - A candidate includes IP, distinct QUIC/TCP ports, and last-seen milliseconds.
 - Trust includes fingerprint, name/state, SPKI hex, paired/seen/revoked timestamps, and reason.
 - History includes ID, direction, optional peer/name/root, totals, status, and timestamps.
+- History detail (`get_history_detail`) adds per-file `relative_path`, `absolute_path`, `size`, and `status`. `absolute_path` is the send-side source path or the receive-side `save_dir/root/relative` landed path, and is `null` for send records that predate schema v2.
 - Replay includes events, optional oldest retained sequence, and latest sequence.
 
 `transfer` exists in the enum but current handlers primarily return `transfer_queued` plus history/events. Clients must not assume it is produced unless a method documents that result.

@@ -18,7 +18,9 @@ The daemon is the sole intended writer. Database initialization enables:
 | `foreign_keys` | `ON` |
 | `temp_store` | `MEMORY` |
 
-Migrations run transactionally and are tracked by `schema_version`. The current schema version is 1. A database newer than the supported version must be rejected rather than modified speculatively.
+Migrations run transactionally and are tracked by `schema_version`. The current schema version is 2. A database newer than the supported version must be rejected rather than modified speculatively.
+
+Migration v2 (`add-transfer-files-source-path`) adds the nullable `transfer_files.source_path` column for send-side history reconstruction.
 
 ## 3. Schema version 1
 
@@ -40,7 +42,7 @@ Stores transfer ID, direction, peer reference, status, byte/file totals, timesta
 
 ### 3.4 `transfer_files`
 
-Stores the per-file ID, relative path, size, optional hash type/value, and terminal file status under a transfer. Rows cascade when their owning transfer is deleted.
+Stores the per-file ID, relative path, size, optional hash type/value, terminal file status, and (since migration v2) the optional `source_path` under a transfer. Rows cascade when their owning transfer is deleted. `source_path` is populated at send completion from the prepared file's absolute path so history detail can reconstruct the source location; it is `NULL` for pre-v2 records and for receives.
 
 ## 4. Trust transactions
 
@@ -60,6 +62,8 @@ For sending:
 6. create a new ID for resend.
 
 For receiving, history records the offered peer, selected destinations, progress, and verified outcome. Listing is bounded by IPC to 1–1000 records and can be filtered by peer.
+
+`get_history_detail` surfaces one transfer's summary plus its per-file rows (`relative_path`, `source_path`, `size`, `status`). `delete_history_entry` removes a single transfer; its `transfer_files` rows cascade via the foreign key.
 
 History timestamps currently originate from multiple code paths with inconsistent units. Until a schema migration normalizes them, clients must not interpret every numeric timestamp as the same wall-clock unit.
 
