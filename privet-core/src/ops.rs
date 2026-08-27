@@ -31,6 +31,19 @@ impl Engine {
         Ok(history::list_history(&db, peer, limit as i64)?)
     }
 
+    pub fn history_detail(
+        &self,
+        transfer_id: &str,
+    ) -> crate::Result<Option<history::HistoryDetailRow>> {
+        let db = self.db_conn()?;
+        Ok(history::get_history_detail(&db, transfer_id)?)
+    }
+
+    pub fn delete_history(&self, transfer_id: &str) -> crate::Result<()> {
+        let db = self.db_conn()?;
+        Ok(history::delete_history_entry(&db, transfer_id)?)
+    }
+
     pub fn revoke_peer(&self, device_fingerprint: &str, reason: &str) -> crate::Result<()> {
         let now_ms = SystemPairingClock.now_ms();
         self.trust().revoke(device_fingerprint, reason, now_ms)?;
@@ -546,6 +559,9 @@ impl Engine {
                 hash_type: "blake3".into(),
                 hash_value: Some(&f.file_hash),
                 status: "completed",
+                // Borrow the path directly: to_string_lossy() would return a
+                // temporary Cow whose reference cannot outlive the closure.
+                source_path: f.abs_path.to_str(),
             })
             .collect();
         {

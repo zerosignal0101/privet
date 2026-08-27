@@ -60,3 +60,64 @@ fn history_empty_by_default() {
     let rows = e.history(None, 100).unwrap();
     assert!(rows.is_empty());
 }
+
+fn seed_completed_send(e: &Engine) {
+    let conn = e.db_conn().unwrap();
+    privet_storage::history::insert_history(
+        &conn,
+        &privet_storage::history::NewTransfer {
+            transfer_id: "t-send",
+            direction: privet_storage::history::TransferDirection::Send,
+            peer_device_fingerprint: None,
+            peer_name: Some("peer"),
+            root_name: Some("docs"),
+            file_count: 1,
+            total_bytes: 10,
+            status: privet_storage::history::TransferStatus::Completed,
+            started_ts: 1,
+            save_dir: None,
+            send_intent: "{\"paths\":[\"/home/u/docs\"],\"chunk_size\":1048576,\"segment_max_chunks\":1024}",
+        },
+    )
+    .unwrap();
+    privet_storage::history::complete_history(
+        &conn,
+        "t-send",
+        &[privet_storage::history::FileRow {
+            file_id: "f1",
+            relative_path: "a.txt",
+            size: 10,
+            hash_type: "blake3".into(),
+            hash_value: Some("h"),
+            status: "completed",
+            source_path: Some("/home/u/docs/a.txt"),
+        }],
+        2,
+    )
+    .unwrap();
+}
+
+#[test]
+fn history_detail_returns_none_for_unknown_transfer() {
+    let (e, _d) = engine();
+    assert!(e.history_detail("missing").unwrap().is_none());
+}
+
+#[test]
+fn history_detail_returns_seeded_files_and_source_path() {
+    let (e, _d) = engine();
+    seed_completed_send(&e);
+    let detail = e.history_detail("t-send").unwrap().unwrap();
+    assert_eq!(detail.direction, "send");
+    assert_eq!(detail.files.len(), 1);
+    assert_eq!(detail.files[0].relative_path, "a.txt");
+    assert_eq!(detail.files[0].source_path.as_deref(), Some("/home/u/docs/a.txt"));
+}
+
+#[test]
+fn delete_history_removes_the_entry() {
+    let (e, _d) = engine();
+    seed_completed_send(&e);
+    e.delete_history("t-send").unwrap();
+    assert!(e.history_detail("t-send").unwrap().is_none());
+}
