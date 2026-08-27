@@ -1,5 +1,6 @@
 
 use crate::error::StorageError;
+use rusqlite::OptionalExtension;
 
 #[derive(Copy, Clone)]
 pub enum TransferDirection {
@@ -296,6 +297,95 @@ pub fn list_history(
     Ok(out)
 }
 
+pub struct HistoryFileRow {
+    pub relative_path: String,
+    pub source_path: Option<String>,
+    pub size: u64,
+    pub status: String,
+}
+
+pub struct HistoryDetailRow {
+    pub transfer_id: String,
+    pub direction: String,
+    pub peer_device_fingerprint: Option<String>,
+    pub peer_name: Option<String>,
+    pub root_name: Option<String>,
+    pub status: String,
+    pub started_ts: i64,
+    pub finished_ts: Option<i64>,
+    pub save_dir: Option<String>,
+    pub files: Vec<HistoryFileRow>,
+}
+
+pub fn get_history_detail(
+    conn: &rusqlite::Connection,
+    transfer_id: &str,
+) -> Result<Option<HistoryDetailRow>, StorageError> {
+    let summary = conn
+        .query_row(
+            "SELECT transfer_id, direction, peer_device_fingerprint, peer_name, root_name, status,
+                    started_ts, finished_ts, save_dir
+             FROM transfer_history WHERE transfer_id=?1",
+            rusqlite::params![transfer_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        transfer_id,
+        direction,
+        peer_device_fingerprint,
+        peer_name,
+        root_name,
+        status,
+        started_ts,
+        finished_ts,
+        save_dir,
+    )) = summary
+    else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT relative_path, source_path, size, status FROM transfer_files
+         WHERE transfer_id=?1 ORDER BY relative_path, file_id",
+    )?;
+    let files = stmt
+        .query_map(rusqlite::params![transfer_id], |r| {
+            Ok(HistoryFileRow {
+                relative_path: r.get(0)?,
+                source_path: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                status: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(Some(HistoryDetailRow {
+        transfer_id,
+        direction,
+        peer_device_fingerprint,
+        peer_name,
+        root_name,
+        status,
+        started_ts,
+        finished_ts,
+        save_dir,
+        files,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +660,54 @@ mod tests {
         assert_eq!((h, f), (0, 0));
         // Deleting a missing id is a no-op, not an error.
         assert!(delete_history_entry(&conn, "does-not-exist").is_ok());
+    }
+
+    #[test]
+    fn get_history_detail_returns_summary_and_files() {
+        let conn = db();
+        // seed a completed receive with save_dir and two files
+        let mut t = new_xfer("t1", None);
+        t.save_dir = Some("/tmp/s");
+        t.root_name = Some("docs");
+        insert_history(&conn, &t).unwrap();
+        complete_history(
+            &conn,
+            "t1",
+            &[
+                FileRow {
+                    file_id: "f1",
+                    relative_path: "a.txt",
+                    size: 10,
+                    hash_type: "blake3".into(),
+                    hash_value: Some("h1"),
+                    status: "completed",
+                    source_path: None,
+                },
+                FileRow {
+                    file_id: "f2",
+                    relative_path: "sub/b.txt",
+                    size: 20,
+                    hash_type: "blake3".into(),
+                    hash_value: Some("h2"),
+                    status: "completed",
+                    source_path: None,
+                },
+            ],
+            999,
+        )
+        .unwrap();
+
+        let row = get_history_detail(&conn, "t1").unwrap().unwrap();
+        assert_eq!(row.transfer_id, "t1");
+        assert_eq!(row.direction, "receive");
+        assert_eq!(row.save_dir.as_deref(), Some("/tmp/s"));
+        assert_eq!(row.root_name.as_deref(), Some("docs"));
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.files.len(), 2);
+        assert_eq!(row.files[0].relative_path, "a.txt");
+        assert_eq!(row.files[0].size, 10);
+        assert_eq!(row.files[1].relative_path, "sub/b.txt");
+
+        assert!(get_history_detail(&conn, "missing").unwrap().is_none());
     }
 }
