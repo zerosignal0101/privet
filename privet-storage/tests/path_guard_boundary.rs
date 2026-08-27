@@ -72,6 +72,7 @@ fn complete_history_rejects_bad_relative_path() {
             hash_type: "blake3".into(),
             hash_value: None,
             status: "completed",
+            source_path: None,
         }],
         999,
     )

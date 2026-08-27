@@ -54,6 +54,7 @@ pub struct FileRow<'a> {
     pub hash_type: Option<&'a str>,
     pub hash_value: Option<&'a str>,
     pub status: &'a str,
+    pub source_path: Option<&'a str>,
 }
 
 pub fn insert_history(conn: &rusqlite::Connection, t: &NewTransfer) -> Result<(), StorageError> {
@@ -103,8 +104,8 @@ pub fn complete_history(
         )?;
         for f in files {
             tx.execute(
-                "INSERT INTO transfer_files (transfer_id, file_id, relative_path, size, hash_type, hash_value, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO transfer_files (transfer_id, file_id, relative_path, size, hash_type, hash_value, status, source_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     transfer_id,
                     f.file_id,
@@ -113,6 +114,7 @@ pub fn complete_history(
                     f.hash_type,
                     f.hash_value,
                     f.status,
+                    f.source_path,
                 ],
             )?;
         }
@@ -321,6 +323,7 @@ mod tests {
                 hash_type: "blake3".into(),
                 hash_value: Some("dead"),
                 status: "completed",
+                source_path: None,
             },
             FileRow {
                 file_id: "f2",
@@ -329,6 +332,7 @@ mod tests {
                 hash_type: "blake3".into(),
                 hash_value: None,
                 status: "failed",
+                source_path: None,
             },
         ];
         complete_history(&conn, "t1", &files, 999).unwrap();
@@ -363,6 +367,7 @@ mod tests {
                 hash_type: "blake3".into(),
                 hash_value: None,
                 status: "completed",
+                source_path: None,
             },
             FileRow {
                 file_id: "f1",
@@ -371,6 +376,7 @@ mod tests {
                 hash_type: "blake3".into(),
                 hash_value: None,
                 status: "completed",
+                source_path: None,
             },
         ];
         assert!(complete_history(&conn, "t1", &files, 999).is_err());
@@ -406,6 +412,7 @@ mod tests {
                 hash_type: "blake3".into(),
                 hash_value: None,
                 status: "completed",
+                source_path: None,
             }],
             1,
         )
@@ -495,5 +502,31 @@ mod tests {
         assert!(!row.transfer_id.is_empty());
         assert_eq!(row.direction, "receive");
         assert_eq!(row.status, "partial");
+    }
+
+    #[test]
+    fn complete_history_persists_source_path() {
+        let conn = db();
+        insert_history(&conn, &new_xfer("t1", None)).unwrap();
+        let files = [
+            FileRow {
+                file_id: "f1",
+                relative_path: "a.txt",
+                size: 10,
+                hash_type: "blake3".into(),
+                hash_value: Some("dead"),
+                status: "completed",
+                source_path: Some("/home/u/docs/a.txt"),
+            },
+        ];
+        complete_history(&conn, "t1", &files, 999).unwrap();
+        let source_path: Option<String> = conn
+            .query_row(
+                "SELECT source_path FROM transfer_files WHERE transfer_id='t1' AND file_id='f1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_path.as_deref(), Some("/home/u/docs/a.txt"));
     }
 }
