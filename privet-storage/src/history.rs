@@ -134,6 +134,17 @@ pub fn clear_history(conn: &rusqlite::Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+pub fn delete_history_entry(
+    conn: &rusqlite::Connection,
+    transfer_id: &str,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "DELETE FROM transfer_history WHERE transfer_id=?1",
+        rusqlite::params![transfer_id],
+    )?;
+    Ok(())
+}
+
 pub fn clear_history_by_peer(
     conn: &rusqlite::Connection,
     device_fingerprint: &str,
@@ -528,5 +539,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(source_path.as_deref(), Some("/home/u/docs/a.txt"));
+    }
+
+    #[test]
+    fn delete_history_entry_removes_transfer_and_files() {
+        let conn = db();
+        insert_history(&conn, &new_xfer("t1", None)).unwrap();
+        complete_history(
+            &conn,
+            "t1",
+            &[FileRow {
+                file_id: "f1",
+                relative_path: "a",
+                size: 1,
+                hash_type: "blake3".into(),
+                hash_value: None,
+                status: "completed",
+                source_path: None,
+            }],
+            1,
+        )
+        .unwrap();
+        delete_history_entry(&conn, "t1").unwrap();
+        let h: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transfer_history", [], |r| r.get(0))
+            .unwrap();
+        let f: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transfer_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((h, f), (0, 0));
+        // Deleting a missing id is a no-op, not an error.
+        assert!(delete_history_entry(&conn, "does-not-exist").is_ok());
     }
 }
