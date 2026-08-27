@@ -111,6 +111,20 @@ async fn send_to_serve_lands_file_over_quic() {
         .iter()
         .any(|r| r.direction == "send" && r.status == "completed"));
 
+    // History detail exposes the send source path. prepare_single_file stores
+    // the as-given absolute path (root.join(rel)), so compare against `src`
+    // itself rather than canonicalize() (which adds a verbatim prefix on Windows).
+    let detail = sender
+        .history_detail(&outcome.transfer_id)
+        .unwrap()
+        .expect("completed send has a detail row");
+    let expected_src = src.to_string_lossy();
+    assert_eq!(
+        detail.files[0].source_path.as_deref(),
+        Some(expected_src.as_ref()),
+        "send detail source_path must be the source path"
+    );
+
     serve.shutdown().await;
     let _ = receiver.shutdown().await;
 }
