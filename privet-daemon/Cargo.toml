@@ -10,6 +10,14 @@ publish = false
 name = "privetd"
 path = "src/main.rs"
 
+# cdylib for embedding the daemon in the app process (Android): on targetSdk >=
+# 29 an app cannot execve an ELF from its own data dir (SELinux W^X), so the app
+# dlopens `libprivetd_embed.so` and runs the daemon on a thread instead.
+# Name differs from the bin to avoid output/Pdb collisions on Windows.
+[lib]
+name = "privetd_embed"
+crate-type = ["cdylib"]
+
 [dependencies]
 privet-core = { path = "../privet-core" }
 privet-ipc = { path = "../privet-ipc" }
@@ -28,3 +36,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# JNI bridge for the embedded daemon; only needed when building for Android.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
