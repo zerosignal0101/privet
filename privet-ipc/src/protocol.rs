@@ -90,6 +90,8 @@ pub enum Request {
     PauseTransfer { transfer_id: String },
     ContinueTransfer { transfer_id: String },
     ListHistory { peer: Option<String>, limit: u32 },
+    GetHistoryDetail { transfer_id: String },
+    DeleteHistory { transfer_id: String },
     GetRuntimeConfig,
     SetRuntimeConfig(RuntimeConfigPatch),
     SubscribeEvents { after_sequence: Option<u64> },
@@ -129,6 +131,7 @@ pub enum ResponsePayload {
     TransferQueued { transfer_id: String },
     Transfer(TransferSummaryDto),
     History(Vec<HistoryEntryDto>),
+    HistoryDetail(HistoryDetailDto),
     RuntimeConfig(RuntimeConfigDto),
     EventReplay { events: Vec<EventMessage>, oldest_available: Option<u64>, latest: u64 },
 }
@@ -194,6 +197,27 @@ pub struct HistoryEntryDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryFileDto {
+    pub relative_path: String,
+    pub absolute_path: Option<String>,
+    pub size: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryDetailDto {
+    pub transfer_id: String,
+    pub direction: String,
+    pub peer_device_fingerprint: Option<String>,
+    pub peer_name: Option<String>,
+    pub root_name: Option<String>,
+    pub status: String,
+    pub started_ts: i64,
+    pub finished_ts: Option<i64>,
+    pub files: Vec<HistoryFileDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeConfigDto {
     pub accept_all_trusted: bool,
     pub collision_policy: CollisionPolicyDto,
@@ -239,5 +263,38 @@ mod tests {
         let encoded = serde_json::to_vec(&message).unwrap();
         let decoded: ClientMessage = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn get_history_detail_round_trip_is_stable() {
+        let request = Request::GetHistoryDetail { transfer_id: "t-1".into() };
+        let message = ClientMessage { protocol_version: IPC_PROTOCOL_VERSION, request_id: "req-1".into(), request };
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let decoded: ClientMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn history_detail_dto_round_trip_is_stable() {
+        let dto = HistoryDetailDto {
+            transfer_id: "t-1".into(),
+            direction: "receive".into(),
+            peer_device_fingerprint: None,
+            peer_name: Some("p".into()),
+            root_name: Some("docs".into()),
+            status: "completed".into(),
+            started_ts: 1,
+            finished_ts: Some(2),
+            files: vec![HistoryFileDto {
+                relative_path: "a.txt".into(),
+                absolute_path: Some("C:\\received\\docs\\a.txt".into()),
+                size: 10,
+                status: "completed".into(),
+            }],
+        };
+        let payload = ResponsePayload::HistoryDetail(dto);
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let decoded: ResponsePayload = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 }
