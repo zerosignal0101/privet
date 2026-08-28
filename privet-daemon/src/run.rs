@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use privet_core::ops::ServeOptions;
-use privet_core::{AcceptPolicy, Engine, OfferResolver};
+use privet_core::{AcceptPolicy, Engine};
 use privet_ipc::LocalListener;
 use tokio::sync::Notify;
 
@@ -48,7 +48,11 @@ pub async fn run(config_path: Option<PathBuf>, ipc_override: Option<PathBuf>) ->
     let listener = LocalListener::bind(config.endpoint()).map_err(|error| error.to_string())?;
     let mut engine = Engine::new(config.engine_config());
     engine.start().await.map_err(|error| error.to_string())?;
-    let resolver = Arc::new(OfferResolver::new());
+    // The receiver registers its pending offer against this resolver AND
+    // `accept_transfer` resolves it via `engine.resolve_offer` — so it must be
+    // the engine's own resolver. A fresh `OfferResolver` here would make every
+    // GUI accept fail with "transfer offer is not pending".
+    let resolver = engine.offer_resolver_arc();
     let serve = engine
         .serve(ServeOptions {
             save_dir: config.save_dir.clone(),
@@ -79,7 +83,8 @@ pub async fn run(config_path: Option<PathBuf>, ipc_override: Option<PathBuf>) ->
     });
 
     let shutdown = Arc::new(Notify::new());
-    let backend = Arc::new(DaemonBackend::new(engine.clone(), serve, broker, shutdown.clone()));
+    let backend =
+        Arc::new(DaemonBackend::new(engine.clone(), serve, broker, shutdown.clone(), config_path));
 
     // Binary: stop on SIGINT.
     let signal_backend = backend.clone();

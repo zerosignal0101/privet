@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use privet_core::ops::{PeerTarget, ServeHandle};
@@ -7,7 +8,7 @@ use privet_ipc::*;
 use privet_security::session::PairingOutcome;
 use tokio::sync::{Mutex, Notify};
 
-use crate::config::{collision_from_dto, collision_to_dto};
+use crate::config::{collision_from_dto, collision_to_dto, DaemonConfig};
 use crate::events::EventBroker;
 
 pub struct BackendError { pub code: String, pub message: String }
@@ -30,10 +31,17 @@ pub struct DaemonBackend {
     session_id: String,
     pub events: Arc<EventBroker>,
     pub shutdown: Arc<Notify>,
+    config_path: Option<PathBuf>,
 }
 
 impl DaemonBackend {
-    pub fn new(engine: Arc<Engine>, serve: ServeHandle, events: Arc<EventBroker>, shutdown: Arc<Notify>) -> Self {
+    pub fn new(
+        engine: Arc<Engine>,
+        serve: ServeHandle,
+        events: Arc<EventBroker>,
+        shutdown: Arc<Notify>,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             quic_addr: serve.quic_addr,
             tcp_addr: serve.tcp_addr,
@@ -42,6 +50,7 @@ impl DaemonBackend {
             serve: Mutex::new(Some(serve)),
             events,
             shutdown,
+            config_path,
         }
     }
 
@@ -189,6 +198,8 @@ impl DaemonBackend {
                 }
                 let config = self.runtime_config();
                 self.events.publish(Event::RuntimeConfigChanged(config.clone())).await;
+                // Persist so the change survives a daemon restart.
+                self.persist_config()?;
                 Ok(ResponsePayload::RuntimeConfig(config))
             }
             Request::SubscribeEvents { after_sequence } => {
@@ -210,6 +221,24 @@ impl DaemonBackend {
             collision_policy: collision_to_dto(self.engine.runtime().on_collision()),
             save_dir: self.engine.runtime().save_dir(),
         }
+    }
+
+    /// Writes the current runtime settings back to the config file (when there
+    /// is one) so `save_dir`, `accept_all_trusted` and `collision_policy`
+    /// survive a daemon restart. Everything else in the config is preserved.
+    fn persist_config(&self) -> std::result::Result<(), BackendError> {
+        let Some(path) = &self.config_path else { return Ok(()); };
+        let mut config = DaemonConfig::load(Some(path)).map_err(|error| BackendError {
+            code: "config".into(),
+            message: error,
+        })?;
+        config.accept_all_trusted = self.engine.runtime().accept_all_trusted();
+        config.collision_policy = collision_to_dto(self.engine.runtime().on_collision());
+        config.save_dir = self.engine.runtime().save_dir();
+        config.save(path).map_err(|error| BackendError {
+            code: "config".into(),
+            message: error,
+        })
     }
 
     fn resolve_pairing_peer(&self, peer: PairingPeer) -> std::result::Result<(SocketAddr, SocketAddr), BackendError> {

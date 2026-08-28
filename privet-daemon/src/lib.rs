@@ -23,7 +23,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use privet_ipc::{IpcClient, LocalEndpoint, Request, ResponsePayload};
+    use privet_ipc::{IpcClient, LocalEndpoint, Request, ResponsePayload, RuntimeConfigPatch};
     use tempfile::tempdir;
 
     use crate::run::{request_shutdown, run_blocking};
@@ -84,5 +84,65 @@ mod tests {
         request_shutdown();
         let result = thread.join().expect("daemon thread panicked");
         assert!(result.is_ok(), "run_blocking returned {result:?}");
+    }
+
+    #[test]
+    fn runtime_config_changes_persist_to_config_file() {
+        let dir = tempdir().unwrap();
+        // Unique pipe name: the sibling test also uses privet-test-<pid>.
+        let endpoint = if cfg!(windows) {
+            PathBuf::from(format!(
+                r"\\.\pipe\privet-test-persist-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+        } else {
+            dir.path().join("privet.sock")
+        };
+        let config_path = write_config(dir.path(), &endpoint);
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread = std::thread::spawn(move || {
+            let result = run_blocking(Some(config_path), None);
+            let _ = result_tx.send(result.clone());
+            result
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = rt.block_on(async {
+            let start = std::time::Instant::now();
+            loop {
+                if let Ok(client) = IpcClient::connect(&LocalEndpoint::new(endpoint.clone())).await {
+                    break client;
+                }
+                if start.elapsed() >= Duration::from_secs(10) {
+                    panic!("daemon endpoint never became reachable (daemon: {:?})", result_rx.try_recv().ok());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let new_save = dir.path().join("save-custom");
+        let resp = rt
+            .block_on(client.call(Request::SetRuntimeConfig(RuntimeConfigPatch {
+                accept_all_trusted: Some(true),
+                collision_policy: Some(privet_ipc::CollisionPolicyDto::Overwrite),
+                save_dir: Some(new_save.clone()),
+            })))
+            .unwrap();
+        assert!(matches!(resp, ResponsePayload::RuntimeConfig(_)));
+
+        // The daemon writes asynchronously; give it a moment, then read the file.
+        std::thread::sleep(Duration::from_millis(300));
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+        assert_eq!(on_disk["accept_all_trusted"], serde_json::Value::Bool(true));
+        assert_eq!(on_disk["collision_policy"], "overwrite");
+        assert_eq!(on_disk["save_dir"], serde_json::Value::String(new_save.to_string_lossy().into_owned()));
+        // Device name and network ports survive the write untouched.
+        assert_eq!(on_disk["device_name"], "test-device");
+
+        request_shutdown();
+        thread.join().expect("daemon thread panicked").unwrap();
     }
 }

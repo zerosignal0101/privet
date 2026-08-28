@@ -58,6 +58,15 @@ impl DaemonConfig {
         Ok(())
     }
 
+    /// Persists this config back to [path] so runtime changes survive a daemon
+    /// restart. The daemon owns these values (`save_dir`, `accept_all_trusted`,
+    /// `collision_policy`), so they live in the config file, not app prefs.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|error| format!("serialize config: {error}"))?;
+        std::fs::write(path, json).map_err(|error| format!("write config: {error}"))
+    }
+
     pub fn endpoint(&self) -> LocalEndpoint {
         self.ipc_endpoint
             .clone()

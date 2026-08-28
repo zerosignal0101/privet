@@ -135,8 +135,15 @@ impl MdnsBrowser {
                             _ => None,
                         })
                         .collect();
-                    if let Some(view) =
-                        from_service(&resolved.fullname, &txt, &addrs, resolved.port)
+                    // `resolved.fullname` is `<instance>.<service_type>`, e.g.
+                    // "Xiaomi 2410DPN6CC._privet._udp.local.". The peer name is
+                    // the instance part, not the full mDNS service name.
+                    let instance = resolved
+                        .fullname
+                        .strip_suffix(SERVICE_TYPE)
+                        .map(|s| s.trim_end_matches('.'))
+                        .unwrap_or(&resolved.fullname);
+                    if let Some(view) = from_service(instance, &txt, &addrs, resolved.port)
                     {
                         let _ = tx.send((view, addrs)).await;
                     }
