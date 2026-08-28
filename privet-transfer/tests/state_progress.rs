@@ -72,6 +72,7 @@ async fn sender_emits_state_changed_events() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let _sr = tokio::spawn(run_sender(s));
     let _rr = tokio::spawn(run_receiver(r));

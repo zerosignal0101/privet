@@ -43,6 +43,7 @@ async fn all_drops_hit_chunk_corrupt_ceiling() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let _rr = tokio::spawn(run_receiver(r));
@@ -90,6 +91,7 @@ async fn manifest_late_chunk_buffered_not_dropped() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let rr = tokio::spawn(run_receiver(r));

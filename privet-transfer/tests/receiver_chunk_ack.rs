@@ -53,6 +53,7 @@ async fn receiver_emits_chunk_ack_after_64_chunks() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let rh = tokio::spawn(run_receiver(inputs));
 

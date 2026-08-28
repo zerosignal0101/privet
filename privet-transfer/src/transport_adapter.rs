@@ -160,6 +160,13 @@ fn frame_err(e: FrameError) -> TransferError {
 
 fn map_te(e: privet_transport::TransportError) -> TransferError {
     use privet_transport::TransportError as TE;
+    // The peer issuing STOP_SENDING on our stream is a deliberate abort (the
+    // receiver does exactly that when it cancels mid-transfer), NOT a resumable
+    // transport loss — reconnecting would re-send the whole transfer after a
+    // cancel. `run_sender` turns this into a proper Cancelled outcome.
+    if e.is_peer_stream_stopped() {
+        return TransferError::Aborted("peer stopped data stream".into());
+    }
     let resumable = matches!(
         &e,
         TE::Closed(_) | TE::Quic(_) | TE::QuicRead(_) | TE::QuicReadExact(_) | TE::QuicWrite(_)

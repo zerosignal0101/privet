@@ -201,6 +201,7 @@ async fn drop_mid_transfer_then_resume() {
             etx.clone(),
             None,
             AcceptPolicy::AutoAccept,
+            None,
         ));
 
         let stage_dir = recv_save.join(".privet").join("t_resume");
@@ -246,6 +247,7 @@ async fn drop_mid_transfer_then_resume() {
             etx,
             None,
             AcceptPolicy::AutoAccept,
+            None,
         )
         .await
         .unwrap();

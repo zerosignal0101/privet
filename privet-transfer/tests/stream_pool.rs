@@ -41,6 +41,7 @@ async fn pool_with_multiple_channels_transfers_successfully() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let rr = tokio::spawn(run_receiver(r));

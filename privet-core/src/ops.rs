@@ -144,6 +144,13 @@ fn record_verified_address(
     Ok(())
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub(crate) fn subnet_for_peer(ip: std::net::IpAddr) -> Option<String> {
     let std::net::IpAddr::V4(v4) = ip else {
         return None;
@@ -220,6 +227,7 @@ use std::sync::Arc;
 
 use privet_security::cert::extract_spki;
 use privet_security::code::Now;
+use privet_transfer::receiver::ReceivedFileRecord;
 use privet_transfer::CollisionPolicy;
 use privet_transport::{Connection, Transport};
 
@@ -383,6 +391,32 @@ impl Engine {
             .map_err(crate::CoreError::Storage)?;
         }
 
+        // Persist the per-file rows up-front so a partial/interrupted send still
+        // lists its files (with source paths) in history — the resend flow
+        // rebuilds the file set from these rows, and before this a partial send
+        // had no file rows at all ("Files not found on disk" on resend).
+        // `complete_history` upgrades them to "completed" once the transfer
+        // finishes; if it never does, the rows stay as the "failed" sentinel but
+        // still carry the source paths a resend needs.
+        {
+            let db = self.db_conn()?;
+            let files: Vec<privet_storage::history::FileRow> = prepared
+                .files
+                .iter()
+                .map(|f| privet_storage::history::FileRow {
+                    file_id: &f.file_id,
+                    relative_path: &f.relative_path,
+                    size: f.size,
+                    hash_type: Some("blake3"),
+                    hash_value: Some(&f.file_hash),
+                    status: "failed",
+                    source_path: f.abs_path.to_str(),
+                })
+                .collect();
+            privet_storage::history::insert_send_files(&db, &transfer_id, &files)
+                .map_err(crate::CoreError::Storage)?;
+        }
+
         self.do_send_inner(cfg, prepared, pa, transfer_id, file_count, total_bytes)
             .await
     }
@@ -531,7 +565,25 @@ impl Engine {
         )
         .await;
         self.registry.unregister(&transfer_id);
-        send_result?;
+        // A cancelled/declined send is NOT a completion. `run_sender` already
+        // emitted `transfer_cancelled`, and the history row — inserted as
+        // 'partial' at send-start — must stay 'partial' so the transfer can be
+        // resumed (mirroring the receiver's own 'partial' row). Returning Ok
+        // here also stops the daemon from publishing a spurious
+        // `transfer_failed` on a cancellation the user already saw.
+        match send_result {
+            Err(crate::CoreError::Transfer(
+                privet_transfer::TransferError::Cancelled(_)
+                | privet_transfer::TransferError::Declined(_),
+            )) => {
+                return Ok(SendOutcome {
+                    transfer_id,
+                    file_count,
+                    total_bytes,
+                });
+            }
+            other => other?,
+        }
 
         if let Some(did) = &pa.device_fingerprint {
             let now = SystemPairingClock.now_ms() as i64 / 1000;
@@ -612,6 +664,7 @@ impl Engine {
             let pending = self.pending_pair_code.clone();
             let pake = self.pake.clone();
             let pairing_cfg = self.engine_config().pairing.clone();
+            let db = self.db.clone();
             async move {
                 loop {
                     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -643,6 +696,7 @@ impl Engine {
                         &device_name,
                         &platform,
                         &pairing_cfg,
+                        db.clone(),
                     )
                     .await;
                 }
@@ -664,6 +718,7 @@ impl Engine {
             let pending = self.pending_pair_code.clone();
             let pake = self.pake.clone();
             let pairing_cfg = self.engine_config().pairing.clone();
+            let db = self.db.clone();
             async move {
                 loop {
                     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -695,6 +750,7 @@ impl Engine {
                         &device_name,
                         &platform,
                         &pairing_cfg,
+                        db.clone(),
                     )
                     .await;
                 }
@@ -725,6 +781,7 @@ async fn handle_inbound(
     device_name: &str,
     platform: &str,
     pairing_cfg: &privet_security::PairingConfig,
+    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
 ) -> crate::Result<()> {
     let mut ctrl = acquire_control(conn.as_ref(), ControlRole::Responder).await?;
     let hello = hello_exchange_responder(ctrl.as_mut(), identity, 1, device_name, platform).await?;
@@ -743,6 +800,112 @@ async fn handle_inbound(
             let mut store_cfg = cfg.clone();
             store_cfg.on_collision = on_collision;
             store_cfg.save_dir = save_dir.clone();
+            // Persist receive history (partial on offer, completed with file
+            // rows before the terminal event). The closures capture the DB, the
+            // landing dir and the peer identity from the hello exchange.
+            let history = {
+                let peer_fp = hello.device_fingerprint.clone();
+                let peer_name = hello.device_name.clone();
+                let save_dir_str = save_dir.to_string_lossy().into_owned();
+                let db_offer = db.clone();
+                let db_complete = db.clone();
+                let on_offer =
+                    move |transfer_id: &str,
+                          root_name: Option<String>,
+                          file_count: u64,
+                          total_bytes: u64| {
+                        let now = now_secs();
+                        match db_offer.lock() {
+                            Ok(conn) => {
+                                let r = history::insert_history(
+                                    &conn,
+                                    &history::NewTransfer {
+                                        transfer_id,
+                                        direction: history::TransferDirection::Receive,
+                                        peer_device_fingerprint: Some(&peer_fp),
+                                        peer_name: Some(&peer_name),
+                                        root_name: root_name.as_deref(),
+                                        file_count,
+                                        total_bytes,
+                                        status: history::TransferStatus::Partial,
+                                        started_ts: now,
+                                        save_dir: Some(&save_dir_str),
+                                        send_intent: "{}",
+                                    },
+                                );
+                                if let Err(e) = r {
+                                    tracing::warn!(transfer_id, error = %e, "receive history: offer insert failed");
+                                }
+                            }
+                            Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
+                        }
+                    };
+                let on_complete = move |transfer_id: &str, records: Vec<ReceivedFileRecord>| {
+                    let now = now_secs();
+                    match db_complete.lock() {
+                        Ok(conn) => {
+                            let files: Vec<history::FileRow<'_>> = records
+                                .iter()
+                                .map(|r| history::FileRow {
+                                    file_id: &r.file_id,
+                                    relative_path: &r.relative_path,
+                                    size: r.size,
+                                    hash_type: r.hash_type.as_deref(),
+                                    hash_value: r.hash_value.as_deref(),
+                                    status: &r.status,
+                                    source_path: None,
+                                })
+                                .collect();
+                            if let Err(e) = history::complete_history(&conn, transfer_id, &files, now) {
+                                tracing::warn!(transfer_id, error = %e, "receive history: complete failed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
+                    }
+                };
+                let db_fileset = db.clone();
+                // The receiver only learned the file manifest after the offer
+                // (FileSetBatch), so persist the per-file rows here — before
+                // data flows — instead of only in complete_history. A partial/
+                // interrupted receive then lists its files (with the landing
+                // path) in history, mirroring insert_send_files on the send
+                // side; complete_history upgrades the rows on success.
+                let on_fileset = move |transfer_id: &str, entries: Vec<privet_protocol::FileEntry>| {
+                    let files: Vec<history::FileRow<'_>> = entries
+                        .iter()
+                        .map(|e| history::FileRow {
+                            file_id: &e.file_id,
+                            relative_path: &e.relative_path,
+                            size: e.size,
+                            hash_type: if e.hash_type.is_empty() {
+                                None
+                            } else {
+                                Some(e.hash_type.as_str())
+                            },
+                            hash_value: if e.hash_value.is_empty() {
+                                None
+                            } else {
+                                Some(e.hash_value.as_str())
+                            },
+                            status: "failed",
+                            source_path: None,
+                        })
+                        .collect();
+                    match db_fileset.lock() {
+                        Ok(conn) => {
+                            if let Err(e) = history::insert_send_files(&conn, transfer_id, &files) {
+                                tracing::warn!(transfer_id, error = %e, "receive history: fileset insert failed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
+                    }
+                };
+                Some(privet_transfer::ReceiveHistory {
+                    on_offer: Box::new(on_offer),
+                    on_fileset: Box::new(on_fileset),
+                    on_complete: Box::new(on_complete),
+                })
+            };
             let recv = receive_over_connection(
                 ctrl,
                 data,
@@ -751,6 +914,7 @@ async fn handle_inbound(
                 event_tx,
                 Some(registry),
                 accept_policy,
+                history,
             )
             .await;
             if recv.is_ok() {

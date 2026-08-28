@@ -104,9 +104,19 @@ pub fn complete_history(
             rusqlite::params![finished_ts, transfer_id],
         )?;
         for f in files {
+            // A send inserts its file rows at start time (insert_send_files) so
+            // a partial/interrupted send still lists its files; upgrade those
+            // pre-existing rows instead of colliding on the primary key. On the
+            // receive path no rows exist yet, so the upsert is a plain insert.
             tx.execute(
                 "INSERT INTO transfer_files (transfer_id, file_id, relative_path, size, hash_type, hash_value, status, source_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(transfer_id, file_id) DO UPDATE SET
+                   status=excluded.status,
+                   size=excluded.size,
+                   hash_type=excluded.hash_type,
+                   hash_value=excluded.hash_value,
+                   source_path=excluded.source_path",
                 rusqlite::params![
                     transfer_id,
                     f.file_id,
@@ -115,6 +125,51 @@ pub fn complete_history(
                     f.hash_type,
                     f.hash_value,
                     f.status,
+                    f.source_path,
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => tx.commit().map_err(Into::into),
+        Err(e) => {
+            let _ = tx.rollback();
+            Err(e.into())
+        }
+    }
+}
+
+/// Inserts the per-file rows at transfer start time, so a partial/interrupted
+/// transfer still lists its files in history. On the send side this happens
+/// when the transfer is prepared (rows carry the source paths a resend needs);
+/// on the receive side it happens once the FileSetBatch manifest is known
+/// (source_path is None). Rows start at the "failed" sentinel;
+/// `complete_history` upgrades them to "completed" on success. Idempotent per
+/// (transfer_id, file_id).
+pub fn insert_send_files(
+    conn: &rusqlite::Connection,
+    transfer_id: &str,
+    files: &[FileRow],
+) -> Result<(), StorageError> {
+    for f in files {
+        let _ = crate::path_guard::guard_relative_path(f.relative_path)?;
+    }
+    let tx = conn.unchecked_transaction()?;
+    let res = (|| -> Result<(), rusqlite::Error> {
+        for f in files {
+            tx.execute(
+                "INSERT OR REPLACE INTO transfer_files
+                   (transfer_id, file_id, relative_path, size, hash_type, hash_value, status, source_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    transfer_id,
+                    f.file_id,
+                    f.relative_path,
+                    f.size as i64,
+                    f.hash_type,
+                    f.hash_value,
+                    "failed",
                     f.source_path,
                 ],
             )?;
@@ -460,6 +515,9 @@ mod tests {
     fn complete_history_rolls_back_on_mid_failure() {
         let conn = db();
         insert_history(&conn, &new_xfer("t1", None)).unwrap();
+        // The second row violates the transfer_files status CHECK after the
+        // first insert succeeds, so the whole write must roll back (the old
+        // duplicate-(transfer_id, file_id) trigger is now a harmless upsert).
         let files = [
             FileRow {
                 file_id: "f1",
@@ -471,12 +529,12 @@ mod tests {
                 source_path: None,
             },
             FileRow {
-                file_id: "f1",
+                file_id: "f2",
                 relative_path: "b.txt",
                 size: 20,
                 hash_type: "blake3".into(),
                 hash_value: None,
-                status: "completed",
+                status: "boom",
                 source_path: None,
             },
         ];
@@ -497,6 +555,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn insert_send_files_persists_source_paths_for_partial_send() {
+        let conn = db();
+        insert_history(&conn, &new_xfer("t1", None)).unwrap();
+        // Send start: file rows carry source paths before the transfer ends, so
+        // a partial/interrupted send still lists its files for a later resend.
+        insert_send_files(
+            &conn,
+            "t1",
+            &[FileRow {
+                file_id: "f1",
+                relative_path: "a.txt",
+                size: 10,
+                hash_type: "blake3".into(),
+                hash_value: Some("dead"),
+                status: "failed",
+                source_path: Some("/src/a.txt"),
+            }],
+        )
+        .unwrap();
+        let detail = get_history_detail(&conn, "t1").unwrap().unwrap();
+        assert_eq!(detail.status, "partial");
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].source_path.as_deref(), Some("/src/a.txt"));
+        assert_eq!(detail.files[0].status, "failed");
+
+        // Completion upgrades the pre-inserted rows rather than colliding on
+        // the (transfer_id, file_id) primary key.
+        complete_history(
+            &conn,
+            "t1",
+            &[FileRow {
+                file_id: "f1",
+                relative_path: "a.txt",
+                size: 10,
+                hash_type: "blake3".into(),
+                hash_value: Some("dead"),
+                status: "completed",
+                source_path: Some("/src/a.txt"),
+            }],
+            999,
+        )
+        .unwrap();
+        let detail = get_history_detail(&conn, "t1").unwrap().unwrap();
+        assert_eq!(detail.status, "completed");
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].status, "completed");
+        assert_eq!(detail.files[0].source_path.as_deref(), Some("/src/a.txt"));
     }
 
     #[test]

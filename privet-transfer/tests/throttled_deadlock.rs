@@ -59,6 +59,7 @@ async fn throttled_deadlock_32chunks_completes() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
 
     let sr = tokio::spawn(run_sender(s_inputs));
@@ -112,6 +113,7 @@ async fn throttled_deadlock_64chunks_completes() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
 
     let sr = tokio::spawn(run_sender(s_inputs));

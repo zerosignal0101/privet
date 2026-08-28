@@ -45,6 +45,7 @@ async fn roundtrip(
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let rr = tokio::spawn(run_receiver(r));
@@ -91,6 +92,7 @@ async fn out_of_order_arrival_assembles_correctly() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let rr = tokio::spawn(run_receiver(r));
@@ -150,6 +152,7 @@ async fn many_small_files_all_inline() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let rr = tokio::spawn(run_receiver(r));

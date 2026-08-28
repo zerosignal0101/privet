@@ -42,6 +42,7 @@ async fn sender_receiver_roundtrip_chunked_file() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
 
     let sr = tokio::spawn(run_sender(s_inputs));

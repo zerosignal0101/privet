@@ -16,6 +16,31 @@ use crate::manifest_store::{ArrivalVerdict, PendingChunk, ReceiverManifestStore}
 use crate::part_store::{FinalizeOutcome, PartStore};
 use crate::state::{TransferFailed, TransferState};
 
+/// A finalized received file, reported to the core so it can record history.
+pub struct ReceivedFileRecord {
+    pub file_id: String,
+    pub relative_path: String,
+    pub size: u64,
+    pub hash_type: Option<String>,
+    pub hash_value: Option<String>,
+    pub status: String,
+}
+
+/// Optional hooks the core supplies so the receiver can persist transfer
+/// history. The receiver never touches the database; it only reports.
+pub struct ReceiveHistory {
+    /// Called once the offer is known: (transfer_id, root_name, file_count,
+    /// total_bytes). The core inserts the partial history row here.
+    pub on_offer: Box<dyn Fn(&str, Option<String>, u64, u64) + Send + Sync>,
+    /// Called once the sender's file manifest is fully known (after the last
+    /// FileSetBatch), before data flows: (transfer_id, Vec<FileEntry>). The
+    /// core persists the per-file rows here so a partial/interrupted receive
+    /// still lists its files, mirroring the sender's insert_send_files.
+    pub on_fileset: Box<dyn Fn(&str, Vec<privet_protocol::FileEntry>) + Send + Sync>,
+    /// Called right before the terminal event once all files are finalized.
+    pub on_complete: Box<dyn Fn(&str, Vec<ReceivedFileRecord>) + Send + Sync>,
+}
+
 pub struct ReceiverInputs {
     pub control: Box<dyn crate::ControlChannel>,
     pub data: Vec<Box<dyn crate::DataChannel>>,
@@ -24,6 +49,7 @@ pub struct ReceiverInputs {
     pub config: TransferEngineConfig,
     pub accept_policy: crate::control::AcceptPolicy,
     pub registry: Option<std::sync::Arc<crate::control::TransferRegistry>>,
+    pub history: Option<ReceiveHistory>,
 }
 
 #[derive(Default)]
@@ -34,6 +60,246 @@ struct FileRecvState {
     verified_count: HashMap<u32, u32>,
     last_acked_count: HashMap<u32, u32>,
     meta_inited: bool,
+}
+
+/// Applies a user command (cancel/pause/resume) read from the transfer registry.
+/// Returns `true` when the transfer was cancelled and the receiver must return,
+/// `false` after a pause/resume (the loop keeps running).
+async fn apply_command(
+    inputs: &mut ReceiverInputs,
+    tid: &str,
+    cmd: crate::control::TransferCommand,
+) -> Result<bool> {
+    match cmd {
+        crate::control::TransferCommand::Cancel => {
+            let _ = inputs
+                .control
+                .send(ControlFrame {
+                    payload: Some(CPayload::Control(ControlMessage {
+                        msg: Some(privet_protocol::control_message::Msg::Cancel(
+                            privet_protocol::Cancel {
+                                transfer_id: tid.to_string(),
+                                reason: "user".into(),
+                            },
+                        )),
+                    })),
+                })
+                .await;
+            if let Some(r) = &inputs.registry {
+                r.unregister(tid);
+            }
+            inputs
+                .events
+                .emit(TransferEvent::StateChanged {
+                    transfer_id: tid.to_string(),
+                    state: TransferState::Cancelled,
+                })
+                .await;
+            inputs
+                .events
+                .emit(TransferEvent::Cancelled {
+                    transfer_id: tid.to_string(),
+                })
+                .await;
+            Ok(true)
+        }
+        crate::control::TransferCommand::Pause => {
+            let _ = inputs
+                .control
+                .send(ControlFrame {
+                    payload: Some(CPayload::Control(ControlMessage {
+                        msg: Some(privet_protocol::control_message::Msg::Pause(
+                            privet_protocol::Pause {
+                                transfer_id: tid.to_string(),
+                            },
+                        )),
+                    })),
+                })
+                .await;
+            inputs
+                .events
+                .emit(TransferEvent::Paused {
+                    transfer_id: tid.to_string(),
+                    reason: crate::state::PausedReason::User,
+                })
+                .await;
+            inputs
+                .events
+                .emit(TransferEvent::StateChanged {
+                    transfer_id: tid.to_string(),
+                    state: TransferState::Paused {
+                        reason: crate::state::PausedReason::User,
+                    },
+                })
+                .await;
+            Ok(false)
+        }
+        crate::control::TransferCommand::Resume => {
+            let _ = inputs
+                .control
+                .send(ControlFrame {
+                    payload: Some(CPayload::Control(ControlMessage {
+                        msg: Some(privet_protocol::control_message::Msg::Resume(
+                            privet_protocol::Resume {
+                                transfer_id: tid.to_string(),
+                            },
+                        )),
+                    })),
+                })
+                .await;
+            inputs
+                .events
+                .emit(TransferEvent::Resumed {
+                    transfer_id: tid.to_string(),
+                })
+                .await;
+            Ok(false)
+        }
+    }
+}
+
+/// Non-blocking poll of the transfer's command channel (cancel/pause/resume).
+/// Returns `None` when no command is pending or the channel is not wired.
+async fn poll_command(
+    rx: Option<&mut tokio::sync::mpsc::Receiver<crate::control::TransferCommand>>,
+) -> Option<crate::control::TransferCommand> {
+    match rx {
+        Some(rx) => tokio::time::timeout(std::time::Duration::from_millis(0), rx.recv())
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    }
+}
+
+/// Outcome of draining control after a mid-transfer data-stream abort.
+#[derive(PartialEq)]
+enum PeerDataStop {
+    /// A terminal Cancelled/Failed event was emitted; the receiver must return.
+    Terminated,
+    /// The transfer actually finished (a Complete frame is pending); finalize.
+    Finalize,
+}
+
+/// Handles a data-stream end/error while files are still incomplete — how a
+/// peer cancel (the sender writes a Cancel control frame, then ends the data
+/// stream) or a vanished peer shows up to the receiver. The receiver used to
+/// return on the data error before reading the Cancel frame, so a sender
+/// cancel produced NO terminal event: the GUI tile froze at its last progress
+/// and History never refreshed to show the 'partial' row.
+///
+/// A pending Complete means the transfer actually finished and the caller
+/// should finalize; every other case terminates the transfer (Cancelled, or
+/// Failed for a chunk-corrupt stop) with a real event and unregisters.
+async fn drain_peer_data_abort(inputs: &mut ReceiverInputs, tid: &str) -> Result<PeerDataStop> {
+    // The Cancel frame the peer wrote is on the control stream already (it was
+    // written before the data stream ended); give the wire a bounded window to
+    // deliver it rather than racing the FIN.
+    let pending = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        inputs.control.recv(),
+    )
+    .await;
+    match pending {
+        Ok(Ok(frame)) => match frame.payload {
+            Some(CPayload::Control(ControlMessage {
+                msg: Some(privet_protocol::control_message::Msg::Cancel(c)),
+            })) if c.reason == "chunk_corrupt" => {
+                inputs
+                    .events
+                    .emit(TransferEvent::StateChanged {
+                        transfer_id: tid.to_string(),
+                        state: TransferState::Failed(TransferFailed {
+                            error_code: "chunk_corrupt",
+                            error_message: "retryable".into(),
+                            retryable: true,
+                            part_kept: true,
+                        }),
+                    })
+                    .await;
+                inputs
+                    .events
+                    .emit(TransferEvent::Failed {
+                        transfer_id: tid.to_string(),
+                        error_code: "chunk_corrupt".into(),
+                        retryable: true,
+                        part_kept: true,
+                    })
+                    .await;
+                if let Some(r) = &inputs.registry {
+                    r.unregister(tid);
+                }
+                Ok(PeerDataStop::Terminated)
+            }
+            Some(CPayload::Control(ControlMessage {
+                msg: Some(privet_protocol::control_message::Msg::Cancel(_)),
+            })) => {
+                inputs
+                    .events
+                    .emit(TransferEvent::StateChanged {
+                        transfer_id: tid.to_string(),
+                        state: TransferState::Cancelled,
+                    })
+                    .await;
+                inputs
+                    .events
+                    .emit(TransferEvent::Cancelled {
+                        transfer_id: tid.to_string(),
+                    })
+                    .await;
+                if let Some(r) = &inputs.registry {
+                    r.unregister(tid);
+                }
+                Ok(PeerDataStop::Terminated)
+            }
+            Some(CPayload::Control(ControlMessage {
+                msg: Some(privet_protocol::control_message::Msg::Complete(_)),
+            })) => Ok(PeerDataStop::Finalize),
+            // A stray frame while the data stream stopped: treat the peer as
+            // stopped rather than guessing.
+            _ => {
+                inputs
+                    .events
+                    .emit(TransferEvent::StateChanged {
+                        transfer_id: tid.to_string(),
+                        state: TransferState::Cancelled,
+                    })
+                    .await;
+                inputs
+                    .events
+                    .emit(TransferEvent::Cancelled {
+                        transfer_id: tid.to_string(),
+                    })
+                    .await;
+                if let Some(r) = &inputs.registry {
+                    r.unregister(tid);
+                }
+                Ok(PeerDataStop::Terminated)
+            }
+        },
+        // No control frame within the window: the peer vanished. Emit
+        // Cancelled (the history row stays 'partial', matching the peer) so the
+        // GUI tile resolves instead of freezing.
+        Ok(Err(_)) | Err(_) => {
+            inputs
+                .events
+                .emit(TransferEvent::StateChanged {
+                    transfer_id: tid.to_string(),
+                    state: TransferState::Cancelled,
+                })
+                .await;
+            inputs
+                .events
+                .emit(TransferEvent::Cancelled {
+                    transfer_id: tid.to_string(),
+                })
+                .await;
+            if let Some(r) = &inputs.registry {
+                r.unregister(tid);
+            }
+            Ok(PeerDataStop::Terminated)
+        }
+    }
 }
 
 pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
@@ -55,6 +321,11 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
     } else {
         Some(summary.root_name.clone())
     };
+    // Record the (partial) history row before publishing the offer event so the
+    // transfer is visible in History as soon as it is offered.
+    if let Some(h) = &inputs.history {
+        (h.on_offer)(&tid, root_name.clone(), summary.file_count, summary.total_bytes);
+    }
     // Register before publishing the offer event so an IPC client can respond immediately.
     let decision_rx = match &inputs.accept_policy {
         crate::control::AcceptPolicy::Resolver(resolver) => {
@@ -110,12 +381,12 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         },
         resume,
     };
-    inputs
+    let send_accept_result = inputs
         .control
         .send(ControlFrame {
             payload: Some(CPayload::TransferAccept(send_accept)),
         })
-        .await?;
+        .await;
     if !accepted {
         if let Some(r) = &inputs.registry {
             r.unregister(&tid);
@@ -134,8 +405,15 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
             .events
             .emit(TransferEvent::Cancelled { transfer_id: tid })
             .await;
-        return Ok(());
+        // The reject frame is best-effort: if the peer is already gone, the
+        // local terminal event above still must reach the UI. Only surface
+        // non-transport errors.
+        return send_accept_result.map(|_| ()).or_else(|e| match e {
+            TransferError::Transport(_) | TransferError::TransportLost => Ok(()),
+            e => Err(e),
+        });
     }
+    send_accept_result?;
     inputs
         .events
         .emit(TransferEvent::Accepted {
@@ -245,6 +523,18 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         }
     }
 
+    // The last FileSetBatch was seen, so the full file manifest is known and
+    // data is about to flow. Persist the per-file rows now (status "failed"
+    // sentinel) so a partial/interrupted receive still lists its files in
+    // history; complete_history upgrades them once the transfer finishes.
+    if let Some(h) = &inputs.history {
+        let entries: Vec<privet_protocol::FileEntry> = files
+            .values()
+            .filter_map(|st| st.entry.clone())
+            .collect();
+        (h.on_fileset)(&tid, entries);
+    }
+
     for bm in &resume_saved {
         if let Some(st) = files.get_mut(&bm.file_id) {
             let seg_id = bm.segment_id;
@@ -282,113 +572,55 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                     raw,
                 )
                 .await?;
+                // Drain any pending user command (cancel/pause/resume) while
+                // data flows. Before, only the idle-timeout branch polled the
+                // command channel, so cancel could not interrupt an active
+                // transfer on the receiving side.
+                if let Some(cmd) = poll_command(cmd_rx.as_mut()).await {
+                    if apply_command(&mut inputs, &tid, cmd).await? {
+                        return Ok(());
+                    }
+                }
                 if last_progress_log.elapsed() >= std::time::Duration::from_secs(1) {
-                    let verified: u64 = files
+                    let verified_chunks: u64 = files
                         .values()
                         .map(|st| st.verified_count.values().sum::<u32>() as u64)
                         .sum();
-                    tracing::debug!(transfer_id = %tid, verified_chunks = verified, "receiver progress");
+                    tracing::debug!(transfer_id = %tid, verified_chunks = verified_chunks, "receiver progress");
+                    // Mirror the sender's byte approximation so the GUI shows
+                    // live progress instead of sitting at 0% until completion.
+                    let verified_bytes =
+                        verified_chunks.saturating_mul(inputs.config.default_chunk_size as u64);
+                    if verified_bytes > 0 {
+                        inputs
+                            .events
+                            .emit(TransferEvent::Progress {
+                                transfer_id: tid.clone(),
+                                verified_bytes: verified_bytes.min(summary.total_bytes),
+                                total_bytes: summary.total_bytes,
+                            })
+                            .await;
+                    }
                     last_progress_log = std::time::Instant::now();
                 }
             }
-            Ok(Err(TransferError::Transport(_))) => break,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(_)) => {
+                // A mid-transfer data-stream end/error: the peer cancelled (it
+                // writes a Cancel frame, then ends the data stream) or vanished.
+                // The receiver used to return on this error without reading the
+                // frame — no terminal event, a frozen tile, stale History.
+                // Drain control and terminate with the matching event; only a
+                // pending Complete finalizes normally below.
+                if drain_peer_data_abort(&mut inputs, &tid).await? != PeerDataStop::Finalize {
+                    return Ok(());
+                }
+                break;
+            }
             Err(_) => {
                 flush_pending_chunk_acks(&mut files, &mut inputs.control).await?;
-                if let Some(rx) = cmd_rx.as_mut() {
-                    if let Ok(Some(cmd)) =
-                        tokio::time::timeout(std::time::Duration::from_millis(0), rx.recv()).await
-                    {
-                        match cmd {
-                            crate::control::TransferCommand::Cancel => {
-                                let _ = inputs
-                                    .control
-                                    .send(ControlFrame {
-                                        payload: Some(CPayload::Control(ControlMessage {
-                                            msg: Some(
-                                                privet_protocol::control_message::Msg::Cancel(
-                                                    privet_protocol::Cancel {
-                                                        transfer_id: tid.clone(),
-                                                        reason: "user".into(),
-                                                    },
-                                                ),
-                                            ),
-                                        })),
-                                    })
-                                    .await;
-                                if let Some(r) = &inputs.registry {
-                                    r.unregister(&tid);
-                                }
-                                inputs
-                                    .events
-                                    .emit(TransferEvent::StateChanged {
-                                        transfer_id: tid.clone(),
-                                        state: TransferState::Cancelled,
-                                    })
-                                    .await;
-                                inputs
-                                    .events
-                                    .emit(TransferEvent::Cancelled {
-                                        transfer_id: tid.clone(),
-                                    })
-                                    .await;
-                                return Ok(());
-                            }
-                            crate::control::TransferCommand::Pause => {
-                                let _ = inputs
-                                    .control
-                                    .send(ControlFrame {
-                                        payload: Some(CPayload::Control(ControlMessage {
-                                            msg: Some(
-                                                privet_protocol::control_message::Msg::Pause(
-                                                    privet_protocol::Pause {
-                                                        transfer_id: tid.clone(),
-                                                    },
-                                                ),
-                                            ),
-                                        })),
-                                    })
-                                    .await;
-                                inputs
-                                    .events
-                                    .emit(TransferEvent::Paused {
-                                        transfer_id: tid.clone(),
-                                        reason: crate::state::PausedReason::User,
-                                    })
-                                    .await;
-                                inputs
-                                    .events
-                                    .emit(TransferEvent::StateChanged {
-                                        transfer_id: tid.clone(),
-                                        state: TransferState::Paused {
-                                            reason: crate::state::PausedReason::User,
-                                        },
-                                    })
-                                    .await;
-                            }
-                            crate::control::TransferCommand::Resume => {
-                                let _ = inputs
-                                    .control
-                                    .send(ControlFrame {
-                                        payload: Some(CPayload::Control(ControlMessage {
-                                            msg: Some(
-                                                privet_protocol::control_message::Msg::Resume(
-                                                    privet_protocol::Resume {
-                                                        transfer_id: tid.clone(),
-                                                    },
-                                                ),
-                                            ),
-                                        })),
-                                    })
-                                    .await;
-                                inputs
-                                    .events
-                                    .emit(TransferEvent::Resumed {
-                                        transfer_id: tid.clone(),
-                                    })
-                                    .await;
-                            }
-                        }
+                if let Some(cmd) = poll_command(cmd_rx.as_mut()).await {
+                    if apply_command(&mut inputs, &tid, cmd).await? {
+                        return Ok(());
                     }
                 }
                 if let Some(frame) = try_recv_control(&mut inputs.control).await? {
@@ -641,6 +873,57 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
             }
         }
         inputs.store.cleanup_staging(&tid)?;
+    }
+
+    // Commit the receive history (status -> completed, per-file rows) BEFORE the
+    // Verified frame and the terminal events. The peer considers the transfer
+    // finished the moment it receives Verified, and the GUI refreshes History on
+    // the terminal event, so committing any later would race a refresh against a
+    // still-"partial" row.
+    if all_ok {
+        if let Some(h) = &inputs.history {
+            let records: Vec<ReceivedFileRecord> = files
+                .iter()
+                .filter_map(|(fid, st)| {
+                    let e = st.entry.as_ref()?;
+                    Some(ReceivedFileRecord {
+                        file_id: fid.clone(),
+                        relative_path: e.relative_path.clone(),
+                        size: e.size,
+                        hash_type: (!e.hash_type.is_empty()).then(|| e.hash_type.clone()),
+                        hash_value: (!e.hash_value.is_empty()).then(|| e.hash_value.clone()),
+                        status: "completed".to_string(),
+                    })
+                })
+                .collect();
+            (h.on_complete)(&tid, records);
+        }
+    } else {
+        // A receive that ends with incomplete files must surface a terminal
+        // event. Verified/StateChanged are discarded at the engine boundary, so
+        // without this the GUI tile would sit frozen at its last progress and
+        // History would not refresh to show the 'partial' row.
+        inputs
+            .events
+            .emit(TransferEvent::StateChanged {
+                transfer_id: tid.clone(),
+                state: TransferState::Failed(TransferFailed {
+                    error_code: "incomplete",
+                    error_message: err_msg.clone(),
+                    retryable: false,
+                    part_kept: true,
+                }),
+            })
+            .await;
+        inputs
+            .events
+            .emit(TransferEvent::Failed {
+                transfer_id: tid.clone(),
+                error_code: "incomplete".into(),
+                retryable: false,
+                part_kept: true,
+            })
+            .await;
     }
 
     let verified = TransferVerified {

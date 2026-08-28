@@ -41,6 +41,7 @@ async fn dropped_chunk_retransmitted_and_completes() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr = tokio::spawn(run_sender(s));
     let rr = tokio::spawn(run_receiver(r));

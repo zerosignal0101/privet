@@ -106,6 +106,38 @@ async fn recv_command(
     }
 }
 
+/// Sends a data frame, translating a peer STOP_SENDING (the receiver cancelled
+/// mid-transfer and dropped its read side) into the same Cancelled outcome as a
+/// Cancel control frame: emit the terminal event and return `Cancelled` rather
+/// than surfacing an abort the reconnect loop would otherwise retry. A receiver
+/// cancel must never make the sender reconnect and re-send the whole transfer.
+async fn send_data_frame(
+    data: &mut Box<dyn crate::DataChannel>,
+    events: &mut Box<dyn TransferEventSink>,
+    tid: &str,
+    frame: DataFrame,
+    raw: Option<&[u8]>,
+) -> Result<()> {
+    if let Err(e) = data.send(frame, raw).await {
+        if matches!(&e, TransferError::Aborted(_)) {
+            events
+                .emit(TransferEvent::StateChanged {
+                    transfer_id: tid.to_string(),
+                    state: TransferState::Cancelled,
+                })
+                .await;
+            events
+                .emit(TransferEvent::Cancelled {
+                    transfer_id: tid.to_string(),
+                })
+                .await;
+            return Err(TransferError::Cancelled("peer".into()));
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
     let tid = inputs.transfer_id.clone();
     let total_bytes = inputs.prepared.summary.total_bytes;
@@ -158,18 +190,65 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
             .await?;
     }
 
-    let accept_frame = recv_control(&mut inputs.control).await?;
-    let (resume, accepted) = match accept_frame.payload {
-        Some(CPayload::TransferAccept(a)) => {
-            use std::collections::HashMap;
-            let r: HashMap<(String, u32), Vec<u8>> = a
-                .resume
-                .iter()
-                .map(|bm| ((bm.file_id.clone(), bm.segment_id), bm.bitmask.clone()))
-                .collect();
-            (r, a.accept)
-        }
-        _ => return Err(TransferError::Protocol("expected TransferAccept".into())),
+    // The receiver has its own 30s decision window; if it has not answered by
+    // then, treat a silent connection as a decline so the transfer terminates
+    // instead of hanging forever with no terminal event for the GUI. The tile
+    // offers Cancel during this negotiation, so a user command must interrupt
+    // the wait as well — before this the command channel was never polled here.
+    let (resume, accepted) = loop {
+        tokio::select! {
+            biased;
+            cmd = recv_command(inputs.cmd_rx.clone()), if inputs.cmd_rx.is_some() => {
+                match cmd {
+                    Some(crate::control::TransferCommand::Cancel) => {
+                        let _ = inputs.control.send(ControlFrame {
+                            payload: Some(CPayload::Control(ControlMessage {
+                                msg: Some(privet_protocol::control_message::Msg::Cancel(
+                                    privet_protocol::Cancel {
+                                        transfer_id: tid.clone(),
+                                        reason: "user".into(),
+                                    },
+                                )),
+                            })),
+                        }).await;
+                        inputs.events.emit(TransferEvent::StateChanged {
+                            transfer_id: tid.clone(), state: TransferState::Cancelled }).await;
+                        inputs.events.emit(TransferEvent::Cancelled { transfer_id: tid.clone() }).await;
+                        // Not a completion: the core relies on a Cancelled error
+                        // here to skip recording this send as 'completed'.
+                        return Err(TransferError::Cancelled("user".into()));
+                    }
+                    // Pause/resume have no meaning before the receiver accepts;
+                    // ignore them and keep waiting for the decision.
+                    Some(_) => continue,
+                    // Channel closed means the registry dropped us; don't spin.
+                    None => return Err(TransferError::Protocol("command channel closed".into())),
+                }
+            }
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                recv_control(&mut inputs.control),
+            ) => {
+                match result {
+                    Ok(Ok(frame)) => match frame.payload {
+                        Some(CPayload::TransferAccept(a)) => {
+                            let r: HashMap<(String, u32), Vec<u8>> = a
+                                .resume
+                                .iter()
+                                .map(|bm| ((bm.file_id.clone(), bm.segment_id), bm.bitmask.clone()))
+                                .collect();
+                            break (r, a.accept);
+                        }
+                        _ => return Err(TransferError::Protocol("expected TransferAccept".into())),
+                    },
+                    // Transport failure: let the caller's reconnect loop decide.
+                    Ok(Err(e)) => return Err(e),
+                    // No answer within the window (the receiver's reject was
+                    // lost, or it never made a decision): declined.
+                    Err(_) => break (HashMap::new(), false),
+                }
+            }
+        };
     };
     if !accepted {
         inputs
@@ -185,7 +264,9 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                 transfer_id: tid.clone(),
             })
             .await;
-        return Ok(());
+        // A silent connection treated as a decline is not a completion either;
+        // leave the history row 'partial' instead of 'completed'.
+        return Err(TransferError::Declined("no_answer".into()));
     }
     inputs
         .events
@@ -229,14 +310,16 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                 hash_value: f.file_hash.clone(),
                 data,
             };
-            inputs.data[0]
-                .send(
-                    DataFrame {
-                        payload: Some(DPayload::InlineFile(inline)),
-                    },
-                    None,
-                )
-                .await?;
+            send_data_frame(
+                &mut inputs.data[0],
+                &mut inputs.events,
+                &tid,
+                DataFrame {
+                    payload: Some(DPayload::InlineFile(inline)),
+                },
+                None,
+            )
+            .await?;
             continue;
         }
         for seg in &f.segments {
@@ -331,14 +414,16 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                     offset: w.offset,
                     length: w.length as u64,
                 };
-                inputs.data[0]
-                    .send(
-                        DataFrame {
-                            payload: Some(DPayload::ChunkHeader(header)),
-                        },
-                        Some(&chunk_data),
-                    )
-                    .await?;
+                send_data_frame(
+                    &mut inputs.data[0],
+                    &mut inputs.events,
+                    &tid,
+                    DataFrame {
+                        payload: Some(DPayload::ChunkHeader(header)),
+                    },
+                    Some(&chunk_data),
+                )
+                .await?;
                 tracker.track(w.key.clone());
                 cursor += 1;
             }
@@ -363,7 +448,7 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                         inputs.events.emit(TransferEvent::StateChanged {
                             transfer_id: tid.clone(), state: TransferState::Cancelled }).await;
                         inputs.events.emit(TransferEvent::Cancelled { transfer_id: tid.clone() }).await;
-                        return Ok(());
+                        return Err(TransferError::Cancelled("user".into()));
                     }
                     Some(crate::control::TransferCommand::Pause) => {
                         paused = true;
@@ -419,7 +504,7 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                                 transfer_id: tid.clone(), state: TransferState::Cancelled,
                             }).await;
                             inputs.events.emit(TransferEvent::Cancelled { transfer_id: tid.clone() }).await;
-                            return Ok(());
+                            return Err(TransferError::Cancelled("peer".into()));
                         }
                         Some(CPayload::Control(ControlMessage {
                             msg: Some(privet_protocol::control_message::Msg::Pause(_)),
@@ -484,15 +569,16 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                             offset: w.offset,
                             length: w.length as u64,
                         };
-                        inputs
-                            .data[0]
-                            .send(
-                                DataFrame {
-                                    payload: Some(DPayload::ChunkHeader(header)),
-                                },
-                                Some(&chunk_data),
-                            )
-                            .await?;
+                        send_data_frame(
+                            &mut inputs.data[0],
+                            &mut inputs.events,
+                            &tid,
+                            DataFrame {
+                                payload: Some(DPayload::ChunkHeader(header)),
+                            },
+                            Some(&chunk_data),
+                        )
+                        .await?;
                         tracker.record_retry(key);
                     }
                 }
@@ -551,7 +637,7 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                     .events
                     .emit(TransferEvent::Cancelled { transfer_id: tid })
                     .await;
-                return Ok(());
+                return Err(TransferError::Cancelled("peer".into()));
             }
             _ => {
                 return Err(TransferError::Protocol(

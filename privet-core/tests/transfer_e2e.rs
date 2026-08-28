@@ -65,6 +65,7 @@ async fn send_chunked_file_over_quic() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         let result = run_receiver(inputs).await;
         (result, conn)
@@ -161,6 +162,7 @@ async fn send_inline_file_over_tcp() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         run_receiver(inputs).await
     };
@@ -255,6 +257,7 @@ async fn send_directory_over_quic() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         let result = run_receiver(inputs).await;
         (result, conn)
@@ -355,6 +358,7 @@ async fn inline_boundary_64kib_and_plus1() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         let result = run_receiver(inputs).await;
         (result, conn)
@@ -453,6 +457,7 @@ async fn send_chunked_file_over_tcp() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         run_receiver(inputs).await
     };
@@ -546,6 +551,7 @@ async fn large_file_over_quic() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         let result = run_receiver(inputs).await;
         (result, conn)
@@ -639,6 +645,7 @@ async fn large_file_over_tcp() {
             config: transfer_cfg.clone(),
             accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
             registry: None,
+            history: None,
         };
         run_receiver(inputs).await
     };

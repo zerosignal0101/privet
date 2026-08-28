@@ -17,6 +17,12 @@ fn engine(dir: &TempDir, name: &str) -> Engine {
         ..Default::default()
     };
     cfg.transport.mode = privet_transport::TransportMode::Quic;
+    // Don't bind the fixed discovery/transport ports: a dev privetd (or another
+    // test) may already hold 47808/47809. The handshake connects to the actual
+    // bound ports from `serve`, so ephemeral ports work here.
+    cfg.discovery.udp_port = 0;
+    cfg.transport.quic_port = 0;
+    cfg.transport.tcp_port = 0;
     std::fs::create_dir_all(cfg.save_dir.as_path()).ok();
     Engine::new(cfg)
 }

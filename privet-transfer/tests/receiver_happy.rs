@@ -52,6 +52,7 @@ async fn receiver_inline_file_lands_directly() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let h = tokio::spawn(run_receiver(inputs));
 
@@ -143,6 +144,7 @@ async fn receiver_empty_file_inline() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let h = tokio::spawn(run_receiver(inputs));
 

@@ -58,6 +58,7 @@ async fn reconnect_resumes_from_bitmask() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr1 = tokio::spawn(run_sender(s1));
     let rr1 = tokio::spawn(run_receiver(r1));
@@ -96,6 +97,7 @@ async fn reconnect_resumes_from_bitmask() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
     let sr2 = tokio::spawn(run_sender(s2));
     let rr2 = tokio::spawn(run_receiver(r2));
@@ -172,6 +174,7 @@ async fn reconnect_skips_via_resume_bitmask() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     }));
     tokio::time::timeout(Duration::from_secs(20), async {
         sr2.await.unwrap().unwrap();

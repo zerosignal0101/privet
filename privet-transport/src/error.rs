@@ -31,4 +31,14 @@ pub enum TransportError {
     TooLarge,
 }
 
+impl TransportError {
+    /// True when the peer deliberately stopped (STOP_SENDING) the stream — the
+    /// peer aborted the transfer, as opposed to a transport loss that could be
+    /// worth reconnecting for. privet's receiver issues exactly this when it
+    /// cancels mid-transfer, so the sender must not treat it as resumable.
+    pub fn is_peer_stream_stopped(&self) -> bool {
+        matches!(self, Self::QuicWrite(quinn::WriteError::Stopped(_)))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, TransportError>;

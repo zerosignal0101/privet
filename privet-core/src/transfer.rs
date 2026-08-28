@@ -13,7 +13,7 @@ use crate::adapters::transfer_sink::CoreTransferEventSink;
 use crate::connection::{
     acquire_control, acquire_data, connect_peer_with_ports, hello_exchange, ControlRole, DataRole,
 };
-use crate::reconnect::{reconnect_event, resumed_event, Backoff};
+use crate::reconnect::{reconnect_event, Backoff};
 use crate::EngineEvent;
 use privet_crypto::identity::Identity;
 
@@ -25,6 +25,7 @@ pub fn receiver_inputs(
     event_tx: broadcast::Sender<EngineEvent>,
     registry: Option<std::sync::Arc<privet_transfer::control::TransferRegistry>>,
     accept_policy: privet_transfer::control::AcceptPolicy,
+    history: Option<privet_transfer::ReceiveHistory>,
 ) -> ReceiverInputs {
     ReceiverInputs {
         control: Box::new(StreamControlChannel::new(control)),
@@ -34,6 +35,7 @@ pub fn receiver_inputs(
         config: cfg,
         accept_policy,
         registry,
+        history,
     }
 }
 
@@ -94,8 +96,10 @@ pub async fn receive_over_connection(
     event_tx: broadcast::Sender<EngineEvent>,
     registry: Option<std::sync::Arc<privet_transfer::control::TransferRegistry>>,
     accept_policy: privet_transfer::control::AcceptPolicy,
+    history: Option<privet_transfer::ReceiveHistory>,
 ) -> crate::Result<()> {
-    let inputs = receiver_inputs(control, data, store, cfg, event_tx, registry, accept_policy);
+    let inputs =
+        receiver_inputs(control, data, store, cfg, event_tx, registry, accept_policy, history);
     Ok(privet_transfer::run_receiver(inputs).await?)
 }
 
@@ -209,10 +213,9 @@ pub async fn send_with_reconnect_endpoints(
             cmd_rx.clone(),
         );
         match privet_transfer::run_sender(inputs).await {
-            Ok(()) => {
-                let _ = event_tx.send(resumed_event(&transfer_id));
-                return Ok(());
-            }
+            // `run_sender` already emits the terminal event (Completed or
+            // Cancelled); don't tack on a spurious `transfer_resumed` on top.
+            Ok(()) => return Ok(()),
             Err(TransferError::TransportLost) | Err(TransferError::Transport(_)) => {
                 if !next_backoff_or_exhausted(backoff, &transfer_id, &event_tx).await {
                     return Err(CoreError::Transfer(TransferError::TransportLost));

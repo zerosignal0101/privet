@@ -52,6 +52,7 @@ async fn cancel_mid_transfer_stops_sender_keeps_part() {
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     };
 
     let sr = tokio::spawn(run_sender(s));
@@ -70,9 +71,19 @@ async fn cancel_mid_transfer_stops_sender_keeps_part() {
         })
         .await;
 
-    // Both should finish (not hang)
+    // The sender must report a cancellation, NOT Ok: the core relies on that to
+    // avoid recording a cancelled send's history as 'completed'. The receiver may
+    // observe the sender stop mid-stream, so its own return value is
+    // transport-dependent — we only require that it doesn't hang.
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = sr.await;
+        let sender_result = sr.await.expect("sender task join failed");
+        assert!(
+            matches!(
+                sender_result,
+                Err(privet_transfer::error::TransferError::Cancelled(_))
+            ),
+            "sender must report Cancelled, got {sender_result:?}"
+        );
         let _ = rr.await;
     })
     .await;

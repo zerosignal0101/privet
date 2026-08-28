@@ -36,6 +36,7 @@ fn make_receiver_inputs(
         },
         accept_policy: privet_transfer::control::AcceptPolicy::AutoAccept,
         registry: None,
+        history: None,
     }
 }
 
