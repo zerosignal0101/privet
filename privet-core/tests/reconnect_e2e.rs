@@ -15,6 +15,7 @@ use privet_transfer::control::AcceptPolicy;
 use privet_transfer::prepare::prepare_dir;
 use privet_transfer::CollisionPolicy;
 use privet_transfer::FsPartStore;
+use privet_transfer::StreamControlChannel;
 use privet_transfer::TransferEngineConfig;
 use privet_transport::{QuicTransport, Transport, TransportMode};
 use tempfile::TempDir;
@@ -194,7 +195,7 @@ async fn drop_mid_transfer_then_resume() {
             .unwrap();
 
         let mut r1 = tokio::spawn(receive_over_connection(
-            ctrl1,
+            Box::new(StreamControlChannel::new(ctrl1)),
             data1,
             FsPartStore::new(recv_save.clone()),
             recv_cfg.clone(),
@@ -240,7 +241,7 @@ async fn drop_mid_transfer_then_resume() {
             .await
             .unwrap();
         receive_over_connection(
-            ctrl2,
+            Box::new(StreamControlChannel::new(ctrl2)),
             data2,
             FsPartStore::new(recv_save),
             recv_cfg,

@@ -225,18 +225,21 @@ pub fn prepare_paths(
 
 use std::sync::Arc;
 
+use privet_protocol::control_frame::Payload;
+use privet_protocol::ControlFrame;
 use privet_security::cert::extract_spki;
 use privet_security::code::Now;
 use privet_transfer::receiver::ReceivedFileRecord;
-use privet_transfer::CollisionPolicy;
-use privet_transport::{Connection, Transport};
+use privet_transfer::{CollisionPolicy, StreamControlChannel};
+use privet_transport::frame_io::{recv_control, send_control};
+use privet_transport::{Connection, Stream, Transport};
 
 use crate::auth::{decide_auth, peer_session_inputs_with_config, AuthPlan};
 use crate::connection::{
     acquire_control, acquire_data, hello_exchange_responder, ControlRole, DataRole,
 };
-use crate::pairing::{StreamPairingChannel, SystemPairingClock};
-use crate::transfer::receive_over_connection;
+use crate::pairing::{BufferedPairingChannel, StreamPairingChannel, SystemPairingClock};
+use crate::transfer::{receive_over_connection, SeededControlChannel};
 use crate::EngineEvent;
 
 pub struct SendOutcome {
@@ -326,10 +329,28 @@ impl Engine {
 
         if let Some(did) = &pa.device_fingerprint {
             let db = self.db_conn()?;
-            let rec = privet_storage::trust::get_trust(&db, did)
-                .map_err(crate::CoreError::Storage)?
-                .ok_or_else(|| crate::CoreError::NotPaired(did.clone()))?;
-            if rec.trust_state != "Trusted" {
+            let rec = privet_storage::trust::get_trust(&db, did).map_err(crate::CoreError::Storage)?;
+            let trusted = matches!(rec.as_ref(), Some(r) if r.trust_state == "Trusted");
+            if !trusted {
+                // Record the refusal so the user sees *why* the send failed and
+                // can re-pair; before this a not-paired send returned before the
+                // history row was written, leaving no record at all.
+                let _ = privet_storage::history::insert_history(
+                    &db,
+                    &history::NewTransfer {
+                        transfer_id: &transfer_id,
+                        direction: history::TransferDirection::Send,
+                        peer_device_fingerprint: pa.device_fingerprint.as_deref(),
+                        peer_name: pa.peer_name.as_deref(),
+                        root_name: as_name,
+                        file_count: 0,
+                        total_bytes: 0,
+                        status: history::TransferStatus::Failed,
+                        started_ts: now,
+                        save_dir: None,
+                        send_intent: "{}",
+                    },
+                );
                 return Err(crate::CoreError::NotPaired(did.clone()));
             }
         }
@@ -571,7 +592,7 @@ impl Engine {
         // resumed (mirroring the receiver's own 'partial' row). Returning Ok
         // here also stops the daemon from publishing a spurious
         // `transfer_failed` on a cancellation the user already saw.
-        match send_result {
+        let send_result = match send_result {
             Err(crate::CoreError::Transfer(
                 privet_transfer::TransferError::Cancelled(_)
                 | privet_transfer::TransferError::Declined(_),
@@ -582,8 +603,19 @@ impl Engine {
                     total_bytes,
                 });
             }
-            other => other?,
+            other => other,
+        };
+        // Any other failure is terminal for this attempt. Mark the history row
+        // 'failed' (with the reason and a finish time) so the send shows up in
+        // History as failed and is resendable — before this a failed send sat
+        // as 'partial' forever with no record of what happened. The daemon also
+        // publishes `transfer_failed` for the GUI tile.
+        if let Err(error) = &send_result {
+            if let Ok(db) = self.db_conn() {
+                let _ = privet_storage::history::mark_failed(&db, &transfer_id, &error.to_string());
+            }
         }
+        send_result?;
 
         if let Some(did) = &pa.device_fingerprint {
             let now = SystemPairingClock.now_ms() as i64 / 1000;
@@ -790,205 +822,386 @@ async fn handle_inbound(
         .ok_or_else(|| crate::CoreError::Internal("peer cert unavailable".into()))?;
     let peer_spki = extract_spki(&cert)?;
     let plan = decide_auth(&peer_spki, &hello.device_fingerprint, trust)?;
+
+    // The initiator's first control frame after the hello tells us what it
+    // wants: a `TransferOffer` means it is sending files, a `PairingInit`
+    // means it wants to pair. Reading it up front lets a *trusted* peer that
+    // is initiating a fresh pairing (it forgot/revoked us and is re-entering
+    // our code) be handled as a pairing instead of being codeless-accepted as
+    // a transfer that never arrives. Both initiators send their opening frame
+    // right after hello, so the wait is short.
+    let first = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        recv_control(ctrl.as_mut()),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => Some(frame),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "inbound: first frame read error");
+            return Err(e.into());
+        }
+        Err(_) => {
+            tracing::warn!("inbound: no first frame within 3s");
+            return Ok(()); // silent peer: nothing to do
+        }
+    };
+    let is_transfer = matches!(
+        first.as_ref().and_then(|f| f.payload.as_ref()),
+        Some(Payload::TransferOffer(_))
+    );
+    let is_pairing = matches!(
+        first.as_ref().and_then(|f| f.payload.as_ref()),
+        Some(Payload::PairingInit(_))
+    );
+
+    let reason = match &plan {
+        AuthPlan::FailClosedAlert => "key_mismatch",
+        AuthPlan::Reject => "revoked",
+        _ => "rejected",
+    };
+
     match plan {
         AuthPlan::AcceptCodeless => {
-            tracing::info!("inbound: trusted peer, codeless accept");
-            let accept_policy = runtime.effective_accept_policy();
-            let on_collision = runtime.on_collision();
-            let save_dir = runtime.save_dir();
-            let data = acquire_data(conn.as_ref(), DataRole::Responder).await?;
-            let mut store_cfg = cfg.clone();
-            store_cfg.on_collision = on_collision;
-            store_cfg.save_dir = save_dir.clone();
-            // Persist receive history (partial on offer, completed with file
-            // rows before the terminal event). The closures capture the DB, the
-            // landing dir and the peer identity from the hello exchange.
-            let history = {
-                let peer_fp = hello.device_fingerprint.clone();
-                let peer_name = hello.device_name.clone();
-                let save_dir_str = save_dir.to_string_lossy().into_owned();
-                let db_offer = db.clone();
-                let db_complete = db.clone();
-                let on_offer =
-                    move |transfer_id: &str,
-                          root_name: Option<String>,
-                          file_count: u64,
-                          total_bytes: u64| {
+            if is_transfer {
+                // Trusted peer sending a transfer — codeless accept. The offer
+                // already read is handed back so the receiver never misses it.
+                tracing::info!("inbound: trusted peer, codeless accept");
+                let accept_policy = runtime.effective_accept_policy();
+                let on_collision = runtime.on_collision();
+                let save_dir = runtime.save_dir();
+                let data = acquire_data(conn.as_ref(), DataRole::Responder).await?;
+                let mut store_cfg = cfg.clone();
+                store_cfg.on_collision = on_collision;
+                store_cfg.save_dir = save_dir.clone();
+                // Persist receive history (partial on offer, completed with file
+                // rows before the terminal event). The closures capture the DB,
+                // the landing dir and the peer identity from the hello exchange.
+                let history = {
+                    let peer_fp = hello.device_fingerprint.clone();
+                    let peer_name = hello.device_name.clone();
+                    let save_dir_str = save_dir.to_string_lossy().into_owned();
+                    let db_offer = db.clone();
+                    let db_complete = db.clone();
+                    let on_offer =
+                        move |transfer_id: &str,
+                              root_name: Option<String>,
+                              file_count: u64,
+                              total_bytes: u64| {
+                            let now = now_secs();
+                            match db_offer.lock() {
+                                Ok(conn) => {
+                                    let r = history::insert_history(
+                                        &conn,
+                                        &history::NewTransfer {
+                                            transfer_id,
+                                            direction: history::TransferDirection::Receive,
+                                            peer_device_fingerprint: Some(&peer_fp),
+                                            peer_name: Some(&peer_name),
+                                            root_name: root_name.as_deref(),
+                                            file_count,
+                                            total_bytes,
+                                            status: history::TransferStatus::Partial,
+                                            started_ts: now,
+                                            save_dir: Some(&save_dir_str),
+                                            send_intent: "{}",
+                                        },
+                                    );
+                                    if let Err(e) = r {
+                                        tracing::warn!(transfer_id, error = %e, "receive history: offer insert failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
+                            }
+                        };
+                    let on_complete = move |transfer_id: &str, records: Vec<ReceivedFileRecord>| {
                         let now = now_secs();
-                        match db_offer.lock() {
+                        match db_complete.lock() {
                             Ok(conn) => {
-                                let r = history::insert_history(
-                                    &conn,
-                                    &history::NewTransfer {
-                                        transfer_id,
-                                        direction: history::TransferDirection::Receive,
-                                        peer_device_fingerprint: Some(&peer_fp),
-                                        peer_name: Some(&peer_name),
-                                        root_name: root_name.as_deref(),
-                                        file_count,
-                                        total_bytes,
-                                        status: history::TransferStatus::Partial,
-                                        started_ts: now,
-                                        save_dir: Some(&save_dir_str),
-                                        send_intent: "{}",
-                                    },
-                                );
-                                if let Err(e) = r {
-                                    tracing::warn!(transfer_id, error = %e, "receive history: offer insert failed");
+                                let files: Vec<history::FileRow<'_>> = records
+                                    .iter()
+                                    .map(|r| history::FileRow {
+                                        file_id: &r.file_id,
+                                        relative_path: &r.relative_path,
+                                        size: r.size,
+                                        hash_type: r.hash_type.as_deref(),
+                                        hash_value: r.hash_value.as_deref(),
+                                        status: &r.status,
+                                        source_path: None,
+                                    })
+                                    .collect();
+                                if let Err(e) = history::complete_history(&conn, transfer_id, &files, now) {
+                                    tracing::warn!(transfer_id, error = %e, "receive history: complete failed");
                                 }
                             }
                             Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
                         }
                     };
-                let on_complete = move |transfer_id: &str, records: Vec<ReceivedFileRecord>| {
-                    let now = now_secs();
-                    match db_complete.lock() {
-                        Ok(conn) => {
-                            let files: Vec<history::FileRow<'_>> = records
-                                .iter()
-                                .map(|r| history::FileRow {
-                                    file_id: &r.file_id,
-                                    relative_path: &r.relative_path,
-                                    size: r.size,
-                                    hash_type: r.hash_type.as_deref(),
-                                    hash_value: r.hash_value.as_deref(),
-                                    status: &r.status,
-                                    source_path: None,
-                                })
-                                .collect();
-                            if let Err(e) = history::complete_history(&conn, transfer_id, &files, now) {
-                                tracing::warn!(transfer_id, error = %e, "receive history: complete failed");
+                    let db_fileset = db.clone();
+                    // The receiver only learned the file manifest after the
+                    // offer (FileSetBatch), so persist the per-file rows here —
+                    // before data flows — instead of only in complete_history. A
+                    // partial/interrupted receive then lists its files (with the
+                    // landing path) in history, mirroring insert_send_files on
+                    // the send side; complete_history upgrades them on success.
+                    let on_fileset = move |transfer_id: &str, entries: Vec<privet_protocol::FileEntry>| {
+                        let files: Vec<history::FileRow<'_>> = entries
+                            .iter()
+                            .map(|e| history::FileRow {
+                                file_id: &e.file_id,
+                                relative_path: &e.relative_path,
+                                size: e.size,
+                                hash_type: if e.hash_type.is_empty() {
+                                    None
+                                } else {
+                                    Some(e.hash_type.as_str())
+                                },
+                                hash_value: if e.hash_value.is_empty() {
+                                    None
+                                } else {
+                                    Some(e.hash_value.as_str())
+                                },
+                                status: "failed",
+                                source_path: None,
+                            })
+                            .collect();
+                        match db_fileset.lock() {
+                            Ok(conn) => {
+                                if let Err(e) = history::insert_send_files(&conn, transfer_id, &files) {
+                                    tracing::warn!(transfer_id, error = %e, "receive history: fileset insert failed");
+                                }
                             }
-                        }
-                        Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
-                    }
-                };
-                let db_fileset = db.clone();
-                // The receiver only learned the file manifest after the offer
-                // (FileSetBatch), so persist the per-file rows here — before
-                // data flows — instead of only in complete_history. A partial/
-                // interrupted receive then lists its files (with the landing
-                // path) in history, mirroring insert_send_files on the send
-                // side; complete_history upgrades the rows on success.
-                let on_fileset = move |transfer_id: &str, entries: Vec<privet_protocol::FileEntry>| {
-                    let files: Vec<history::FileRow<'_>> = entries
-                        .iter()
-                        .map(|e| history::FileRow {
-                            file_id: &e.file_id,
-                            relative_path: &e.relative_path,
-                            size: e.size,
-                            hash_type: if e.hash_type.is_empty() {
-                                None
-                            } else {
-                                Some(e.hash_type.as_str())
-                            },
-                            hash_value: if e.hash_value.is_empty() {
-                                None
-                            } else {
-                                Some(e.hash_value.as_str())
-                            },
-                            status: "failed",
-                            source_path: None,
-                        })
-                        .collect();
-                    match db_fileset.lock() {
-                        Ok(conn) => {
-                            if let Err(e) = history::insert_send_files(&conn, transfer_id, &files) {
-                                tracing::warn!(transfer_id, error = %e, "receive history: fileset insert failed");
-                            }
-                        }
-                        Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
-                    }
-                };
-                Some(privet_transfer::ReceiveHistory {
-                    on_offer: Box::new(on_offer),
-                    on_fileset: Box::new(on_fileset),
-                    on_complete: Box::new(on_complete),
-                })
-            };
-            let recv = receive_over_connection(
-                ctrl,
-                data,
-                privet_transfer::FsPartStore::new(save_dir),
-                store_cfg,
-                event_tx,
-                Some(registry),
-                accept_policy,
-                history,
-            )
-            .await;
-            if recv.is_ok() {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-            recv
-        }
-        AuthPlan::TriggerPairing => {
-            tracing::info!("inbound: unknown peer, trigger pairing");
-            let code = pending
-                .lock()
-                .map_err(|_| crate::CoreError::Internal("code lock".into()))?
-                .take();
-            match code {
-                Some(mut code) => {
-                    let inputs = match peer_session_inputs_with_config(
-                        conn.as_ref(),
-                        code.code().to_string(),
-                        hello.device_fingerprint.clone(),
-                        hello.device_name.clone(),
-                        pairing_cfg,
-                    ) {
-                        Ok(inputs) => inputs,
-                        Err(error) => {
-                            if let Ok(mut slot) = pending.lock() {
-                                *slot = Some(code);
-                            }
-                            return Err(error);
+                            Err(e) => tracing::warn!(transfer_id, error = %e, "receive history: db lock"),
                         }
                     };
-                    let mut ch = StreamPairingChannel::new(ctrl);
-                    let clock = SystemPairingClock;
-                    let pr = privet_security::session::run_responder_checked(
-                        identity,
-                        &inputs,
-                        &mut code,
-                        &mut ch,
-                        &clock,
-                        trust,
-                        pake,
-                    )
-                    .await;
-                    if !code.is_consumed()
-                        && code.check_valid(clock.now_ms()).is_ok()
-                    {
-                        if let Ok(mut slot) = pending.lock() {
-                            *slot = Some(code);
-                        }
-                    }
-                    let _ = pr?;
+                    Some(privet_transfer::ReceiveHistory {
+                        on_offer: Box::new(on_offer),
+                        on_fileset: Box::new(on_fileset),
+                        on_complete: Box::new(on_complete),
+                    })
+                };
+                let offer_frame = first.expect("transfer offer frame");
+                let control = Box::new(SeededControlChannel::new(
+                    Box::new(StreamControlChannel::new(ctrl)),
+                    offer_frame,
+                ));
+                let recv = receive_over_connection(
+                    control,
+                    data,
+                    privet_transfer::FsPartStore::new(save_dir),
+                    store_cfg,
+                    event_tx,
+                    Some(registry),
+                    accept_policy,
+                    history,
+                )
+                .await;
+                if recv.is_ok() {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    Ok(())
                 }
-                None => {
-                    let _ = event_tx.send(EngineEvent::PairingResult {
-                        device_fingerprint: hello.device_fingerprint,
-                        success: false,
-                        error: Some("no pending pairing".into()),
-                    });
-                    Ok(())
-                }
+                recv
+            } else if is_pairing {
+                // A trusted peer initiating a fresh pairing (it dropped us and
+                // is re-entering our code): run the responder session instead
+                // of codeless-accepting a transfer that will never come.
+                tracing::info!("inbound: trusted peer initiates pairing");
+                run_responder_pairing(
+                    conn.as_ref(),
+                    identity,
+                    trust,
+                    pending,
+                    pake,
+                    pairing_cfg,
+                    &event_tx,
+                    &hello.device_fingerprint,
+                    &hello.device_name,
+                    ctrl,
+                    first,
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        }
+        AuthPlan::TriggerPairing => {
+            if is_pairing {
+                // Unknown peer initiating a pairing (e.g. it scanned our QR
+                // code). Run the responder session, feeding the consumed
+                // PairingInit back into it.
+                run_responder_pairing(
+                    conn.as_ref(),
+                    identity,
+                    trust,
+                    pending,
+                    pake,
+                    pairing_cfg,
+                    &event_tx,
+                    &hello.device_fingerprint,
+                    &hello.device_name,
+                    ctrl,
+                    first,
+                )
+                .await
+            } else {
+                // An unknown peer sending a transfer. We don't trust it, so
+                // decline with a reason: the sender fails fast with a clear
+                // message instead of timing out against a silent connection.
+                tracing::info!("inbound: unknown peer, reject transfer");
+                decline_inbound(ctrl.as_mut(), "peer_not_trusted").await;
+                Ok(())
             }
         }
         AuthPlan::Reject | AuthPlan::FailClosedAlert => {
             tracing::warn!("inbound: rejected/fail-closed");
-            let _ = event_tx.send(EngineEvent::PairingResult {
-                device_fingerprint: hello.device_fingerprint,
-                success: false,
-                error: Some("rejected".into()),
-            });
+            if is_pairing {
+                // A revoked/key-mismatched peer trying to pair: refuse the
+                // session with a clear reason.
+                let _ = send_control(
+                    ctrl.as_mut(),
+                    &ControlFrame {
+                        payload: Some(Payload::PairingResult(privet_protocol::PairingResult {
+                            success: false,
+                            error: reason.to_string(),
+                            identity_pubkey: Vec::new(),
+                            transcript_sig: Vec::new(),
+                        })),
+                    },
+                )
+                .await;
+            } else {
+                // A revoked/key-mismatched peer sending a transfer: decline.
+                decline_inbound(ctrl.as_mut(), reason).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             Ok(())
         }
     }
 }
+
+/// Decline an inbound transfer offer with a machine-readable reason so the
+/// sender fails fast with a clear message instead of timing out against a
+/// silently-closed connection.
+async fn decline_inbound(ctrl: &mut dyn Stream, reason: &str) {
+    let _ = send_control(
+        ctrl,
+        &ControlFrame {
+            payload: Some(Payload::TransferAccept(privet_protocol::TransferAccept {
+                accept: false,
+                reason: reason.to_string(),
+                resume: Vec::new(),
+            })),
+        },
+    )
+    .await;
+    // Give the QUIC driver time to transmit the decline before the connection
+    // is implicitly closed (dropping the last handle discards queued writes).
+    // Without this the sender sees only a transport loss and retries the whole
+    // transfer instead of failing fast with the reason.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+}
+
+/// Run the responder side of a pairing session for an inbound connection.
+/// Shared by the unknown-peer (QR scan) and trusted-peer-repairing paths.
+/// `first` is the initiator's opening frame — if `handle_inbound` already read
+/// it to learn the initiator's intent (a `PairingInit`), it is fed back into
+/// the session so the responder sees it first.
+#[allow(clippy::too_many_arguments)]
+async fn run_responder_pairing(
+    conn: &dyn Connection,
+    identity: &privet_crypto::identity::Identity,
+    trust: &dyn privet_security::trust::TrustStore,
+    pending: &std::sync::Mutex<Option<privet_security::code::PairingCode>>,
+    pake: &privet_crypto::pake::Spake2Backend,
+    pairing_cfg: &privet_security::PairingConfig,
+    event_tx: &tokio::sync::broadcast::Sender<EngineEvent>,
+    hello_fingerprint: &str,
+    hello_name: &str,
+    ctrl: Box<dyn Stream>,
+    first: Option<ControlFrame>,
+) -> crate::Result<()> {
+    let code = pending
+        .lock()
+        .map_err(|_| crate::CoreError::Internal("code lock".into()))?
+        .take();
+    let Some(mut code) = code else {
+        let _ = event_tx.send(EngineEvent::PairingResult {
+            device_fingerprint: hello_fingerprint.to_string(),
+            success: false,
+            error: Some("no pending pairing".into()),
+        });
+        return Ok(());
+    };
+    let inputs = match peer_session_inputs_with_config(
+        conn,
+        code.code().to_string(),
+        hello_fingerprint.to_string(),
+        hello_name.to_string(),
+        pairing_cfg,
+    ) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            tracing::warn!(
+                device_fingerprint = %hello_fingerprint,
+                %error,
+                "pairing: responder session inputs failed"
+            );
+            if let Ok(mut slot) = pending.lock() {
+                *slot = Some(code);
+            }
+            return Err(error);
+        }
+    };
+    let mut ch = BufferedPairingChannel::new(StreamPairingChannel::new(ctrl), first);
+    let clock = SystemPairingClock;
+    let pr = privet_security::session::run_responder_checked(
+        identity,
+        &inputs,
+        &mut code,
+        &mut ch,
+        &clock,
+        trust,
+        pake,
+    )
+    .await;
+    match &pr {
+        Ok(privet_security::session::PairingOutcome::Paired { peer_device_fingerprint, .. }) => {
+            tracing::info!(
+                peer_device_fingerprint = %peer_device_fingerprint,
+                "pairing: responder paired"
+            );
+            let _ = event_tx.send(EngineEvent::PairingResult {
+                device_fingerprint: peer_device_fingerprint.clone(),
+                success: true,
+                error: None,
+            });
+        }
+        Ok(privet_security::session::PairingOutcome::Failed { reason }) => {
+            tracing::warn!(%reason, "pairing: responder failed");
+            let _ = event_tx.send(EngineEvent::PairingResult {
+                device_fingerprint: hello_fingerprint.to_string(),
+                success: false,
+                error: Some(format!("{reason:?}")),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%error, "pairing: responder error");
+            let _ = event_tx.send(EngineEvent::PairingResult {
+                device_fingerprint: hello_fingerprint.to_string(),
+                success: false,
+                error: Some(error.to_string()),
+            });
+        }
+    }
+    if !code.is_consumed() && code.check_valid(clock.now_ms()).is_ok() {
+        if let Ok(mut slot) = pending.lock() {
+            *slot = Some(code);
+        }
+    }
+    let _ = pr?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    Ok(())
+}
+
 
 impl Engine {
     pub async fn pair_initiate(

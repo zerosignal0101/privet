@@ -85,6 +85,18 @@ pub async fn run_initiator_with_config(
 
     let confirm = match channel.recv().await?.payload {
         Some(Payload::PairingConfirm(c)) => c,
+        // A responder that refuses us before confirming (we are revoked, our
+        // key mismatches, no code is pending) replies with a failed
+        // PairingResult instead of hanging or closing the connection.
+        Some(Payload::PairingResult(r)) if !r.success => {
+            return Err(if r.error.contains("revoked") {
+                PairingError::Revoked
+            } else if r.error.contains("key_mismatch") {
+                PairingError::KeyMismatch
+            } else {
+                PairingError::Protocol(r.error)
+            })
+        }
         _ => return Err(PairingError::Protocol("expected PairingConfirm".into())),
     };
     let out: PakeOutput = state_i.finish(&confirm.spake2_msg)?;

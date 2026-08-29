@@ -86,3 +86,78 @@ async fn pair_initiate_and_accept_succeed_over_quic() {
     serve.shutdown().await;
     let _ = receiver.shutdown().await;
 }
+
+/// Issue regression: a receiver that unilaterally drops (forgets) a sender,
+/// then re-pairs by entering the sender's code, used to time out. The sender
+/// still trusts the receiver, so the responder codeless-accepted the connection
+/// and waited for a transfer that never came. The responder must instead run
+/// the pairing session when a *trusted* peer initiates a pairing.
+#[tokio::test]
+async fn trusted_peer_initiating_pairing_runs_responder_session() {
+    let dir = TempDir::new().unwrap();
+    let mut s = engine(&dir, "s");
+    s.start().await.unwrap();
+    let r = engine(&dir, "r");
+
+    let clock = SystemPairingClock;
+    let code = PairingCode::generate_decimal(&clock).unwrap();
+    let code_str = code.code().to_string();
+
+    let serve_s = s
+        .serve(ServeOptions {
+            save_dir: dir.path().join("s"),
+            accept_all_trusted: false,
+            on_collision: CollisionPolicy::Rename,
+            accept_policy: privet_core::AcceptPolicy::AutoAccept,
+        })
+        .await
+        .unwrap();
+    s.set_pending_pair_code(code);
+
+    let mut quic_addr = serve_s.quic_addr;
+    quic_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut tcp_addr = serve_s.tcp_addr;
+    tcp_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    // Initial pairing: r (initiator) enters s's code.
+    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+        r.pair_initiate_with_ports(quic_addr, tcp_addr, code_str.clone())
+            .await
+    })
+    .await
+    .expect("pair timeout")
+    .expect("pair failed");
+    assert!(matches!(outcome, PairingOutcome::Paired { .. }));
+
+    // The receiver r drops the sender s (forget removes the trust row).
+    let s_fp = s.identity().fingerprint();
+    r.forget_peer(&s_fp).unwrap();
+
+    // s still trusts r. r re-enters a *new* code s displays. On s's side r is
+    // still Trusted — the connection must be treated as a pairing attempt.
+    let code2 = PairingCode::generate_decimal(&clock).unwrap();
+    let code2_str = code2.code().to_string();
+    s.set_pending_pair_code(code2);
+    let outcome2 = tokio::time::timeout(Duration::from_secs(15), async {
+        r.pair_initiate_with_ports(quic_addr, tcp_addr, code2_str)
+            .await
+    })
+    .await
+    .expect("re-pair timeout")
+    .expect("re-pair failed");
+    assert!(matches!(outcome2, PairingOutcome::Paired { .. }));
+
+    assert!(r
+        .list_trusted()
+        .unwrap()
+        .iter()
+        .any(|rec| rec.device_fingerprint == s_fp));
+    assert!(s
+        .list_trusted()
+        .unwrap()
+        .iter()
+        .any(|rec| rec.device_fingerprint == r.identity().fingerprint()));
+
+    serve_s.shutdown().await;
+    let _ = s.shutdown().await;
+}

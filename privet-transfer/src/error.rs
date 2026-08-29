@@ -5,6 +5,8 @@ use privet_protocol::error::PathError;
 pub enum TransferError {
     #[error("declined: {0}")]
     Declined(String),
+    #[error("rejected: {0}")]
+    Rejected(String),
     #[error("cancelled: {0}")]
     Cancelled(String),
     #[error("verify failed: {0}")]
@@ -47,6 +49,7 @@ impl TransferError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Declined(_) => "declined",
+            Self::Rejected(_) => "rejected",
             Self::Cancelled(_) => "cancelled",
             Self::VerifyFailed(_) => "verify_failed",
             Self::ChunkCorrupt => "chunk_corrupt",
@@ -70,6 +73,13 @@ impl TransferError {
             self,
             Self::TransportLost | Self::ChunkCorrupt | Self::VerifyFailed(_)
         )
+    }
+
+    /// Whether the peer refused the transfer outright (revoked / untrusted /
+    /// key mismatch). Such failures are terminal — retrying against a peer that
+    /// no longer trusts us will never succeed.
+    pub fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected(_))
     }
 }
 

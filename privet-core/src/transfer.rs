@@ -1,10 +1,10 @@
 
 use std::net::SocketAddr;
 
-use privet_protocol::DataFrame;
+use privet_protocol::{ControlFrame, DataFrame};
 use privet_transfer::{
-    FsPartStore, ReceiverInputs, SenderInputs, StreamControlChannel, StreamDataChannel,
-    TransferEngineConfig,
+    ControlChannel, FsPartStore, ReceiverInputs, SenderInputs, StreamControlChannel,
+    StreamDataChannel, TransferEngineConfig,
 };
 use privet_transport::{send_data, Stream, Transport, TransportMode};
 use tokio::sync::broadcast;
@@ -18,7 +18,7 @@ use crate::EngineEvent;
 use privet_crypto::identity::Identity;
 
 pub fn receiver_inputs(
-    control: Box<dyn Stream>,
+    control: Box<dyn ControlChannel>,
     data: Box<dyn Stream>,
     store: FsPartStore,
     cfg: TransferEngineConfig,
@@ -28,7 +28,7 @@ pub fn receiver_inputs(
     history: Option<privet_transfer::ReceiveHistory>,
 ) -> ReceiverInputs {
     ReceiverInputs {
-        control: Box::new(StreamControlChannel::new(control)),
+        control,
         data: vec![Box::new(StreamDataChannel::new(data))],
         store: Box::new(store),
         events: Box::new(CoreTransferEventSink::new(event_tx)),
@@ -88,8 +88,39 @@ pub async fn send_over_connection(
     Ok(privet_transfer::run_sender(inputs).await?)
 }
 
+/// A [`ControlChannel`] that yields a pre-read frame before delegating to the
+/// underlying stream. `handle_inbound` consumes the initiator's opening frame to
+/// learn whether it is pairing or sending a transfer; when it is a transfer, the
+/// consumed offer is handed back here so the receiver never misses it.
+pub struct SeededControlChannel {
+    inner: Box<dyn ControlChannel>,
+    seed: Option<ControlFrame>,
+}
+
+impl SeededControlChannel {
+    pub fn new(inner: Box<dyn ControlChannel>, seed: ControlFrame) -> Self {
+        Self {
+            inner,
+            seed: Some(seed),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ControlChannel for SeededControlChannel {
+    async fn send(&mut self, frame: ControlFrame) -> Result<(), privet_transfer::TransferError> {
+        self.inner.send(frame).await
+    }
+    async fn recv(&mut self) -> Result<ControlFrame, privet_transfer::TransferError> {
+        if let Some(frame) = self.seed.take() {
+            return Ok(frame);
+        }
+        self.inner.recv().await
+    }
+}
+
 pub async fn receive_over_connection(
-    control: Box<dyn Stream>,
+    control: Box<dyn ControlChannel>,
     data: Box<dyn Stream>,
     store: FsPartStore,
     cfg: TransferEngineConfig,

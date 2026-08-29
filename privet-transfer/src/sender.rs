@@ -14,7 +14,7 @@ use crate::events::{TransferEvent, TransferEventSink};
 use crate::fileset::{build_offer, FileSetBatcher};
 use crate::inflight::{ChunkKey, InFlightTracker};
 use crate::prepare::PreparedSet;
-use crate::state::TransferState;
+use crate::state::{TransferFailed, TransferState};
 
 pub trait ChunkReader: Send + Sync {
     fn read_chunk(&self, file_id: &str, offset: u64, length: usize) -> Result<Vec<u8>>;
@@ -232,12 +232,49 @@ pub async fn run_sender(mut inputs: SenderInputs) -> Result<()> {
                 match result {
                     Ok(Ok(frame)) => match frame.payload {
                         Some(CPayload::TransferAccept(a)) => {
-                            let r: HashMap<(String, u32), Vec<u8>> = a
-                                .resume
-                                .iter()
-                                .map(|bm| ((bm.file_id.clone(), bm.segment_id), bm.bitmask.clone()))
-                                .collect();
-                            break (r, a.accept);
+                            if a.accept {
+                                let r: HashMap<(String, u32), Vec<u8>> = a
+                                    .resume
+                                    .iter()
+                                    .map(|bm| {
+                                        ((bm.file_id.clone(), bm.segment_id), bm.bitmask.clone())
+                                    })
+                                    .collect();
+                                break (r, true);
+                            }
+                            // A decline with no reason (or the receiver's own
+                            // "declined") is a user decision — the transfer is
+                            // left resumable. Any other reason means the peer
+                            // refused us because it no longer trusts us (it
+                            // revoked or forgot us, or our key mismatches).
+                            // That is terminal: keep retrying would never
+                            // succeed, so fail fast and mark the history row.
+                            let reason = a.reason.clone();
+                            if reason.is_empty() || reason == "declined" {
+                                break (HashMap::new(), false);
+                            }
+                            inputs
+                                .events
+                                .emit(TransferEvent::StateChanged {
+                                    transfer_id: tid.clone(),
+                                    state: TransferState::Failed(TransferFailed {
+                                        error_code: "rejected",
+                                        error_message: reason.clone(),
+                                        retryable: false,
+                                        part_kept: false,
+                                    }),
+                                })
+                                .await;
+                            inputs
+                                .events
+                                .emit(TransferEvent::Failed {
+                                    transfer_id: tid.clone(),
+                                    error_code: "rejected".into(),
+                                    retryable: false,
+                                    part_kept: false,
+                                })
+                                .await;
+                            return Err(TransferError::Rejected(reason));
                         }
                         _ => return Err(TransferError::Protocol("expected TransferAccept".into())),
                     },

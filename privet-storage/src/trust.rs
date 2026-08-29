@@ -32,6 +32,28 @@ pub struct TrustRecord {
     pub revocation_reason: Option<String>,
 }
 
+/// Upsert a fresh pairing into the trust store. Re-pairing a peer that already
+/// has a row — e.g. one the user revoked earlier — must RE-TRUST it, not fail on
+/// the `device_fingerprint` UNIQUE constraint: a fresh, human-gated pairing code
+/// is a new authorization, so the revoked state is cleared and the (possibly
+/// rotated) key is recorded. This is what lets a user "Remove Trust" (forget)
+/// and then pair again on the initiator side.
+fn upsert_trust_sql() -> &'static str {
+    "INSERT INTO trust_store
+       (device_fingerprint, peer_spki, peer_device_name, trust_state, share_with_peers,
+        first_paired_ts, last_seen_ts)
+     VALUES (?1, ?2, ?3, 'Trusted', ?4, ?5, ?6)
+     ON CONFLICT(device_fingerprint) DO UPDATE SET
+       peer_spki = excluded.peer_spki,
+       peer_device_name = excluded.peer_device_name,
+       trust_state = 'Trusted',
+       share_with_peers = excluded.share_with_peers,
+       first_paired_ts = excluded.first_paired_ts,
+       last_seen_ts = excluded.last_seen_ts,
+       revoked_ts = NULL,
+       revocation_reason = NULL"
+}
+
 pub fn insert_paired(
     conn: &rusqlite::Connection,
     trust: &PeerTrust,
@@ -40,10 +62,7 @@ pub fn insert_paired(
     let tx = conn.unchecked_transaction()?;
     let res = (|| -> Result<(), rusqlite::Error> {
         tx.execute(
-            "INSERT INTO trust_store
-               (device_fingerprint, peer_spki, peer_device_name, trust_state, share_with_peers,
-                first_paired_ts, last_seen_ts)
-             VALUES (?1, ?2, ?3, 'Trusted', ?4, ?5, ?6)",
+            upsert_trust_sql(),
             rusqlite::params![
                 trust.device_fingerprint,
                 trust.peer_spki,
@@ -56,7 +75,13 @@ pub fn insert_paired(
         tx.execute(
             "INSERT INTO known_device_addresses
                (device_fingerprint, subnet_cidr, gateway_ip, addr, quic_port, tcp_port, source, last_seen_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(device_fingerprint, subnet_cidr, addr) DO UPDATE SET
+               gateway_ip = excluded.gateway_ip,
+               quic_port = excluded.quic_port,
+               tcp_port = excluded.tcp_port,
+               source = excluded.source,
+               last_seen_ts = excluded.last_seen_ts",
             rusqlite::params![
                 trust.device_fingerprint,
                 address.subnet_cidr,
@@ -81,10 +106,7 @@ pub fn insert_paired(
 
 pub fn insert_trust(conn: &rusqlite::Connection, trust: &PeerTrust) -> Result<(), StorageError> {
     conn.execute(
-        "INSERT INTO trust_store
-           (device_fingerprint, peer_spki, peer_device_name, trust_state, share_with_peers,
-            first_paired_ts, last_seen_ts)
-         VALUES (?1, ?2, ?3, 'Trusted', ?4, ?5, ?6)",
+        upsert_trust_sql(),
         rusqlite::params![
             trust.device_fingerprint,
             trust.peer_spki,
@@ -243,17 +265,37 @@ mod tests {
     }
 
     #[test]
-    fn insert_paired_atomic_rollback_on_dup() {
+    fn insert_paired_is_idempotent_upsert() {
+        // Re-recording a pairing for a device that already has a row (e.g. one
+        // the user revoked and is now re-pairing) must re-trust it, not fail on
+        // the fingerprint UNIQUE constraint, and must not duplicate addresses.
         let conn = db();
         insert_paired(&conn, &sample_trust("dev1"), &sample_addr()).unwrap();
-        let err = insert_paired(&conn, &sample_trust("dev1"), &sample_addr());
-        assert!(err.is_err());
+        revoke(&conn, "dev1", "user_request", 999).unwrap();
+        insert_paired(&conn, &sample_trust("dev1"), &sample_addr()).unwrap();
+        let r = get_trust(&conn, "dev1").unwrap().unwrap();
+        assert_eq!(r.trust_state, "Trusted");
+        assert_eq!(r.revoked_ts, None);
+        assert_eq!(r.revocation_reason, None);
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM known_device_addresses", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn insert_trust_retrusts_after_revoke() {
+        // The initiator/responder `commit_peer` path uses insert_trust; a
+        // revoked peer that completes a fresh pairing must be re-trusted.
+        let conn = db();
+        insert_trust(&conn, &sample_trust("dev1")).unwrap();
+        revoke(&conn, "dev1", "user_request", 999).unwrap();
+        insert_trust(&conn, &sample_trust("dev1")).unwrap();
+        let r = get_trust(&conn, "dev1").unwrap().unwrap();
+        assert_eq!(r.trust_state, "Trusted");
+        assert_eq!(r.revoked_ts, None);
     }
 
     #[test]

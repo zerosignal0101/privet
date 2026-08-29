@@ -289,9 +289,13 @@ pub fn mark_failed(
     transfer_id: &str,
     error: &str,
 ) -> Result<(), StorageError> {
+    let finished_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     conn.execute(
-        "UPDATE transfer_history SET status='failed', error=?1 WHERE transfer_id=?2",
-        rusqlite::params![error, transfer_id],
+        "UPDATE transfer_history SET status='failed', error=?1, finished_ts=?3 WHERE transfer_id=?2",
+        rusqlite::params![error, transfer_id, finished_ts],
     )?;
     Ok(())
 }

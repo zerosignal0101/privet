@@ -34,6 +34,34 @@ impl PairingChannel for StreamPairingChannel {
     }
 }
 
+/// A [`PairingChannel`] that yields a pre-read frame before delegating to the
+/// underlying stream. `handle_inbound` consumes the initiator's opening frame to
+/// learn whether it is pairing or sending; when it is a `PairingInit` it is fed
+/// back here so the responder session sees it first.
+pub struct BufferedPairingChannel {
+    inner: StreamPairingChannel,
+    buffered: Option<ControlFrame>,
+}
+
+impl BufferedPairingChannel {
+    pub fn new(inner: StreamPairingChannel, buffered: Option<ControlFrame>) -> Self {
+        Self { inner, buffered }
+    }
+}
+
+#[async_trait]
+impl PairingChannel for BufferedPairingChannel {
+    async fn send(&mut self, frame: ControlFrame) -> Result<(), PairingError> {
+        self.inner.send(frame).await
+    }
+    async fn recv(&mut self) -> Result<ControlFrame, PairingError> {
+        if let Some(frame) = self.buffered.take() {
+            return Ok(frame);
+        }
+        self.inner.recv().await
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemPairingClock;
 impl Now for SystemPairingClock {

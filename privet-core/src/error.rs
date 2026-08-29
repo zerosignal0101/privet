@@ -28,7 +28,10 @@ impl CoreError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Pairing(_) => "pairing",
-            Self::Transfer(_) => "transfer",
+            // Surface the specific failure (rejected / transport_lost / ...)
+            // so the GUI can show a readable message instead of a generic
+            // "transfer" for every failure.
+            Self::Transfer(t) => t.error_code(),
             Self::Transport(_) => "transport",
             Self::Storage(_) => "storage",
             Self::Crypto(_) => "crypto",

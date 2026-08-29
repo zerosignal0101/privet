@@ -11,9 +11,15 @@ fn engine_config_default_compiles() {
 fn core_error_maps_pairing_and_transfer() {
     let p = CoreError::from(privet_security::PairingError::CodeMismatch);
     let t = CoreError::from(privet_transfer::TransferError::Cancelled("x".into()));
+    let r = CoreError::from(privet_transfer::TransferError::Rejected("revoked".into()));
+    let tl = CoreError::from(privet_transfer::TransferError::TransportLost);
     let d = CoreError::from(privet_transport::TransportError::Unavailable("x".into()));
     assert_eq!(p.error_code(), "pairing");
-    assert_eq!(t.error_code(), "transfer");
+    // Transfer failures surface their specific code so the GUI can show a
+    // readable message, not a generic "transfer" for every failure.
+    assert_eq!(t.error_code(), "cancelled");
+    assert_eq!(r.error_code(), "rejected");
+    assert_eq!(tl.error_code(), "transport_lost");
     assert_eq!(d.error_code(), "transport");
 }
 
