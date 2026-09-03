@@ -79,18 +79,36 @@ impl Engine {
                 let recs =
                     privet_storage::addresses::recent_known(&db, id, privet_storage::RECENT_N)
                         .map_err(crate::CoreError::Storage)?;
-                let a = recs.first().ok_or_else(|| {
-                    crate::CoreError::NotPaired(format!("{id}: no known address"))
-                })?;
+                // A discovery sweep bumps every advertised endpoint of a peer
+                // (IPv4 + IPv6 + link-local) to the same fresh timestamp, so the
+                // newest row is not necessarily the most *usable* one. On a
+                // dual-stack LAN that would hand the send a link-local/global
+                // IPv6 address while the peer's listeners are reachable on IPv4
+                // (they bind 0.0.0.0). Prefer an IPv4 endpoint, falling back to
+                // the newest endpoint (IPv6 included) when the peer is v6-only.
+                let a = recs
+                    .iter()
+                    .find(|r| {
+                        r.addr
+                            .parse::<std::net::IpAddr>()
+                            .map_or(false, |ip| ip.is_ipv4())
+                    })
+                    .or_else(|| recs.first())
+                    .ok_or_else(|| {
+                        crate::CoreError::NotPaired(format!("{id}: no known address"))
+                    })?;
                 let ip = via.unwrap_or_else(|| {
                     a.addr
                         .parse()
                         .unwrap_or_else(|_| "0.0.0.0".parse().unwrap())
                 });
                 let port = a.quic_port;
-                let addr: std::net::SocketAddr = format!("{ip}:{port}").parse().map_err(|_| {
-                    crate::CoreError::Internal(format!("bad peer addr {ip}:{port}"))
-                })?;
+                // Build the socket address directly. Round-tripping through a
+                // formatted string (`format!("{ip}:{port}")`) fails to parse for
+                // IPv6 — unbracketed `fe80::…:47808` is not a valid SocketAddr —
+                // which crashed a dual-stack send with a bogus
+                // Internal("bad peer addr …") before it ever connected.
+                let addr = std::net::SocketAddr::new(ip, port);
                 Ok(PeerAddr {
                     addr,
                     device_fingerprint: Some(id.clone()),
