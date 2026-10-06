@@ -16,6 +16,11 @@ fn info() -> LocalDeviceInfo {
     }
 }
 
+/// A peer's fingerprint, distinct from the local device's own. The engine now
+/// refuses to record a beacon whose fingerprint is its own, so the beacon fed
+/// into the store here must be somebody else's.
+const PEER_FP: &str = "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d";
+
 #[tokio::test(start_paused = true)]
 async fn sweep_task_promotes_stale_then_lost() {
     let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
@@ -26,11 +31,12 @@ async fn sweep_task_promotes_stale_then_lost() {
         Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed)),
     ));
     let now = 1_000_000;
-    let b = eng.make_beacon(now, vec![1, 2, 3, 4]);
+    let mut b = eng.make_beacon(now, vec![1, 2, 3, 4]);
+    b.device_fingerprint = PEER_FP.to_string();
     let bytes = privet_discovery::beacon::encode_beacon_tagged(&b).unwrap();
     eng.inject_incoming(&bytes, "10.0.0.2".parse().unwrap(), None, now);
-    eng.force_transition("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", PeerEvent::AddrResolved);
-    eng.force_transition("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", PeerEvent::ConnectOk);
+    eng.force_transition(PEER_FP, PeerEvent::AddrResolved);
+    eng.force_transition(PEER_FP, PeerEvent::ConnectOk);
     assert_eq!(
         eng.peers()[0].state,
         PeerState::Live,
@@ -43,7 +49,7 @@ async fn sweep_task_promotes_stale_then_lost() {
     tokio::task::yield_now().await;
     assert!(
         eng.drain_events().iter().any(
-            |e| matches!(e, PeerStoreEvent::StateChanged(p, PeerState::Stale) if p == "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+            |e| matches!(e, PeerStoreEvent::StateChanged(p, PeerState::Stale) if p == PEER_FP)
         ),
         "peer must transition to Stale after 200s"
     );
@@ -54,11 +60,35 @@ async fn sweep_task_promotes_stale_then_lost() {
     assert!(
         eng.drain_events()
             .iter()
-            .any(|e| matches!(e, PeerStoreEvent::Lost(p) if p == "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")),
+            .any(|e| matches!(e, PeerStoreEvent::Lost(p) if p == PEER_FP)),
         "peer must transition to Lost after 310s"
     );
 
     eng.cancel();
     tokio::task::yield_now().await;
     let _ = h.await;
+}
+
+#[tokio::test]
+async fn self_beacon_is_never_recorded_as_a_peer() {
+    let eng = DiscoveryEngine::with_now(
+        info(),
+        DiscoveryConfigPrivet::default(),
+        Arc::new(|| 1_000_000u64),
+    );
+    let now = 1_000_000;
+    // A beacon carrying our own fingerprint, from our own broadcast looping back
+    // to the 0.0.0.0 listener, must not create a peer.
+    let b = eng.make_beacon(now, vec![9, 9, 9, 9]);
+    assert_eq!(
+        b.device_fingerprint,
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    );
+    let bytes = privet_discovery::beacon::encode_beacon_tagged(&b).unwrap();
+    eng.inject_incoming(&bytes, "10.0.0.2".parse().unwrap(), None, now);
+    assert!(
+        eng.peers().is_empty(),
+        "our own broadcast must not be recorded as a peer, got {:?}",
+        eng.peers()
+    );
 }

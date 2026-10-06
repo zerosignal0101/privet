@@ -80,6 +80,12 @@ pub enum PeerStoreEvent {
 pub struct PeerStore {
     peers: HashMap<String, PeerRecord>,
     events: Vec<PeerStoreEvent>,
+    /// This device's own fingerprint. `handle_beacon` is the single funnel every
+    /// inbound discovery path goes through — the UDP beacon path
+    /// (`udp::handle_incoming_datagram`) and the mDNS path
+    /// (`DiscoveryEngine::on_mdns_resolved`) both call it — so this is the one
+    /// place that can drop a peer that is really us.
+    own_fingerprint: Option<String>,
 }
 
 impl PeerStore {
@@ -87,7 +93,29 @@ impl PeerStore {
         Self {
             peers: HashMap::new(),
             events: Vec::new(),
+            own_fingerprint: None,
         }
+    }
+
+    /// A store that refuses to record `own_fp` as a peer.
+    pub fn with_own_fingerprint(own_fp: String) -> Self {
+        Self {
+            own_fingerprint: Some(own_fp),
+            ..Self::new()
+        }
+    }
+
+    /// True when `fingerprint` is this device's own.
+    ///
+    /// A directed or global broadcast sent from this host is looped back by the
+    /// kernel to sockets bound to `0.0.0.0`, so the daemon receives its own
+    /// beacon with its own source address. Likewise `MdnsAnnouncer` registers
+    /// `_privet._udp.local.` on the same host that `MdnsBrowser` browses, so the
+    /// browser resolves the daemon's own service. Neither case is a peer.
+    pub fn is_self(&self, fingerprint: &str) -> bool {
+        self.own_fingerprint
+            .as_deref()
+            .is_some_and(|own| own == fingerprint)
     }
 
     pub fn handle_beacon(
@@ -97,6 +125,9 @@ impl PeerStore {
         heard_iface: Option<IpAddr>,
         now_ms: u64,
     ) {
+        if self.is_self(&v.device_fingerprint) {
+            return;
+        }
         let cand = CandidateAddress {
             ip: src,
             quic_port: v.quic_port,
@@ -140,6 +171,9 @@ impl PeerStore {
     }
 
     pub fn handle_goodbye(&mut self, fingerprint: &str) {
+        if self.is_self(fingerprint) {
+            return;
+        }
         if let Some(rec) = self.peers.get_mut(fingerprint) {
             let prev = rec.state;
             if let Some(ns) = transition(prev, PeerEvent::GoodbyeBeacon) {

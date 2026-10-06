@@ -63,11 +63,12 @@ impl DiscoveryEngine {
         now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         let (cancel, _) = watch::channel(false);
+        let own_fp = info.device_fingerprint.clone();
         Self {
             info,
             mode: Mutex::new(config.mode),
             config,
-            store: Arc::new(Mutex::new(PeerStore::new())),
+            store: Arc::new(Mutex::new(PeerStore::with_own_fingerprint(own_fp))),
             nonce: Arc::new(Mutex::new(NonceCache::new())),
             rl: Arc::new(Mutex::new(RateLimiter::new())),
             now_fn,
@@ -233,6 +234,13 @@ impl DiscoveryEngine {
         let port = self.config.udp_port;
         let mut out: Vec<std::net::SocketAddr> = Vec::new();
         for (addr, prefix, bcast, _) in crate::netinfo::enumerate_interfaces() {
+            // IPv6 has no directed broadcast: `directed_broadcast` returns the
+            // address unchanged for V6, which would put the interface's *own*
+            // unicast address into the beacon target list — a beacon sent
+            // straight back to ourselves. Only IPv4 can be broadcast.
+            if !addr.is_ipv4() {
+                continue;
+            }
             let b = bcast.unwrap_or_else(|| crate::netinfo::directed_broadcast(addr, prefix));
             let sa = std::net::SocketAddr::new(b, port);
             if !out.contains(&sa) {

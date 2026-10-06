@@ -55,6 +55,13 @@ pub fn enumerate_interfaces() -> Vec<(IpAddr, u8, Option<IpAddr>, String)> {
         if iface.is_loopback() {
             continue;
         }
+        // Skip interfaces that are not operationally up. A DOWN/NO-CARRIER
+        // interface (e.g. a `docker0` bridge with nothing attached) still has an
+        // address, so it used to contribute a directed-broadcast target and an
+        // mDNS address that the kernel can never deliver.
+        if !iface.is_oper_up() {
+            continue;
+        }
         match iface.addr {
             if_addrs::IfAddr::V4(ref v4) => {
                 out.push((

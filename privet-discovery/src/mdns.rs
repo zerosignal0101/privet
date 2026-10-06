@@ -39,7 +39,9 @@ pub fn from_service(
             .unwrap_or_default(),
         device_fingerprint,
         quic_port: port,
-        tcp_port: txt.get("tcp").and_then(|s| s.parse().ok()).unwrap_or(0),
+        // `to_txt` writes the key "tcp_port"; reading "tcp" always missed, so
+        // every mDNS-discovered peer came back with tcp_port 0.
+        tcp_port: txt.get("tcp_port").and_then(|s| s.parse().ok()).unwrap_or(0),
         nonce: vec![],
         ts_ms: 0,
     })
