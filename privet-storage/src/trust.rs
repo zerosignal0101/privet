@@ -145,6 +145,71 @@ pub fn get_trust(
     }
 }
 
+/// The canonical comparison form of a fingerprint: ASCII-trimmed and case-folded.
+///
+/// Fingerprints are produced by `privet_crypto::hash::fingerprint_hex` as
+/// lowercase hex, so today every caller supplies the canonical form and this is
+/// the identity function. It is not, however, the *only* form that can reach the
+/// trust boundary: a peer sends its fingerprint on the wire, and a store row can
+/// be written by an older build, a migration, or a direct database edit. A
+/// trust decision must not silently flip because a value that denotes the same
+/// device was spelled differently, so the decision boundary normalizes both
+/// sides before comparing.
+///
+/// ASCII-only by design: a fingerprint is hex, so full Unicode case folding
+/// would only invent equivalences between values that were never confusable.
+pub fn normalize_fingerprint(device_fingerprint: &str) -> String {
+    device_fingerprint.trim().to_ascii_lowercase()
+}
+
+/// Whether a `trust_state` value means "currently trusted", compared the same
+/// way the fingerprint is: trimmed, case-insensitive.
+///
+/// Semantics are unchanged by that normalization — only `Trusted` is true, so a
+/// `Revoked` or `Compromised` record (kept for history) is still refused.
+pub fn state_is_trusted(trust_state: &str) -> bool {
+    trust_state.trim().eq_ignore_ascii_case("Trusted")
+}
+
+/// Look up a trust record by fingerprint, matching on the normalized form.
+///
+/// [`get_trust`] keeps exact-match semantics for callers that depend on them
+/// (and that want "this precise stored row"); this is the variant the trust
+/// *decision* uses, so a device cannot be declared untrusted — or trusted —
+/// purely by how its fingerprint happens to be written.
+///
+/// The SQL folds the stored column rather than trusting SQLite's `COLLATE
+/// NOCASE`, which is ASCII-only as a subtlety rather than a guarantee, and it
+/// would silently change the comparison of every other query on the column.
+pub fn get_trust_normalized(
+    conn: &rusqlite::Connection,
+    device_fingerprint: &str,
+) -> Result<Option<TrustRecord>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT device_fingerprint, peer_spki, peer_device_name, trust_state, share_with_peers,
+                first_paired_ts, last_seen_ts, revoked_ts, revocation_reason
+         FROM trust_store
+         WHERE lower(trim(device_fingerprint)) = ?1
+         ORDER BY rowid
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![normalize_fingerprint(device_fingerprint)])?;
+    match rows.next()? {
+        Some(r) => Ok(Some(TrustRecord {
+            device_fingerprint: r.get(0)?,
+            peer_spki: r.get(1)?,
+            peer_device_name: r.get(2)?,
+            trust_state: r.get(3)?,
+            share_with_peers: r.get::<_, i64>(4)? != 0,
+            first_paired_ts: r.get(5)?,
+            last_seen_ts: r.get(6)?,
+            revoked_ts: r.get(7)?,
+            revocation_reason: r.get(8)?,
+        })),
+        None => Ok(None),
+    }
+}
+
 pub fn revoke(
     conn: &rusqlite::Connection,
     device_fingerprint: &str,

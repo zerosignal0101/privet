@@ -27,10 +27,16 @@ impl Engine {
     /// `Trusted` only: a revoked or compromised record stays in the store (it is
     /// kept for history), and a device in that state is precisely one the user
     /// must not be handed without a fresh pairing.
+    ///
+    /// Both the stored and the incoming fingerprint are matched in their
+    /// normalized form, so the decision cannot be flipped by case or surrounding
+    /// whitespace in a value that denotes the same device. See
+    /// [`trust::get_trust_normalized`]. A revoked row stays false whatever its
+    /// state is spelled like.
     pub fn is_trusted(&self, device_fingerprint: &str) -> crate::Result<bool> {
         let db = self.db_conn()?;
-        Ok(trust::get_trust(&db, device_fingerprint)?
-            .is_some_and(|rec| rec.trust_state == "Trusted"))
+        Ok(trust::get_trust_normalized(&db, device_fingerprint)?
+            .is_some_and(|rec| trust::state_is_trusted(&rec.trust_state)))
     }
 
     /// Addresses this device has been successfully reached at, newest first.
