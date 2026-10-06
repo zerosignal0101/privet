@@ -527,6 +527,127 @@ async fn structurally_mismatching_override_is_refused_and_changes_nothing() {
     h.shutdown().await;
 }
 
+/// WP-R14: why the app must not build a per-file override for a send that is
+/// rooted at a DIRECTORY.
+///
+/// A folder pick is a supported source shape: the app caches the picked tree
+/// and hands the daemon the root directory, and `prepare_paths` recurses it
+/// (`prepare_dir`), so the recorded file set is the NESTED relative paths —
+/// `sub/a.txt`, `b.txt`. Resuming that send with no override reproduces exactly
+/// that nesting, because the engine re-reads the recorded paths.
+///
+/// A resume override is a list of individual paths, and `prepare_paths` takes
+/// the `else` branch beside `meta.is_dir()` for each of them: it derives
+/// `relative_path = file_name`. Handing it the two resolved *files* therefore
+/// flattens the set to `a.txt`, `b.txt`, and `check_override_matches_intent`
+/// refuses it — the flattened `a.txt` is not a file this send recorded.
+///
+/// This test pins that refusal in the engine's own suite, so the reason the app
+/// has a fast path that carries no override cannot be quietly dropped from the
+/// engine side. The app-side pin is
+/// `test/pages/history_partial_resume_test.dart`'s "resumes with the RECORDED
+/// paths and no override when the staged tree is intact".
+#[tokio::test]
+async fn nested_directory_send_refuses_a_flat_per_file_override() {
+    init_tracing();
+    let h = Harness::start().await;
+
+    // A tree: `sub/a.txt` and `b.txt`. The send is rooted at the DIRECTORY, so
+    // the recorded relative paths keep the nesting.
+    let root = h.dir.path().join("picked-folder");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub").join("a.txt"), vec![7u8; SMALL_BYTES]).unwrap();
+    std::fs::write(root.join("b.txt"), vec![7u8; SMALL_BYTES]).unwrap();
+
+    let tid = "t-dir-flat-override";
+    send_then_cancel_midflight(&h, vec![root.clone()], tid).await;
+
+    // Precondition: the intent really does record NESTED relative paths, which
+    // is what the flat override below would destroy.
+    let detail = h
+        .sender
+        .history_detail(tid)
+        .unwrap()
+        .expect("a history detail row");
+    let mut recorded: Vec<String> = detail
+        .files
+        .iter()
+        .map(|f| f.relative_path.clone())
+        .collect();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec!["b.txt".to_string(), "sub/a.txt".to_string()],
+        "precondition: a directory-rooted send records the nested relative \
+         paths, not a flat set"
+    );
+
+    let before = receiver_state(&h);
+
+    // The override WP-R12's app code would build: the stager resolves each
+    // recorded FILE to its own path, and the engine derives
+    // `relative_path = file_name` for each.
+    let flat = vec![root.join("sub").join("a.txt"), root.join("b.txt")];
+    let err = refusal(&h, tid, flat).await;
+
+    // The refusal names a file and says precisely how it disagrees with the
+    // recorded set.
+    //
+    // NOTE, verified rather than assumed: the engine names the FLAT path, not
+    // the nested one. `check_override_matches_intent` runs its two loops in
+    // order — "is this supplied file one of the recorded ones?" first, and
+    // "is every recorded file supplied?" second — and the flattened `a.txt`
+    // trips the first loop. So the diagnosis the user gets is "a.txt is not a
+    // file of this send", which is accurate and names the file; it does not
+    // spell out the `sub/a.txt` nesting that caused it. That is a diagnostic
+    // nicety, not a correctness problem: the refusal happens before anything is
+    // sent either way, and this test pins the refusal, not the phrasing.
+    assert!(
+        err.contains("a.txt"),
+        "the refusal must name a file of the disagreement, got: {err}"
+    );
+    assert!(
+        err.contains("not a file of this send"),
+        "the flat override supplies a relative path this send never recorded, \
+         and the refusal must say so, got: {err}"
+    );
+    // The nesting is what makes this override wrong, so it must be visible in
+    // the recorded set: the flat name must not itself be a recorded file.
+    assert!(
+        !err.contains("\"sub/a.txt\" is not a file"),
+        "the refusal must not blame the nested path, which IS recorded, \
+         got: {err}"
+    );
+
+    // A refusal changes nothing: the receiver still holds exactly what it did,
+    // and the send is still resumable.
+    assert_eq!(
+        receiver_state(&h),
+        before,
+        "a refused resume must not change what the receiver holds"
+    );
+    assert_still_partial(&h, tid).await;
+
+    println!("DIR-FLAT-OVERRIDE transfer_id={tid} -> {err}");
+
+    // And the shape that IS correct — no override at all — is still accepted,
+    // which is what the app's fast path relies on.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(90),
+        h.sender.resume_send_with_paths(tid, None),
+    )
+    .await
+    .expect("resume timeout")
+    .expect("a directory-rooted send must resume with no override, sources intact");
+    assert_eq!(
+        outcome.transfer_id, tid,
+        "the resume must reuse the same id"
+    );
+    assert_eq!(outcome.file_count, 2, "both nested files must be sent");
+
+    h.shutdown().await;
+}
+
 /// Everything the receiver currently holds, so a refusal can be shown to change
 /// nothing.
 fn receiver_state(h: &Harness) -> Vec<(String, u64)> {
