@@ -255,6 +255,81 @@ pub(crate) fn subnet_for_peer(ip: std::net::IpAddr) -> Option<String> {
     None
 }
 
+/// Refuse a resume override that does not describe the recorded file set.
+///
+/// The receiver is holding a partial transfer under this id: it has already
+/// accepted some chunks and will skip them on resume, trusting the manifest it
+/// was given. An override with a different root name, a different set of
+/// relative paths, or a different per-file size would therefore not "send a bit
+/// more" — it would write bytes into a layout the receiver already believes,
+/// deleting or corrupting what it holds. So this is checked before anything is
+/// sent, and every refusal names the file that disagrees.
+fn check_override_matches_intent(
+    transfer_id: &str,
+    root_name: Option<&str>,
+    prepared: &privet_transfer::PreparedSet,
+    recorded: &[(String, u64)],
+) -> crate::Result<()> {
+    // `None` and "" are the same "no root name", and `prepare_paths` is handed
+    // the row's root name, so compare the normalized forms.
+    let want_root = root_name.unwrap_or("");
+    let got_root = prepared.root_name.as_deref().unwrap_or("");
+    if want_root != got_root {
+        return Err(crate::CoreError::Internal(format!(
+            "cannot resume {transfer_id}: the supplied sources are rooted at \
+         \"{got_root}\" but this send was rooted at \"{want_root}\""
+        )));
+    }
+
+    if recorded.is_empty() {
+        // Nothing recorded to check against. Refusing is the only safe answer:
+        // accepting would send an unverified file set into a transfer the
+        // receiver has already partly filled.
+        return Err(crate::CoreError::Internal(format!(
+            "cannot resume {transfer_id} with supplied sources: this send \
+         recorded no file list to verify them against"
+        )));
+    }
+
+    let mut got: Vec<(&str, u64)> = prepared
+        .files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f.size))
+        .collect();
+    got.sort();
+    let mut want: Vec<(&str, u64)> = recorded.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    want.sort();
+
+    for (path, size) in &got {
+        match want.iter().find(|(p, _)| p == path) {
+            None => {
+                return Err(crate::CoreError::Internal(format!(
+                    "cannot resume {transfer_id}: the supplied sources include \
+                 \"{path}\", which is not a file of this send"
+                )));
+            }
+            Some((_, want_size)) if want_size != size => {
+                return Err(crate::CoreError::Internal(format!(
+                    "cannot resume {transfer_id}: \"{path}\" is {size} bytes \
+                 now but this send recorded {want_size} bytes"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (path, size) in &want {
+        if !got.iter().any(|(p, _)| p == path) {
+            return Err(crate::CoreError::Internal(format!(
+                "cannot resume {transfer_id}: the supplied sources are missing \
+             \"{path}\", which this send recorded as {size} bytes"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn prepare_paths(
     paths: &[std::path::PathBuf],
     root_name: Option<&str>,
@@ -529,7 +604,38 @@ impl Engine {
             .await
     }
 
+    /// Resume an interrupted send from the sources recorded in its send intent.
+    ///
+    /// See [`Engine::resume_send_with_paths`] for the override variant.
     pub async fn resume_send(&self, transfer_id: &str) -> crate::Result<SendOutcome> {
+        self.resume_send_with_paths(transfer_id, None).await
+    }
+
+    /// Resume an interrupted send, optionally taking the source list from the
+    /// caller instead of from the recorded `StoredSendIntent.paths`.
+    ///
+    /// `override_paths` exists because the recorded paths are not guaranteed to
+    /// still be there when the user asks to resume. On Android every picked
+    /// document is staged into a cache copy that the send cache deletes once the
+    /// transfer reaches a terminal state — and cancellation is terminal — while
+    /// the history row keeps pointing at that deleted copy. Resuming such a
+    /// transfer then fails in `prepare_paths` as a bare `CoreError::Io`, which is
+    /// the "Transfer Failed io" a user cannot act on.
+    ///
+    /// The transfer **id**, peer target, chunking and receiver state are all
+    /// unchanged: this is still the same transfer, so the receiver keeps the
+    /// chunks it already has and only the missing ones are sent.
+    ///
+    /// Because the receiver is holding a partial transfer under this id, an
+    /// override must describe the *same* file set the intent recorded. A
+    /// different root name, a different set of relative paths, or a different
+    /// per-file size is refused by [`check_override_matches_intent`] before
+    /// anything is sent.
+    pub async fn resume_send_with_paths(
+        &self,
+        transfer_id: &str,
+        override_paths: Option<Vec<std::path::PathBuf>>,
+    ) -> crate::Result<SendOutcome> {
         let row = {
             let db = self.db_conn()?;
             privet_storage::history::get_send_intent_row(&db, transfer_id)
@@ -550,24 +656,37 @@ impl Engine {
                 row.status
             )));
         }
-        let blob = row.send_intent.filter(|b| !b.trim().is_empty()).ok_or_else(|| {
-            crate::CoreError::Internal(format!(
-                "transfer {transfer_id} has no send intent (not resumable)"
-            ))
-        })?;
+        let blob = row
+            .send_intent
+            .filter(|b| !b.trim().is_empty())
+            .ok_or_else(|| {
+                crate::CoreError::Internal(format!(
+                    "transfer {transfer_id} has no send intent (not resumable)"
+                ))
+            })?;
 
         let intent: StoredSendIntent = serde_json::from_str(&blob)
             .map_err(|e| crate::CoreError::Internal(format!("send intent deser: {e}")))?;
 
         let root_name = row.root_name.as_deref();
-        let paths: Vec<std::path::PathBuf> =
-            intent.paths.iter().map(std::path::PathBuf::from).collect();
+        // An empty override is the same as none: keep the recorded paths.
+        let override_paths = override_paths.filter(|p| !p.is_empty());
+        let paths: Vec<std::path::PathBuf> = match &override_paths {
+            Some(p) => p.clone(),
+            None => intent.paths.iter().map(std::path::PathBuf::from).collect(),
+        };
         let prepared = prepare_paths(
             &paths,
             root_name,
             intent.chunk_size,
             intent.segment_max_chunks,
         )?;
+        // Validate the override against what the receiver already holds *before*
+        // any of it goes on the wire: a refused resume must change nothing.
+        if override_paths.is_some() {
+            let recorded = self.recorded_send_files(transfer_id)?;
+            check_override_matches_intent(transfer_id, root_name, &prepared, &recorded)?;
+        }
         let file_count = prepared.summary.file_count;
         let total_bytes = prepared.summary.total_bytes;
 
@@ -592,6 +711,22 @@ impl Engine {
             total_bytes,
         )
         .await
+    }
+
+    /// The file rows the send recorded for [transfer_id]: `(relative_path, size)`.
+    ///
+    /// These describe the file set the receiver is already holding a partial
+    /// transfer of, which is what an override has to agree with.
+    fn recorded_send_files(&self, transfer_id: &str) -> crate::Result<Vec<(String, u64)>> {
+        let detail = self.history_detail(transfer_id)?;
+        Ok(detail
+            .map(|d| {
+                d.files
+                    .into_iter()
+                    .map(|f| (f.relative_path, f.size))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Start a new transfer from the paths and peer stored in a previous send-history row.
@@ -1500,5 +1635,101 @@ impl Engine {
             Some(d) => crate::discovery::drain_peer_events_named(d, &fp_map),
             None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_override_tests {
+    use super::*;
+
+    /// Builds a real `PreparedSet` for [paths] so the guard is exercised on the
+    /// same type the resume path hands it.
+    fn prepared(
+        paths: &[std::path::PathBuf],
+        root_name: Option<&str>,
+    ) -> privet_transfer::PreparedSet {
+        prepare_paths(paths, root_name, 65536, 64).expect("prepare")
+    }
+
+    #[test]
+    fn matching_override_is_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"world!").unwrap();
+        let p = prepared(&[a.clone(), b.clone()], None);
+        let recorded = vec![("a.txt".to_string(), 5u64), ("b.txt".to_string(), 6u64)];
+        assert!(check_override_matches_intent("t-1", None, &p, &recorded).is_ok());
+    }
+
+    #[test]
+    fn mismatched_root_name_is_refused_and_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        // Prepared as if rooted at "photos", while the recorded row is not.
+        let p = prepared(&[a.clone()], Some("photos"));
+        let recorded = vec![("a.txt".to_string(), 5u64)];
+        let err = check_override_matches_intent("t-root", None, &p, &recorded)
+            .expect_err("a different root name must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("photos"), "must name the root: {msg}");
+        assert!(msg.contains("t-root"), "must name the transfer: {msg}");
+    }
+
+    #[test]
+    fn unknown_file_is_refused_and_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let intruder = dir.path().join("intruder.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&intruder, b"nope").unwrap();
+        let p = prepared(&[a.clone(), intruder.clone()], None);
+        let recorded = vec![("a.txt".to_string(), 5u64)];
+        let err = check_override_matches_intent("t-extra", None, &p, &recorded)
+            .expect_err("an unrecorded file must be refused");
+        assert!(err.to_string().contains("intruder.txt"), "got: {err}");
+    }
+
+    #[test]
+    fn changed_size_is_refused_and_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        let p = prepared(&[a.clone()], None);
+        // Recorded 99 bytes, the file on disk is 5.
+        let recorded = vec![("a.txt".to_string(), 99u64)];
+        let err = check_override_matches_intent("t-size", None, &p, &recorded)
+            .expect_err("a changed size must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("a.txt") && msg.contains("99"), "got: {msg}");
+    }
+
+    #[test]
+    fn missing_recorded_file_is_refused_and_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        let p = prepared(&[a.clone()], None);
+        let recorded = vec![("a.txt".to_string(), 5u64), ("gone.txt".to_string(), 7u64)];
+        let err = check_override_matches_intent("t-missing", None, &p, &recorded)
+            .expect_err("a missing recorded file must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gone.txt") && msg.contains("missing"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn override_with_nothing_recorded_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        let p = prepared(&[a.clone()], None);
+        let err = check_override_matches_intent("t-empty", None, &p, &[])
+            .expect_err("an unverifiable override must be refused");
+        assert!(err.to_string().contains("no file list"), "got: {err}");
     }
 }

@@ -195,13 +195,20 @@ impl DaemonBackend {
                 });
                 Ok(ResponsePayload::TransferQueued { transfer_id: queued_id })
             }
-            Request::ResumeTransfer { transfer_id } => {
+            Request::ResumeTransfer { transfer_id, paths } => {
                 let queued_id = transfer_id.clone();
                 let engine = self.engine.clone();
                 let events = self.events.clone();
                 let error_id = transfer_id.clone();
+                // An absent or empty list keeps the recorded intent paths.
+                let override_paths: Option<Vec<std::path::PathBuf>> = paths
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.into_iter().map(std::path::PathBuf::from).collect());
                 tokio::spawn(async move {
-                    if let Err(error) = engine.resume_send(&transfer_id).await {
+                    if let Err(error) = engine
+                        .resume_send_with_paths(&transfer_id, override_paths)
+                        .await
+                    {
                         publish_start_error_for_id(&events, error_id, error).await;
                     }
                 });

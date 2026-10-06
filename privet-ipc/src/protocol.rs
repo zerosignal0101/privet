@@ -118,7 +118,29 @@ pub enum Request {
         #[serde(default)]
         via: Option<String>,
     },
-    ResumeTransfer { transfer_id: String },
+    /// Resume an interrupted send **in place**: the same transfer id is reused,
+    /// so the receiver still holds the partial bytes and skips already-received
+    /// chunks instead of re-transmitting from zero.
+    ///
+    /// `paths` optionally replaces the source list recorded in the send intent.
+    /// It exists because a sender may no longer have the recorded files at those
+    /// exact paths — on Android every picked document is staged into a cache
+    /// copy that is deleted once the transfer reaches a terminal state, while
+    /// the history row keeps pointing at it. Without an override the recorded
+    /// paths are used, and a resume of such a transfer fails as a bare `io`
+    /// error.
+    ///
+    /// Structurally additive: an absent or empty `paths` keeps the pre-existing
+    /// behaviour exactly. A supplied list must describe the *same* file set the
+    /// recorded intent did — same root name, same relative paths, same per-file
+    /// sizes — because the receiver already holds a partial transfer under this
+    /// id and a different file set would corrupt it. A mismatch is refused, and
+    /// the refusal names the file that disagrees.
+    ResumeTransfer {
+        transfer_id: String,
+        #[serde(default)]
+        paths: Option<Vec<String>>,
+    },
     ResendTransfer { transfer_id: String },
     AcceptTransfer { transfer_id: String, accept: bool },
     CancelTransfer { transfer_id: String },
