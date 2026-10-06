@@ -22,6 +22,17 @@ impl Engine {
         Ok(trust::list_all(&db)?)
     }
 
+    /// Whether this daemon already trusts a fingerprint.
+    ///
+    /// `Trusted` only: a revoked or compromised record stays in the store (it is
+    /// kept for history), and a device in that state is precisely one the user
+    /// must not be handed without a fresh pairing.
+    pub fn is_trusted(&self, device_fingerprint: &str) -> crate::Result<bool> {
+        let db = self.db_conn()?;
+        Ok(trust::get_trust(&db, device_fingerprint)?
+            .is_some_and(|rec| rec.trust_state == "Trusted"))
+    }
+
     /// Addresses this device has been successfully reached at, newest first.
     ///
     /// Trusted does not imply discoverable: on a network that blocks broadcast
@@ -106,23 +117,40 @@ impl Engine {
                 // IPv6 address while the peer's listeners are reachable on IPv4
                 // (they bind 0.0.0.0). Prefer an IPv4 endpoint, falling back to
                 // the newest endpoint (IPv6 included) when the peer is v6-only.
-                let a = recs
+                let remembered = recs
                     .iter()
                     .find(|r| {
                         r.addr
                             .parse::<std::net::IpAddr>()
                             .map_or(false, |ip| ip.is_ipv4())
                     })
-                    .or_else(|| recs.first())
-                    .ok_or_else(|| {
-                        crate::CoreError::NotPaired(format!("{id}: no known address"))
-                    })?;
-                let ip = via.unwrap_or_else(|| {
-                    a.addr
-                        .parse()
-                        .unwrap_or_else(|_| "0.0.0.0".parse().unwrap())
-                });
-                let port = a.quic_port;
+                    .or_else(|| recs.first());
+                // An explicit `via` exists for exactly the case where nothing was
+                // ever recorded here — a peer paired on one network and met again
+                // on another. So it must not require a remembered row; only the
+                // ports do, and those fall back to this device's own listener
+                // config (what a peer built the same way runs on).
+                let (ip, port, tcp_port) = match (via, remembered) {
+                    (Some(via_ip), Some(a)) => (via_ip, a.quic_port, a.tcp_port),
+                    (Some(via_ip), None) => {
+                        let transport = &self.engine_config().transport;
+                        (via_ip, transport.quic_port, transport.tcp_port)
+                    }
+                    // No `via`: the remembered row supplies both address and
+                    // ports, and without one there is nothing to dial.
+                    (None, Some(a)) => (
+                        a.addr
+                            .parse()
+                            .unwrap_or_else(|_| "0.0.0.0".parse().unwrap()),
+                        a.quic_port,
+                        a.tcp_port,
+                    ),
+                    (None, None) => {
+                        return Err(crate::CoreError::NotPaired(format!(
+                            "{id}: no known address"
+                        )))
+                    }
+                };
                 // Build the socket address directly. Round-tripping through a
                 // formatted string (`format!("{ip}:{port}")`) fails to parse for
                 // IPv6 — unbracketed `fe80::…:47808` is not a valid SocketAddr —
@@ -133,8 +161,8 @@ impl Engine {
                     addr,
                     device_fingerprint: Some(id.clone()),
                     peer_name: Some(rec.peer_device_name.clone()),
-                    quic_port: a.quic_port,
-                    tcp_port: a.tcp_port
+                    quic_port: port,
+                    tcp_port
                 })
             }
         }
@@ -154,6 +182,21 @@ pub struct PeerAddr {
     pub peer_name: Option<String>,
     pub quic_port: u16,
     pub tcp_port: u16,
+}
+
+/// How long [`Engine::identify_address`] may take before it reports "nobody
+/// answered".
+///
+/// Long enough for a real handshake on a slow link (connect and hello each have
+/// their own 12 s / 5 s inner budgets, and this is the outer one a user waiting
+/// on a dialog actually feels).
+pub const IDENTIFY_TIMEOUT_SECS: u64 = 8;
+
+/// The identity a peer reported when dialled at an address, before any pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+    pub device_fingerprint: String,
+    pub device_name: String,
 }
 
 fn record_verified_address(
@@ -1318,6 +1361,62 @@ impl Engine {
             }
         }
         outcome
+    }
+
+    /// Dial an address and report who answers there, without pairing.
+    ///
+    /// The transport handshake exchanges identities (`HelloAck`) *before* any
+    /// code is involved — that is how pairing learns who it is talking to — so a
+    /// plain dial answers "is the device at this address one I already have?"
+    /// without asking the user for a code they already exchanged.
+    ///
+    /// This is what makes a peer reachable on a network where discovery cannot
+    /// see it and the address is new: the address alone identifies nothing, but
+    /// the handshake does.
+    ///
+    /// Bounded, and a silent address is not an error: nothing answering is the
+    /// ordinary outcome for a typo or a device that is simply off, and the
+    /// caller only needs to tell the user that.
+    pub async fn identify_address(
+        &self,
+        quic_addr: std::net::SocketAddr,
+        tcp_addr: std::net::SocketAddr,
+    ) -> crate::Result<Option<PeerIdentity>> {
+        let attempt = async {
+            let conn = crate::connection::connect_peer_with_ports(
+                self.quic.as_ref(),
+                Some(self.tcp.as_ref()),
+                quic_addr,
+                tcp_addr,
+                self.engine_config().transport.mode,
+                None,
+            )
+            .await?;
+            let mut ctrl =
+                crate::connection::acquire_control(conn.as_ref(), ControlRole::Initiator).await?;
+            let ack = crate::connection::hello_exchange(
+                ctrl.as_mut(),
+                self.identity(),
+                1,
+                &self.engine_config().device_name,
+            )
+            .await?;
+            crate::Result::Ok(PeerIdentity {
+                device_fingerprint: ack.device_fingerprint,
+                device_name: ack.device_name,
+            })
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(IDENTIFY_TIMEOUT_SECS),
+            attempt,
+        )
+        .await
+        {
+            Ok(Ok(identity)) => Ok(Some(identity)),
+            // Unreachable, or nothing that speaks this protocol, or slower than
+            // the budget: all "nobody answered", which is all the caller needs.
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
     }
 
     pub fn set_pending_pair_code(&self, code: privet_security::code::PairingCode) {

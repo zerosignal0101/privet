@@ -85,6 +85,37 @@ impl DaemonBackend {
                 self.engine.discover_snapshot().into_iter().map(peer_dto).collect()
             )),
             Request::RefreshPeers => { self.engine.discover_refresh().await?; Ok(ResponsePayload::Ack) }
+            Request::ResolveAddress { ip, quic_port, tcp_port } => {
+                // Same shape `send.via` accepts, so a user can paste either into
+                // the other.
+                let addr = parse_via_ip(&ip)?;
+                // Ports default to the ones this daemon listens on, which is what
+                // a peer runs unless something told us otherwise.
+                let quic_port = quic_port.unwrap_or_else(|| self.quic_addr.port());
+                let tcp_port = tcp_port.unwrap_or_else(|| self.tcp_addr.port());
+                let answered = self
+                    .engine
+                    .identify_address(
+                        SocketAddr::new(addr, quic_port),
+                        SocketAddr::new(addr, tcp_port),
+                    )
+                    .await?;
+                // Trust is a store question, not a transport one, so it is asked
+                // here: identifying tells us who is there, the store tells us
+                // whether we already have them.
+                let trusted = match &answered {
+                    Some(identity) => self.engine.is_trusted(&identity.device_fingerprint)?,
+                    None => false,
+                };
+                Ok(ResponsePayload::ResolvedAddress(ResolvedAddressDto {
+                    found: answered.is_some(),
+                    device_fingerprint: answered.as_ref().map(|i| i.device_fingerprint.clone()),
+                    device_name: answered.as_ref().map(|i| i.device_name.clone()),
+                    trusted,
+                    quic_port,
+                    tcp_port,
+                }))
+            }
             Request::ListTrusted => {
                 let peers = self.engine.list_trusted()?;
                 let mut out = Vec::with_capacity(peers.len());

@@ -77,6 +77,25 @@ pub enum Request {
     GetIdentity,
     ListPeers,
     RefreshPeers,
+    /// Dial one address and report who answers there.
+    ///
+    /// An address alone does not identify a device: a peer paired on one network
+    /// is often met again on another, where discovery cannot see it and the trust
+    /// store has never recorded the new address. The transport handshake
+    /// exchanges identities before any pairing code is involved, so a dial is
+    /// enough to answer "is the device at this address one I already have?"
+    /// without asking the user for a code they already exchanged.
+    ResolveAddress {
+        /// A bare IPv4 or IPv6 literal (brackets optional), the same shape
+        /// `Send.via` accepts.
+        ip: String,
+        /// Ports to dial. Omitted means the daemon's configured defaults, which
+        /// is what a peer listens on when nothing has told us otherwise.
+        #[serde(default)]
+        quic_port: Option<u16>,
+        #[serde(default)]
+        tcp_port: Option<u16>,
+    },
     ListTrusted,
     GeneratePairingCode,
     Pair { peer: PairingPeer, code: String },
@@ -142,6 +161,7 @@ pub enum ResponsePayload {
     Identity(IdentityDto),
     Peers(Vec<PeerDto>),
     Trusted(Vec<TrustedPeerDto>),
+    ResolvedAddress(ResolvedAddressDto),
     PairingCode { code: String, validity_secs: u64 },
     PairingResult { paired: bool, device_fingerprint: Option<String> },
     TransferQueued { transfer_id: String },
@@ -185,6 +205,26 @@ pub struct LocalAddrDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IdentityDto { pub device_fingerprint: String, pub device_name: String }
+
+/// Who answered at an address the user dialled.
+///
+/// Produced by `resolve_address`, which dials and completes the transport
+/// handshake — the same identity exchange pairing performs *before* it asks for
+/// a code. `trusted` is what lets a client skip that code: when the device at
+/// the address is one this daemon already has, there is nothing left to prove.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedAddressDto {
+    /// False when nothing answered; every other field is then meaningless.
+    pub found: bool,
+    pub device_fingerprint: Option<String>,
+    pub device_name: Option<String>,
+    /// True when the answering fingerprint is in this daemon's trust store with
+    /// state Trusted.
+    pub trusted: bool,
+    /// The ports dialled, so the client can pass them on verbatim.
+    pub quic_port: u16,
+    pub tcp_port: u16,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CandidateAddressDto {
