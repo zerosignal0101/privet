@@ -82,7 +82,23 @@ pub enum Request {
     Pair { peer: PairingPeer, code: String },
     RevokePeer { device_fingerprint: String, reason: String },
     ForgetPeer { device_fingerprint: String },
-    Send { paths: Vec<PathBuf>, device_fingerprint: String, as_name: Option<String> },
+    Send {
+        paths: Vec<PathBuf>,
+        device_fingerprint: String,
+        as_name: Option<String>,
+        /// Optional address to dial instead of the one remembered for the
+        /// device: a bare IPv4 or IPv6 literal (brackets optional).
+        ///
+        /// This exists because a device paired on one network is often reached
+        /// on another, and where discovery is blocked (campus AP client
+        /// isolation) the address is the only thing the user can supply. The
+        /// ports always come from the device record.
+        ///
+        /// A fingerprint is still required: the identity of the peer is pinned
+        /// by the trust store, and this only overrides *where* we reach it.
+        #[serde(default)]
+        via: Option<String>,
+    },
     ResumeTransfer { transfer_id: String },
     ResendTransfer { transfer_id: String },
     AcceptTransfer { transfer_id: String, accept: bool },
@@ -197,6 +213,13 @@ pub struct TrustedPeerDto {
     pub last_seen_ts: i64,
     pub revoked_ts: Option<i64>,
     pub revocation_reason: Option<String>,
+    /// Addresses this device has been successfully reached at (pairing, a
+    /// completed send, or discovery), newest first. A trusted device that
+    /// discovery cannot currently see still has these, which is how a user on a
+    /// client-isolated network avoids re-typing an address they already used.
+    /// Additive: absent means empty.
+    #[serde(default)]
+    pub addresses: Vec<CandidateAddressDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

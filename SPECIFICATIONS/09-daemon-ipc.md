@@ -52,7 +52,7 @@ Unsupported protocol versions return `incompatible_protocol`. Adding optional fi
 | `generate_pairing_code` | none | code and validity |
 | `pair` | peer selector, code | pairing result |
 | `revoke_peer` / `forget_peer` | fingerprint and optional reason | ack |
-| `send` | paths, trusted fingerprint, optional root name | queued ID |
+| `send` | paths, trusted fingerprint, optional root name, optional `via` address | queued ID |
 | `resume_transfer` | transfer ID | queued same ID |
 | `resend_transfer` | historical transfer ID | queued new ID |
 | `accept_transfer` | transfer ID, accept boolean | ack |
@@ -76,6 +76,8 @@ Implemented response variants are `pong`, `ack`, `status`, `identity`, `peers`, 
 - Status also includes `local_addrs`: this device's own dialable interface addresses (`{ ip, quic_port, tcp_port }`), IPv4 first, excluding loopback, the wildcard `0.0.0.0`, and links that are not operationally up. The bound addresses above are usually wildcards (`0.0.0.0:47808`) that no peer can dial, so clients show `local_addrs` to let a user read an address off and type it on the other device when discovery is blocked (e.g. campus AP client isolation). The field is additive: absent means empty.
 - A candidate includes IP, distinct QUIC/TCP ports, and last-seen milliseconds.
 - Trust includes fingerprint, name/state, SPKI hex, paired/seen/revoked timestamps, and reason.
+- Trust also includes `addresses`: the endpoints this device has been successfully reached at (pairing, a completed send, or discovery), newest first, as `{ ip, quic_port, tcp_port, last_seen_ms }`. A trusted device that discovery cannot currently see still has these, which is how a client lets a user reuse an address instead of re-typing it. Additive: absent means empty.
+- `send` accepts an optional `via`: a bare IPv4 or IPv6 literal (brackets optional) to dial *instead of* the address remembered for the fingerprint. The ports always come from the device record. The fingerprint stays mandatory, so the peer's identity is still pinned by the trust store and `via` only changes where it is reached; pairing it with an unknown fingerprint is an error, and a value carrying a port is an error rather than a silently ignored one.
 - History includes ID, direction, optional peer/name/root, totals, status, and timestamps.
 - History detail (`get_history_detail`) adds per-file `relative_path`, `absolute_path`, `size`, and `status`. `absolute_path` is the send-side source path or the receive-side `save_dir/root/relative` landed path, and is `null` for send records that predate schema v2.
 - Replay includes events, optional oldest retained sequence, and latest sequence.

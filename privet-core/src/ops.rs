@@ -22,6 +22,26 @@ impl Engine {
         Ok(trust::list_all(&db)?)
     }
 
+    /// Addresses this device has been successfully reached at, newest first.
+    ///
+    /// Trusted does not imply discoverable: on a network that blocks broadcast
+    /// and multicast the device may never appear in `list_peers`, yet the
+    /// address recorded when it was paired (or when a send to it succeeded)
+    /// still points at it. Clients surface this so a user does not have to
+    /// remember, or re-type, an address they have already used once.
+    pub fn known_addresses(
+        &self,
+        device_fingerprint: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<privet_storage::addresses::AddressRecord>> {
+        let db = self.db_conn()?;
+        Ok(privet_storage::addresses::recent_known(
+            &db,
+            device_fingerprint,
+            limit,
+        )?)
+    }
+
     pub fn history(
         &self,
         peer: Option<&str>,

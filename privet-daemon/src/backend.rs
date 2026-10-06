@@ -85,9 +85,28 @@ impl DaemonBackend {
                 self.engine.discover_snapshot().into_iter().map(peer_dto).collect()
             )),
             Request::RefreshPeers => { self.engine.discover_refresh().await?; Ok(ResponsePayload::Ack) }
-            Request::ListTrusted => Ok(ResponsePayload::Trusted(
-                self.engine.list_trusted()?.into_iter().map(trusted_dto).collect()
-            )),
+            Request::ListTrusted => {
+                let peers = self.engine.list_trusted()?;
+                let mut out = Vec::with_capacity(peers.len());
+                for peer in peers {
+                    // Every trusted device, including one discovery cannot see.
+                    let addresses = self
+                        .engine
+                        .known_addresses(&peer.device_fingerprint, TRUSTED_ADDR_LIMIT)?
+                        .into_iter()
+                        .map(|a| CandidateAddressDto {
+                            ip: a.addr,
+                            quic_port: a.quic_port,
+                            tcp_port: a.tcp_port,
+                            // The store records seconds; the DTO has always
+                            // spoken milliseconds.
+                            last_seen_ms: (a.last_seen_ts.max(0) as u64) * 1000,
+                        })
+                        .collect();
+                    out.push(trusted_dto(peer, addresses));
+                }
+                Ok(ResponsePayload::Trusted(out))
+            }
             Request::GeneratePairingCode => {
                 let code = self.engine.generate_pairing_code()?;
                 Ok(ResponsePayload::PairingCode {
@@ -118,8 +137,15 @@ impl DaemonBackend {
                 self.engine.forget_peer(&device_fingerprint)?;
                 Ok(ResponsePayload::Ack)
             }
-            Request::Send { paths, device_fingerprint, as_name } => {
+            Request::Send { paths, device_fingerprint, as_name, via } => {
                 if paths.is_empty() { return Err(BackendError::invalid("paths must not be empty")); }
+                // Parse the address before spawning: a bad one has to come back
+                // as a request error the caller can act on, not as an event on a
+                // transfer that only appeared to start.
+                let via_ip = match via.as_deref() {
+                    None => None,
+                    Some(raw) => Some(parse_via_ip(raw)?),
+                };
                 let transfer_id = new_transfer_id();
                 let queued_id = transfer_id.clone();
                 let engine = self.engine.clone();
@@ -129,7 +155,7 @@ impl DaemonBackend {
                     if let Err(error) = engine.send_with_id(
                         paths,
                         &PeerTarget::ByDeviceFingerprint(device_fingerprint),
-                        None,
+                        via_ip,
                         as_name.as_deref(),
                         transfer_id,
                     ).await {
@@ -375,7 +401,33 @@ fn peer_dto(peer: privet_discovery::peer::PeerRecord) -> PeerDto {
     }
 }
 
-fn trusted_dto(peer: privet_storage::trust::TrustRecord) -> TrustedPeerDto {
+/// How many remembered addresses a trusted device reports. Enough to cover the
+/// networks it has been reached on (IPv4 + IPv6, home and away) without dumping
+/// an unbounded history into a UI list.
+const TRUSTED_ADDR_LIMIT: usize = 8;
+
+/// Parse the optional `via` of a `send`.
+///
+/// A bare IP only, brackets optional. The ports always come from the device
+/// record: a user who knows where the peer is does not know, and should not have
+/// to guess, which port it listens on.
+fn parse_via_ip(raw: &str) -> std::result::Result<std::net::IpAddr, BackendError> {
+    let trimmed = raw.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    bare.parse::<std::net::IpAddr>().map_err(|_| {
+        BackendError::invalid(format!(
+            "via \"{raw}\" must be a bare IP address (IPv4 or IPv6); the ports come from the device record"
+        ))
+    })
+}
+
+fn trusted_dto(
+    peer: privet_storage::trust::TrustRecord,
+    addresses: Vec<CandidateAddressDto>,
+) -> TrustedPeerDto {
     TrustedPeerDto {
         device_fingerprint: peer.device_fingerprint,
         device_name: peer.peer_device_name,
@@ -385,6 +437,7 @@ fn trusted_dto(peer: privet_storage::trust::TrustRecord) -> TrustedPeerDto {
         last_seen_ts: peer.last_seen_ts,
         revoked_ts: peer.revoked_ts,
         revocation_reason: peer.revocation_reason,
+        addresses,
     }
 }
 
@@ -446,6 +499,30 @@ fn history_detail_dto(row: privet_storage::history::HistoryDetailRow) -> History
 mod tests {
     use super::*;
     use privet_storage::history::{HistoryDetailRow, HistoryFileRow};
+
+    #[test]
+    fn via_takes_a_bare_ip_and_rejects_a_port_or_junk() {
+        // `BackendError` deliberately has no `Debug`, so unwrap on the Ok side
+        // by hand rather than pulling Debug into the error type.
+        fn ok_ip(s: &str) -> std::net::IpAddr {
+            match parse_via_ip(s) {
+                Ok(ip) => ip,
+                Err(_) => panic!("expected {s:?} to parse as a bare IP"),
+            }
+        }
+        // A bare literal, and the bracketed IPv6 a user copies out of the
+        // status output, which must unwrap to the address itself.
+        assert_eq!(ok_ip("10.29.210.120").to_string(), "10.29.210.120");
+        assert_eq!(ok_ip("  10.29.210.120  ").to_string(), "10.29.210.120");
+        assert_eq!(ok_ip("fe80::1").to_string(), "fe80::1");
+        assert_eq!(ok_ip("[fe80::1]").to_string(), "fe80::1");
+        // A port belongs to the device record, not to this request: silently
+        // honouring one would let a typo point the send somewhere else.
+        assert!(parse_via_ip("10.29.210.120:47808").is_err());
+        assert!(parse_via_ip("[fe80::1]:47808").is_err());
+        assert!(parse_via_ip("").is_err());
+        assert!(parse_via_ip("lan.local").is_err());
+    }
 
     fn iface(ip: &str, prefix: u8, name: &str) -> (IpAddr, u8, Option<IpAddr>, String) {
         (ip.parse().unwrap(), prefix, None, name.into())
