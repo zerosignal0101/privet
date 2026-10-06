@@ -553,6 +553,11 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
 
     let mut last_flush = std::time::Instant::now();
     let mut last_progress_log = std::time::Instant::now();
+    // Whether any progress report with verified_bytes > 0 has been emitted yet.
+    // The first report is never throttled: a fast receive can verify every byte
+    // and reach the terminal state inside the 1s window, which used to leave the
+    // GUI tile at 0% forever. See emit_progress_if_due.
+    let mut progress_reported = false;
     loop {
         let data_recv =
             tokio::time::timeout(crate::constants::CHUNK_ACK_TIME_BASE, inputs.data[0].recv())
@@ -581,28 +586,17 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                         return Ok(());
                     }
                 }
-                if last_progress_log.elapsed() >= std::time::Duration::from_secs(1) {
-                    let verified_chunks: u64 = files
-                        .values()
-                        .map(|st| st.verified_count.values().sum::<u32>() as u64)
-                        .sum();
-                    tracing::debug!(transfer_id = %tid, verified_chunks = verified_chunks, "receiver progress");
-                    // Mirror the sender's byte approximation so the GUI shows
-                    // live progress instead of sitting at 0% until completion.
-                    let verified_bytes =
-                        verified_chunks.saturating_mul(inputs.config.default_chunk_size as u64);
-                    if verified_bytes > 0 {
-                        inputs
-                            .events
-                            .emit(TransferEvent::Progress {
-                                transfer_id: tid.clone(),
-                                verified_bytes: verified_bytes.min(summary.total_bytes),
-                                total_bytes: summary.total_bytes,
-                            })
-                            .await;
-                    }
-                    last_progress_log = std::time::Instant::now();
-                }
+                emit_progress_if_due(
+                    &files,
+                    &inputs.config,
+                    &*inputs.events,
+                    &tid,
+                    summary.total_bytes,
+                    &mut last_progress_log,
+                    &mut progress_reported,
+                    false,
+                )
+                .await;
             }
             Ok(Err(_)) => {
                 // A mid-transfer data-stream end/error: the peer cancelled (it
@@ -628,6 +622,20 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                         Some(CPayload::SegmentManifest(m)) => {
                             on_manifest(&mut manifests, &mut files, &*inputs.store, &tid, &m)
                                 .await?;
+                            // on_manifest can verify a batch of chunks that
+                            // arrived before their manifest, so progress must
+                            // be reconsidered on the control path too.
+                            emit_progress_if_due(
+                                &files,
+                                &inputs.config,
+                                &*inputs.events,
+                                &tid,
+                                summary.total_bytes,
+                                &mut last_progress_log,
+                                &mut progress_reported,
+                                false,
+                            )
+                            .await;
                         }
                         Some(CPayload::Control(ControlMessage {
                             msg: Some(privet_protocol::control_message::Msg::Complete(_)),
@@ -718,6 +726,20 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
                 match frame.payload {
                     Some(CPayload::SegmentManifest(m)) => {
                         on_manifest(&mut manifests, &mut files, &*inputs.store, &tid, &m).await?;
+                        // on_manifest can verify a batch of chunks that arrived
+                        // before their manifest, so progress must be
+                        // reconsidered on the control path too.
+                        emit_progress_if_due(
+                            &files,
+                            &inputs.config,
+                            &*inputs.events,
+                            &tid,
+                            summary.total_bytes,
+                            &mut last_progress_log,
+                            &mut progress_reported,
+                            false,
+                        )
+                        .await;
                     }
                     Some(CPayload::Control(ControlMessage {
                         msg: Some(privet_protocol::control_message::Msg::Complete(_)),
@@ -955,6 +977,21 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
         })
         .await;
     if all_ok {
+        // Force one final progress report so the GUI tile reaches a real
+        // percentage before the terminal event, even when every chunk was
+        // verified on a path that never ticked the 1s throttle (small/fast
+        // receives). One extra event per transfer, so this is not a flood.
+        emit_progress_if_due(
+            &files,
+            &inputs.config,
+            &*inputs.events,
+            &tid,
+            summary.total_bytes,
+            &mut last_progress_log,
+            &mut progress_reported,
+            true,
+        )
+        .await;
         inputs
             .events
             .emit(TransferEvent::StateChanged {
@@ -970,6 +1007,58 @@ pub async fn run_receiver(mut inputs: ReceiverInputs) -> Result<()> {
     } else {
         Err(TransferError::VerifyFailed(err_msg))
     }
+}
+
+/// Emit a receiver-side progress report when one is due.
+///
+/// `verified_count` is the only source of truth for receive progress, and it is
+/// bumped from two different places: `handle_data` (chunk verified inline) and
+/// `on_manifest` (chunks that arrived before their manifest and were verified
+/// when the manifest showed up). Every place that can change it must funnel
+/// through this helper, otherwise verified bytes can be known but never
+/// reported and the GUI tile sticks at 0%.
+///
+/// The first report is never throttled: a fast receive can deliver and verify
+/// every byte, then reach the terminal state, all inside the 1s window. After
+/// the first report the 1s throttle resumes, so long transfers keep ticking at
+/// ~1 Hz instead of flooding subscribers.
+#[allow(clippy::too_many_arguments)]
+async fn emit_progress_if_due(
+    files: &HashMap<String, FileRecvState>,
+    config: &TransferEngineConfig,
+    events: &dyn TransferEventSink,
+    tid: &str,
+    total_bytes: u64,
+    last_progress_log: &mut std::time::Instant,
+    progress_reported: &mut bool,
+    force: bool,
+) {
+    let verified_chunks: u64 = files
+        .values()
+        .map(|st| st.verified_count.values().sum::<u32>() as u64)
+        .sum();
+    // Mirror the sender's byte approximation so the GUI shows live progress
+    // instead of sitting at 0% until completion.
+    let verified_bytes = verified_chunks.saturating_mul(config.default_chunk_size as u64);
+    if verified_bytes == 0 {
+        return;
+    }
+    if !force
+        && *progress_reported
+        && last_progress_log.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return;
+    }
+    tracing::debug!(transfer_id = %tid, verified_chunks = verified_chunks, "receiver progress");
+    events
+        .emit(TransferEvent::Progress {
+            transfer_id: tid.to_string(),
+            verified_bytes: verified_bytes.min(total_bytes),
+            total_bytes,
+        })
+        .await;
+    *progress_reported = true;
+    *last_progress_log = std::time::Instant::now();
 }
 
 async fn on_manifest(

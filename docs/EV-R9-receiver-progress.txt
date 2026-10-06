@@ -1,0 +1,279 @@
+================================================================================
+WP-R9 — 引擎：接收端在快速传输下完全不发进度事件（进度条卡在 0%）
+Evidence log
+Branch: wp/receiver-progress   (base commit: f56d6c1)
+Date: 2026-10-06
+================================================================================
+
+--------------------------------------------------------------------------------
+0. 结论摘要（TL;DR）
+--------------------------------------------------------------------------------
+测试断言本身是对的，不是误报。真实根因比任务描述中假设的「1 秒节流」更深一层，
+是两个独立缺陷叠加：
+
+  (A) 首个进度上报被 1s 节流挡住；
+  (B) 更关键 —— `verified_count` 只在 `on_manifest()` 里被累加，而进度事件
+      只从 data 分支发出。快速传输的 chunk 在自己的 SegmentManifest 到达之前
+      就已到达，被判为 `ArrivalVerdict::Pending` 缓存起来；等到 manifest 到达
+      才在 control 路径上批量验证并累加 —— 而 control 路径**根本不发进度事件**。
+
+所以只做 (A) 的修法（首次上报不受节流约束）在 8 MiB 场景下实测仍然发 0 条，
+见 §3.2。最终修法同时覆盖 (A)(B)，并在终态前补发一次保证「至少一条」。
+
+--------------------------------------------------------------------------------
+1. 复现：修复前的原始失败输出
+--------------------------------------------------------------------------------
+$ cargo test -p privet-core --test ops_send_serve receiver_emits_offered_progress_completed
+
+running 1 test
+test receiver_emits_offered_progress_completed ... FAILED
+
+---- receiver_emits_offered_progress_completed stdout ----
+2026-10-06T12:01:59.697574Z  WARN privet_core::adapters::transfer_sink: engine event publish: no subscribers (dropped)
+2026-10-06T12:01:59.697605Z  WARN privet_core::adapters::transfer_sink: engine event publish: no subscribers (dropped)
+2026-10-06T12:02:00.417023Z  WARN privet_core::adapters::transfer_sink: engine event publish: no subscribers (dropped)
+2026-10-06T12:02:00.426725Z  WARN privet_core::adapters::transfer_sink: engine event publish: no subscribers (dropped)
+
+thread 'receiver_emits_offered_progress_completed' (3281970) panicked at privet-core/tests/ops_send_serve.rs:640:5:
+receiver must emit TransferProgress with verified_bytes > 0 (got 0)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1.13s
+(退出码 101)
+
+用 git stash 回到 main 状态复跑，确认这是修复前的稳定失败（不是偶发）：
+$ git stash push -m "r9-fix" && cargo test -p privet-core --test ops_send_serve receiver_emits_offered_progress_completed
+
+BEFORE_EXIT=101
+test receiver_emits_offered_progress_completed ... FAILED
+thread 'receiver_emits_offered_progress_completed' (3339447) panicked at privet-core/tests/ops_send_serve.rs:640:5:
+receiver must emit TransferProgress with verified_bytes > 0 (got 0)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1.15s
+
+--------------------------------------------------------------------------------
+2. 测量方法
+--------------------------------------------------------------------------------
+临时探针（已删除，不在提交内）：privet-core/tests/zz_probe_r9.rs
+  - 在 send() 之前订阅接收端事件，后台任务按时间戳记录**有序**事件序列；
+  - 两个场景：8 MiB（快）与 512 MiB（慢），其余参数与失败测试一致；
+  - 另外在 receiver.rs 数据循环里临时加了计数器
+    （循环总时长 / 迭代次数 / 进入节流分支次数 / 首次 verified>0 的时刻）。
+
+常量基线：DEFAULT_CHUNK_SIZE = 1 MiB（privet-protocol/src/constants.rs:8）
+           CHUNK_ACK_TIME_BASE = 500 ms（privet-transfer/src/constants.rs:23）
+=> 8 MiB 文件 = 8 个 chunk；512 MiB 文件 = 512 个 chunk。
+
+--------------------------------------------------------------------------------
+3. 修复前的测量结果（核心证据）
+--------------------------------------------------------------------------------
+3.1 快传输 8 MiB —— 一次进度事件都没发
+
+$ cargo test -p privet-core --test zz_probe_r9 probe_fast_8mib -- --nocapture
+
+  ERROR privet_transfer::receiver: WP-R9 PROBE: data loop finished
+        transfer_id=t-cfe8b5b5 loop_ms=1031 iterations=10
+        throttle_branch_entered=0 first_verified_at_ms=None
+  === PROBE [fast-8MiB] 8 MiB ===
+  send() returned after 1.044059987s
+  --- receiver events (2 total) ---
+    [11.969ms] Offered files=1 total=8388608
+    [  1.245s] Completed
+  PROGRESS_EVENT_COUNT = 0
+
+  => 结论：这次收传**确实一条 Progress 都没发**（不是发了但 verified_bytes=0）。
+     时间轴上只有 Offered(12ms) 和 Completed(1.245s)，中间完全空白。
+
+3.2 只修 (A)「首次上报不受节流」之后的反证 —— 仍然 0 条
+
+把节流条件改成 `!progress_reported || elapsed >= 1s` 后重跑同一探针：
+
+  ERROR privet_transfer::receiver: R9PROBE branch entered transfer_id=t-fff2dd44 verified_chunks=0 progress_reported=false entered=true   (x9)
+  === PROBE [fast-8MiB] 8 MiB ===
+  send() returned after 1.044059987s
+  --- receiver events (2 total) ---
+    [11.969ms] Offered files=1 total=8388608
+    [  1.245s] Completed
+  PROGRESS_EVENT_COUNT = 0
+
+  => 分支确实进入了 9 次（(A) 的修法生效），但 verified_chunks 每次都是 0。
+     这直接证伪了「只是 1 秒节流挡住」这一单点假设。
+
+3.3 真正的根因（定位到 verified_count 的累加点）
+
+receiver.rs 里 `verified_count` 只有两处累加：
+  - receiver.rs:1048  on_manifest()  —— 排空「先于 manifest 到达」的 pending chunk
+  - receiver.rs:1107  handle_data()  —— 仅当 classify_arrival 返回 ArrivalVerdict::Verified
+
+在 data 分支加探针后：
+
+  ERROR privet_transfer::receiver: R9PROBE branch entered ... verified_chunks=0   (x9)
+  ERROR privet_transfer::receiver: R9PROBE on_manifest    ... __r9_total=8 pending_drained=true
+
+  => 8 个 chunk 全部以 `ArrivalVerdict::Pending` 到达（此时 manifest 还没来），
+     被 `manifests.buffer_pending()` 缓存，因此 handle_data 一次都没有 Verified，
+     verified_count 始终为 0；直到 on_manifest 到达才一次性排空，__r9_total=8。
+     而 on_manifest 是在 control 分支被调用的，那条路径上没有任何进度上报。
+
+3.4 关于 `last_progress_log` 初值与「1 秒为什么没触发」的准确说明
+
+`last_progress_log` 在循环开始前初始化为 `std::time::Instant::now()`
+（receiver.rs:555，紧邻 `last_flush`），所以 elapsed 从 0 起算。
+
+有意思的是：快传输的循环总时长 loop_ms=1031 **已经超过 1000 ms**，但
+throttle_branch_entered=0。原因是那多出来的约 1 秒并不是在传数据 —— 8 个 chunk
+在最初 ~430ms 内就全部到达（iterations=10），剩下约 600ms 是循环停在
+`tokio::time::timeout(CHUNK_ACK_TIME_BASE, data.recv())` 的 `Err(_)` 空闲超时分支上
+等待 Complete 控制帧。该分支**不包含任何进度检查代码**，所以即使 elapsed > 1s，
+节流分支也一次都没被求值。
+
+  => 所以「传输实际耗时多少」的正确答案是：真正的数据接收窗口约 430ms，
+     而循环整体 1031ms 的绝大部分花在空闲等待上，而这部分不参与进度判定。
+
+3.5 慢传输 512 MiB —— 该链路本身是正常的
+
+  ERROR privet_transfer::receiver: WP-R9 PROBE: data loop finished
+        loop_ms=29306 iterations=514 throttle_branch_entered=27 first_verified_at_ms=Some(1005)
+  === PROBE [slow-512MiB] 512 MiB ===
+  --- receiver events (28 total) ---
+    [324.998ms] Offered files=1 total=536870912
+    [  1.332s] Progress verified=18874368 total=536870912 (3.5%)
+    [  2.347s] Progress verified=37748736 total=536870912 (7.0%)
+    ...（共 27 条，间隔稳定约 1.02s）
+    [ 28.300s] Progress verified=522190848 total=536870912 (97.3%)
+  PROGRESS_EVENT_COUNT = 27
+
+  => 慢传输按 ~1 Hz 稳定上报，这条链在正常工作；问题只在快传输。
+     另外可见：最后一条进度停在 97.3%，从未到达 100%，这也印证了缺少终态补发。
+
+--------------------------------------------------------------------------------
+4. 改动说明
+--------------------------------------------------------------------------------
+文件：privet-transfer/src/receiver.rs（6 个 hunk）
+
+4.1 新增单一收敛点 `emit_progress_if_due()`
+    统一计算 `verified_chunks * default_chunk_size`、截到 total_bytes、
+    并决定「该不该发」。调用方只需回答「这里是否可能改变了 verified_count」。
+
+4.2 修 (A)：首次上报不受节流约束
+    `!progress_reported` 时立即发一条，之后恢复 1s 节流。
+    => 满足「至少一次」，同时不引入事件风暴（长传输仍是 ~1 Hz）。
+
+4.3 修 (B)：补上 control 路径的调用点
+    在两处 in-loop 的 `on_manifest(...)` 之后调用（receiver.rs:625、729）。
+    这是本次真正的关键 —— 快速传输的字节正是在这里被验证的。
+
+4.4 终态前强制补发一次
+    在 `if all_ok {` 分支内、发出 StateChanged::Completed / Completed **之前**
+    以 force=true 调一次（receiver.rs:980）。
+    => 无论前面走的是哪条路径，都保证「Completed 之前至少有一条
+       verified_bytes > 0 的 Progress」。每次传输最多多 1 条，不是洪水。
+
+4.5 为什么落点在 receiver 而不是改 sink 的丢弃分支
+    - `transfer_sink.rs:96` 丢弃的 Accepted/SendingDone/Verified/StateChanged
+      里，唯一可能承载进度的是 `TransferEvent::Verified{ok}`，但它**没有字节数**
+      （privet-transfer/src/events.rs:34-37），结构上无法表达进度；给它编一个
+      字节数只能是凭空捏造。
+    - 真正的缺陷是「接收引擎在某些验证路径上根本没有上报进度」，属于事件**产生**
+      端缺失，不是事件**转发**端丢失。改 sink 无法修复一个从未被发出的事件。
+    - 对比 sender.rs:528-535：发送端每批 chunk ack 就无条件 emit 一次 Progress，
+      没有节流，所以发送侧从来没暴露过这个问题 —— 两侧语义不对称正是 bug 温床。
+
+4.6 total_bytes / verified_bytes 语义保持不变
+    - verified_bytes 仍为「已验块数 × default_chunk_size」，仍 `.min(total_bytes)`；
+    - total_bytes 始终取 offer 的 `summary.total_bytes`；
+    - 未新增任何 panic/unwr/expect/unsafe，非测试可达路径返回 Result。
+
+--------------------------------------------------------------------------------
+5. 修复后的测量结果
+--------------------------------------------------------------------------------
+5.1 快传输 8 MiB —— 现在有 2 条，且都在 Completed 之前
+
+  === PROBE [fast-8MiB] 8 MiB ===
+  send() returned after 1.09355629s
+  --- receiver events (4 total) ---
+    [ 11.931ms] Offered files=1 total=8388608
+    [577.923ms] Progress verified=8388608 total=8388608 (100.0%)
+    [  1.294s] Progress verified=8388608 total=8388608 (100.0%)
+    [  1.294s] Completed
+  PROGRESS_EVENT_COUNT = 2
+
+5.2 慢传输 512 MiB —— 仍是 ~1 Hz，没有变成洪水
+
+  PROGRESS_EVENT_COUNT = 29（修复前 27）
+  首条提前：918ms（修复前 1332ms）
+  末条到达 100.0%：30.204s（修复前最后一条停在 97.3%，永远到不了 100%）
+  间隔仍稳定在 ~1.01s。
+  => 事件数 27 -> 29，只多了终态前那 1 条 + 首条时机变化，量级没有变化。
+
+--------------------------------------------------------------------------------
+6. 门禁
+--------------------------------------------------------------------------------
+6.1 门禁 1：cargo test -p privet-core -p privet-daemon -p privet-ipc --no-fail-fast
+
+GATE1_EXIT=0
+passed=115 failed=0 ignored=0
+（grep -cE "FAILED|panicked at|^error" 结果为 0）
+
+包含：privet-core 全部测试目标、privet-daemon（unittests lib+main）、
+      privet-ipc、doc-tests，均 0 失败。
+
+6.2 门禁 2：cargo test -p privet-core --test ops_send_serve -- --nocapture
+
+GATE2_EXIT=0
+running 6 tests
+test send_to_peer_that_forgot_us_is_rejected_fast_with_failed_history ... ok
+test send_to_serve_lands_file_over_quic ... ok
+test runtime_accept_all_trusted_toggle_makes_resolver_autoaccept ... ok
+test fast_receive_reports_verified_bytes_before_completed ... ok
+test receiver_cancel_mid_flight_leaves_send_partial ... ok
+test receiver_emits_offered_progress_completed ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+注：原为 5 条，新增的 fast_receive_reports_verified_bytes_before_completed 是
+    本包要求补充的回归钉子，故为 6 条。
+
+6.3 门禁 3：新增回归测试，且已验证它「能失败」
+
+新增测试：privet-core/tests/ops_send_serve.rs
+  fast_receive_reports_verified_bytes_before_completed
+
+它比原有断言更强：不只要求「存在一条进度」，而是要求
+  progress_idx < completed_idx（严格排在终态之前），
+并额外钉住 total_bytes 正确、verified_bytes 未越过 total。
+
+把 receiver.rs 的修复单独回退（保留测试）后重跑，确认它会失败：
+
+$ git checkout privet-transfer/src/receiver.rs
+$ cargo test -p privet-core --test ops_send_serve fast_receive_reports_verified_bytes_before_completed
+
+running 1 test
+test fast_receive_reports_verified_bytes_before_completed ... FAILED
+
+thread 'fast_receive_reports_verified_bytes_before_completed' (3325718) panicked at
+privet-core/tests/ops_send_serve.rs:781:5:
+receiver must report TransferProgress with verified_bytes > 0 before Completed;
+saw [("completed", 0, 0)]
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.96s
+
+失败原因正是本次 bug：事件序列里只有 Completed，一条 Progress 都没有。
+
+--------------------------------------------------------------------------------
+7. 关于断言是否本身有误
+--------------------------------------------------------------------------------
+不认为原有断言有误，无需替换。理由（有证据）：
+  - §3.1 证明修复前这条链路确实一条 Progress 都没发；
+  - 修复后（§5.1）Progress 在 Completed 之前到达，GUI 卡片可以推进后终止；
+  - 因此断言描述的语义「Offered -> Progress(verified>0) -> Completed」
+    与产品语义一致，不是测试写错了。
+本次没有修改、删改或放宽任何原有断言。
+
+--------------------------------------------------------------------------------
+8. 范围纪律
+--------------------------------------------------------------------------------
+- 只改 privet-transfer/src/receiver.rs 与 privet-core/tests/ops_send_serve.rs。
+- 临时探针文件 zz_probe_r9.rs 已删除，未进入提交。
+- `cargo fmt -p privet-transfer -p privet-core` 曾一次性重排 41 个无关文件
+  （该仓并非 fmt-clean），已全部 git checkout 回退；最终未运行 crate 级 fmt。
+  改为核对 rustfmt --check 的报错行号（1/195/324/331/528）全部落在本次首个
+  hunk（555 行）之前，即我的新增代码本身是 fmt-clean 的。
+- 未触碰 privet-discovery/beacon.rs 的既有 deprecated 警告等无关代码。

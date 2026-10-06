@@ -657,3 +657,151 @@ async fn receiver_emits_offered_progress_completed() {
     serve.shutdown().await;
     let _ = receiver.shutdown().await;
 }
+
+/// Regression pin for WP-R9 (progress stuck at 0% on fast receives).
+///
+/// Unlike `receiver_emits_offered_progress_completed`, this test does not just
+/// require *a* progress event: it requires the event to be ordered **before**
+/// the terminal `TransferCompleted`, which is what actually lets a GUI tile
+/// advance and then terminate. A 4 MiB receive over loopback finishes far
+/// inside the receiver's 1s progress throttle, so this is the fast path.
+///
+/// How this assertion can fail (i.e. what it is protecting):
+///  * if the first progress report is gated behind the 1s throttle, a fast
+///    receive reaches `Completed` with no progress at all -> `progress_idx`
+///    stays `None`;
+///  * if progress is only emitted from the data-frame path, the chunks that
+///    arrive before their `SegmentManifest` are verified inside `on_manifest`
+///    (the control path), which never reports -> same failure;
+///  * if a report is emitted only *after* `Completed`, `progress_idx >=
+///    completed_idx` and the tile still never advances.
+#[tokio::test]
+async fn fast_receive_reports_verified_bytes_before_completed() {
+    init_tracing();
+    let dir = TempDir::new().unwrap();
+    let sender = engine(&dir, "send");
+
+    let mut receiver = engine(&dir, "recv");
+    let spki = sender.identity().spki_der().to_vec();
+    let fp = sender.identity().fingerprint();
+    {
+        let conn = privet_storage::migration::open_and_migrate(dir.path().join("recv.db")).unwrap();
+        privet_storage::trust::insert_paired(
+            &conn,
+            &privet_storage::trust::PeerTrust {
+                device_fingerprint: &fp,
+                peer_spki: &spki,
+                peer_device_name: "alice",
+                share_with_peers: false,
+                first_paired_ts: 100,
+                last_seen_ts: 100,
+            },
+            &privet_storage::trust::PeerAddress {
+                subnet_cidr: "127.0.0.1/32",
+                gateway_ip: None,
+                addr: "127.0.0.1",
+                quic_port: 0,
+                tcp_port: 0,
+                source: "self",
+                last_seen_ts: 100,
+            },
+        )
+        .unwrap();
+        drop(conn);
+    }
+
+    let mut recv_events = receiver.subscribe();
+    receiver.start().await.unwrap();
+    let save = dir.path().join("recv");
+    std::fs::create_dir_all(save.join(".privet")).ok();
+    let serve = receiver
+        .serve(ServeOptions {
+            save_dir: save.clone(),
+            accept_all_trusted: true,
+            on_collision: CollisionPolicy::Rename,
+            accept_policy: privet_core::AcceptPolicy::AutoAccept,
+        })
+        .await
+        .unwrap();
+
+    // 4 MiB: well above the 64 KiB inline threshold (so the chunked/manifest
+    // path runs) but small enough to complete well inside the 1s throttle.
+    const SIZE: usize = 4 * 1024 * 1024;
+    let src = dir.path().join("fast.bin");
+    std::fs::write(&src, vec![9u8; SIZE]).unwrap();
+
+    let mut target_addr = serve.quic_addr;
+    target_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        sender
+            .send(
+                vec![src.clone()],
+                &PeerTarget::ByAddr(target_addr),
+                None,
+                None,
+            )
+            .await
+    })
+    .await
+    .expect("send timeout")
+    .expect("send failed");
+    assert_eq!(outcome.file_count, 1);
+
+    // Record the ordered event sequence until Completed.
+    let mut seq: Vec<(&'static str, u64, u64)> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), recv_events.recv()).await {
+            Ok(Ok(privet_core::EngineEvent::TransferProgress {
+                verified_bytes,
+                total_bytes,
+                ..
+            })) => seq.push(("progress", verified_bytes, total_bytes)),
+            Ok(Ok(privet_core::EngineEvent::TransferCompleted { .. })) => {
+                seq.push(("completed", 0, 0));
+                break;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
+            | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {}
+            Err(_) => break,
+        }
+    }
+
+    let completed_idx = seq.iter().position(|(k, _, _)| *k == "completed");
+    assert!(
+        completed_idx.is_some(),
+        "receiver must emit TransferCompleted; saw sequence {seq:?}"
+    );
+    let completed_idx = completed_idx.unwrap();
+
+    let progress_idx = seq
+        .iter()
+        .position(|(k, v, _)| *k == "progress" && *v > 0);
+    assert!(
+        progress_idx.is_some(),
+        "receiver must report TransferProgress with verified_bytes > 0 before Completed; saw {seq:?}"
+    );
+    let progress_idx = progress_idx.unwrap();
+
+    assert!(
+        progress_idx < completed_idx,
+        "progress with verified_bytes > 0 must precede TransferCompleted so the GUI tile advances \
+         then terminates; progress at {progress_idx}, completed at {completed_idx}; saw {seq:?}"
+    );
+
+    // The reported totals must stay truthful: the byte count is clamped to the
+    // advertised total, and the total itself is the offer's size.
+    let (_, verified, total) = seq[progress_idx];
+    assert!(
+        verified <= total,
+        "verified_bytes must be clamped to total_bytes (got {verified} > {total})"
+    );
+    assert_eq!(
+        total, SIZE as u64,
+        "progress must advertise the offer's total_bytes"
+    );
+
+    serve.shutdown().await;
+    let _ = receiver.shutdown().await;
+}
