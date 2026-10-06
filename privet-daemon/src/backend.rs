@@ -333,9 +333,17 @@ async fn publish_start_error_for_id(
 /// off) to reach it.
 ///
 /// `enumerate_interfaces` already drops loopback and links that are not
-/// operationally up; what remains to strip is the unspecified address. The
-/// wildcard bind in `quic_addr`/`tcp_addr` is not dialable, so this list is the
-/// only way a client can learn where to reach us when discovery is blocked.
+/// operationally up; what remains to strip is the unspecified address and every
+/// IPv6 address. The wildcard bind in `quic_addr`/`tcp_addr` is not dialable, so
+/// this list is the only way a client can learn where to reach us when discovery
+/// is blocked.
+///
+/// IPv4 only, deliberately. A phone that is on Wi-Fi and cellular at once
+/// enumerates dozens of IPv6 addresses -- two or three links, each carrying
+/// SLAAC privacy addresses plus a link-local -- and the list stops being
+/// readable exactly when the user has to read one out and type it on the other
+/// device. One short IPv4 line per interface is usable; a 39-character literal
+/// chosen from eight look-alikes is not.
 fn local_addr_dtos(
     ifaces: &[(IpAddr, u8, Option<IpAddr>, String)],
     quic_port: u16,
@@ -343,10 +351,14 @@ fn local_addr_dtos(
 ) -> Vec<LocalAddrDto> {
     let mut out: Vec<LocalAddrDto> = Vec::new();
     for (addr, _, _, _) in ifaces {
-        if addr.is_unspecified() || addr.is_loopback() {
+        // See the doc comment: IPv6 is out, whatever the interface.
+        let IpAddr::V4(v4) = addr else {
+            continue;
+        };
+        if v4.is_unspecified() || v4.is_loopback() {
             continue;
         }
-        let ip = addr.to_string();
+        let ip = v4.to_string();
         if out.iter().any(|seen| seen.ip == ip) {
             continue;
         }
@@ -362,9 +374,9 @@ fn local_addr_dtos(
 
 /// Ranking for `local_addrs`: lower is shown first.
 ///
-/// IPv4 before IPv6 (the engine's own peer resolution prefers IPv4), and
-/// link-local last: an address that only works on-link is the least likely to
-/// be the one the user should read out.
+/// Link-local last: 169.254.x only works on-link, so it is the least likely to
+/// be the address the user should read out. `local_addr_dtos` emits IPv4 only;
+/// anything else ranks after it rather than panicking if that filter changes.
 fn addr_rank(ip: &str) -> u8 {
     match ip.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => {
@@ -375,14 +387,7 @@ fn addr_rank(ip: &str) -> u8 {
                 0
             }
         }
-        Ok(IpAddr::V6(v6)) => {
-            if v6.segments()[0] & 0xffc0 == 0xfe80 {
-                3
-            } else {
-                1
-            }
-        }
-        Err(_) => 4,
+        _ => 1,
     }
 }
 
@@ -529,25 +534,29 @@ mod tests {
     }
 
     #[test]
-    fn local_addr_dtos_drops_unspecified_and_duplicates_and_puts_routable_v4_first() {
+    fn local_addr_dtos_keeps_ipv4_only_and_puts_routable_v4_first() {
         let ifaces = vec![
             // The wildcard is not dialable and must never be advertised.
             iface("0.0.0.0", 0, "wild"),
+            // Loopback is not dialable either.
+            iface("127.0.0.1", 8, "lo"),
+            // A phone on Wi-Fi and cellular at once enumerates many IPv6
+            // addresses -- SLAAC privacy addresses and a link-local per link.
+            // They are exactly the flood this list must not carry: the user has
+            // to read one address out and type it on the other device.
+            iface("fe80::1", 64, "wlan0"),
+            iface("2001:db8::1", 64, "wlan0"),
+            iface("2409:8900:5794:905a:ac8:2f98:5e6d:e47e", 64, "rmnet_data1"),
             // Link-local comes first in enumeration order and must come last in
             // the output: it is the address least likely to be the useful one.
-            iface("fe80::1", 64, "wlan0"),
             iface("169.254.145.185", 16, "enp6s0"),
-            iface("2001:db8::1", 64, "wlan0"),
             iface("10.29.210.120", 16, "wlan0"),
             // The same address on two rows (e.g. two names for one link).
             iface("10.29.210.120", 16, "wlan0:1"),
         ];
         let out = local_addr_dtos(&ifaces, 47808, 47809);
         let ips: Vec<&str> = out.iter().map(|a| a.ip.as_str()).collect();
-        assert_eq!(
-            ips,
-            vec!["10.29.210.120", "2001:db8::1", "169.254.145.185", "fe80::1"]
-        );
+        assert_eq!(ips, vec!["10.29.210.120", "169.254.145.185"]);
         assert!(out.iter().all(|a| a.quic_port == 47808 && a.tcp_port == 47809));
     }
 
