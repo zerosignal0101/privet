@@ -241,6 +241,10 @@ async fn resume_without_override_after_source_gone_fails_with_bare_io() {
         msg, "io: No such file or directory (os error 2)",
         "the reported symptom is a bare `io` error naming no file: {msg}"
     );
+    println!(
+        "REPRO transfer_id={tid} resume_without_override -> error_code={} message={msg:?}",
+        err.error_code()
+    );
 
     h.shutdown().await;
 }
