@@ -67,6 +67,11 @@ impl DaemonBackend {
                     quic_addr: self.quic_addr.to_string(),
                     tcp_addr: self.tcp_addr.to_string(),
                     active_transfers: self.engine.active_transfer_ids(),
+                    local_addrs: local_addr_dtos(
+                        &privet_discovery::netinfo::enumerate_interfaces(),
+                        self.quic_addr.port(),
+                        self.tcp_addr.port(),
+                    ),
                 }))
             }
             Request::GetIdentity => {
@@ -298,6 +303,63 @@ async fn publish_start_error_for_id(
     }).await;
 }
 
+/// This device's own dialable addresses, for a peer (or the user, reading them
+/// off) to reach it.
+///
+/// `enumerate_interfaces` already drops loopback and links that are not
+/// operationally up; what remains to strip is the unspecified address. The
+/// wildcard bind in `quic_addr`/`tcp_addr` is not dialable, so this list is the
+/// only way a client can learn where to reach us when discovery is blocked.
+fn local_addr_dtos(
+    ifaces: &[(IpAddr, u8, Option<IpAddr>, String)],
+    quic_port: u16,
+    tcp_port: u16,
+) -> Vec<LocalAddrDto> {
+    let mut out: Vec<LocalAddrDto> = Vec::new();
+    for (addr, _, _, _) in ifaces {
+        if addr.is_unspecified() || addr.is_loopback() {
+            continue;
+        }
+        let ip = addr.to_string();
+        if out.iter().any(|seen| seen.ip == ip) {
+            continue;
+        }
+        out.push(LocalAddrDto { ip, quic_port, tcp_port });
+    }
+    // Most useful first, stable within a rank. A user in a restricted network
+    // has to read an address off and type it on the other device, so a routable
+    // IPv4 address must not be buried under a link-local one (169.254.x on a
+    // cable that happens to be plugged in but is not carrying the traffic).
+    out.sort_by_key(|entry| addr_rank(&entry.ip));
+    out
+}
+
+/// Ranking for `local_addrs`: lower is shown first.
+///
+/// IPv4 before IPv6 (the engine's own peer resolution prefers IPv4), and
+/// link-local last: an address that only works on-link is the least likely to
+/// be the one the user should read out.
+fn addr_rank(ip: &str) -> u8 {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let octets = v4.octets();
+            if octets[0] == 169 && octets[1] == 254 {
+                2
+            } else {
+                0
+            }
+        }
+        Ok(IpAddr::V6(v6)) => {
+            if v6.segments()[0] & 0xffc0 == 0xfe80 {
+                3
+            } else {
+                1
+            }
+        }
+        Err(_) => 4,
+    }
+}
+
 fn peer_dto(peer: privet_discovery::peer::PeerRecord) -> PeerDto {
     PeerDto {
         device_fingerprint: peer.device_fingerprint,
@@ -384,6 +446,39 @@ fn history_detail_dto(row: privet_storage::history::HistoryDetailRow) -> History
 mod tests {
     use super::*;
     use privet_storage::history::{HistoryDetailRow, HistoryFileRow};
+
+    fn iface(ip: &str, prefix: u8, name: &str) -> (IpAddr, u8, Option<IpAddr>, String) {
+        (ip.parse().unwrap(), prefix, None, name.into())
+    }
+
+    #[test]
+    fn local_addr_dtos_drops_unspecified_and_duplicates_and_puts_routable_v4_first() {
+        let ifaces = vec![
+            // The wildcard is not dialable and must never be advertised.
+            iface("0.0.0.0", 0, "wild"),
+            // Link-local comes first in enumeration order and must come last in
+            // the output: it is the address least likely to be the useful one.
+            iface("fe80::1", 64, "wlan0"),
+            iface("169.254.145.185", 16, "enp6s0"),
+            iface("2001:db8::1", 64, "wlan0"),
+            iface("10.29.210.120", 16, "wlan0"),
+            // The same address on two rows (e.g. two names for one link).
+            iface("10.29.210.120", 16, "wlan0:1"),
+        ];
+        let out = local_addr_dtos(&ifaces, 47808, 47809);
+        let ips: Vec<&str> = out.iter().map(|a| a.ip.as_str()).collect();
+        assert_eq!(
+            ips,
+            vec!["10.29.210.120", "2001:db8::1", "169.254.145.185", "fe80::1"]
+        );
+        assert!(out.iter().all(|a| a.quic_port == 47808 && a.tcp_port == 47809));
+    }
+
+    #[test]
+    fn local_addr_dtos_is_empty_when_only_the_wildcard_exists() {
+        let ifaces = vec![iface("0.0.0.0", 0, "wild")];
+        assert!(local_addr_dtos(&ifaces, 47808, 47808).is_empty());
+    }
 
     #[test]
     fn history_detail_dto_maps_send_source_path() {

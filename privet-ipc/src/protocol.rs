@@ -145,6 +145,26 @@ pub struct DaemonStatus {
     pub quic_addr: String,
     pub tcp_addr: String,
     pub active_transfers: Vec<String>,
+    /// This device's own dialable addresses.
+    ///
+    /// `quic_addr`/`tcp_addr` are wildcard binds (`0.0.0.0:47808`), which no
+    /// peer can dial: a client that only had them would have to guess the real
+    /// address. On a network where discovery is blocked (campus AP client
+    /// isolation) the user has to read the address here and type it on the
+    /// other device, so these are the real interface addresses.
+    ///
+    /// Additive: an older client ignores the field, an older daemon omits it
+    /// (the default is empty).
+    #[serde(default)]
+    pub local_addrs: Vec<LocalAddrDto>,
+}
+
+/// One of this device's own dialable interface addresses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalAddrDto {
+    pub ip: String,
+    pub quic_port: u16,
+    pub tcp_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

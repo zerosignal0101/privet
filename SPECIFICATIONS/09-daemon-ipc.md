@@ -73,6 +73,7 @@ History limits are clamped to 1–1000. Transfer-starting requests return an ID 
 Implemented response variants are `pong`, `ack`, `status`, `identity`, `peers`, `trusted`, `pairing_code`, `pairing_result`, `transfer_queued`, `transfer`, `history`, `history_detail`, `runtime_config`, and `event_replay`.
 
 - Status includes versions, daemon session UUID, fingerprint, bound QUIC/TCP addresses, and active IDs.
+- Status also includes `local_addrs`: this device's own dialable interface addresses (`{ ip, quic_port, tcp_port }`), IPv4 first, excluding loopback, the wildcard `0.0.0.0`, and links that are not operationally up. The bound addresses above are usually wildcards (`0.0.0.0:47808`) that no peer can dial, so clients show `local_addrs` to let a user read an address off and type it on the other device when discovery is blocked (e.g. campus AP client isolation). The field is additive: absent means empty.
 - A candidate includes IP, distinct QUIC/TCP ports, and last-seen milliseconds.
 - Trust includes fingerprint, name/state, SPKI hex, paired/seen/revoked timestamps, and reason.
 - History includes ID, direction, optional peer/name/root, totals, status, and timestamps.
